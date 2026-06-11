@@ -1,0 +1,94 @@
+{
+  "tweets": [
+    {
+      "type": "tweet",
+      "id": "1932700000000000001",
+      "url": "https://twitter.com/PIB_India/status/1932700000000000001",
+      "text": "Cabinet approves the National Semiconductor Mission phase two with a total outlay of Rs 76,000 crore for fabs and OSAT units. Details: https://t.co/abc123",
+      "source": "Twitter Web App",
+      "retweetCount": 12,
+      "replyCount": 3,
+      "likeCount": 50,
+      "quoteCount": 1,
+      "viewCount": 10000,
+      "createdAt": "Wed Jun 10 09:15:00 +0000 2026",
+      "lang": "en",
+      "isReply": false,
+      "author": {
+        "type": "user",
+        "userName": "PIB_India",
+        "url": "https://x.com/PIB_India",
+        "id": "39240673",
+        "name": "PIB India"
+      },
+      "entities": {
+        "hashtags": [],
+        "urls": [
+          {
+            "display_url": "pib.gov.in/PressRelease…",
+            "expanded_url": "https://pib.gov.in/PressReleasePage.aspx?PRID=2026100",
+            "indices": [136, 159],
+            "url": "https://t.co/abc123"
+          },
+          {
+            "display_url": "t.co/notexpanded",
+            "expanded_url": "https://t.co/notexpanded",
+            "indices": [0, 1],
+            "url": "https://t.co/notexpanded"
+          }
+        ],
+        "user_mentions": []
+      },
+      "quoted_tweet": null,
+      "retweeted_tweet": null,
+      "isLimitedReply": false
+    },
+    {
+      "type": "tweet",
+      "id": "1932700000000000002",
+      "url": "https://twitter.com/PIBFactCheck/status/1932700000000000002",
+      "text": "A viral message claims UPI transactions above Rs 2,000 will be charged from July. This claim is FAKE.",
+      "createdAt": "Wed Jun 10 10:30:00 +0000 2026",
+      "lang": "en",
+      "isReply": false,
+      "author": {
+        "type": "user",
+        "userName": "PIBFactCheck",
+        "id": "1184014694",
+        "name": "PIB Fact Check"
+      },
+      "entities": {
+        "hashtags": [{"indices": [0, 9], "text": "FactCheck"}],
+        "urls": [],
+        "user_mentions": []
+      },
+      "quoted_tweet": {
+        "type": "tweet",
+        "id": "1932600000000000009",
+        "text": "Breaking: UPI transactions above Rs 2000 to be charged 1.1 percent from July 1.",
+        "createdAt": "Tue Jun 09 18:00:00 +0000 2026",
+        "author": {
+          "type": "user",
+          "userName": "viralhandle",
+          "id": "987654",
+          "name": "Viral Account"
+        },
+        "entities": {"hashtags": [], "urls": [], "user_mentions": []}
+      },
+      "retweeted_tweet": null,
+      "isLimitedReply": false
+    },
+    {
+      "type": "tweet",
+      "id": "1932700000000000003",
+      "text": "",
+      "createdAt": "Wed Jun 10 11:00:00 +0000 2026",
+      "author": {"type": "user", "userName": "PIB_India", "id": "39240673"},
+      "entities": {"hashtags": [], "urls": [], "user_mentions": []},
+      "quoted_tweet": null,
+      "retweeted_tweet": null
+    }
+  ],
+  "has_next_page": false,
+  "next_cursor": ""
+}

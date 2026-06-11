@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "connect"
+version = "0.1.0"
+description = "connect — information intelligence system (backend)"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+    "trafilatura",
+    "pymupdf",
+    "feedparser",
+    "rapidfuzz",
+    "sse-starlette",
+    "pydantic>=2",
+    "pydantic-settings",
+    "python-multipart",
+    "sqlite-vec",
+    "fastembed",
+    "anthropic",
+    "openpyxl",
+    "xlrd",
+    "python-docx",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[tool.setuptools.packages.find]
+include = ["connect*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

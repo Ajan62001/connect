@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>RBI Press Releases (fixture)</title>
+    <link>https://rbi.org.in/</link>
+    <description>Fixture feed for tests</description>
+    <item>
+      <title>RBI announces expansion of digital rupee pilot</title>
+      <link>https://rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=10001</link>
+      <pubDate>Wed, 10 Jun 2026 09:30:00 GMT</pubDate>
+      <description>The pilot now covers twelve more cities.</description>
+    </item>
+    <item>
+      <title>Monetary Policy Committee meeting dates announced</title>
+      <link>https://rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=10002</link>
+      <pubDate>Tue, 09 Jun 2026 11:00:00 GMT</pubDate>
+      <description>Schedule of MPC meetings for the second half of 2026.</description>
+    </item>
+    <item>
+      <title>Entry without a link is skipped</title>
+      <description>No link element here.</description>
+    </item>
+  </channel>
+</rss>

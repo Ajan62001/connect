@@ -1,0 +1,36 @@
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, HTTPException
+
+from connect.api.deps import get_container
+from connect.domain.models import EnrichmentSweepRequest, JobAccepted
+from connect.orchestration.container import Container
+
+router = APIRouter(prefix="/enrichment", tags=["enrichment"])
+
+
+@router.post("/sweep", response_model=JobAccepted, status_code=202)
+async def sweep(body: EnrichmentSweepRequest,
+                container: Container = Depends(get_container)):
+    """Queue one T1 sweep job. 'sync' processes eligible docs inline in the
+    job (governor-checked per call); 'batch' submits one Anthropic Message
+    Batch and the job polls/ingests the results."""
+    service = container.enrichment
+    jobs = container.jobs
+    assert service is not None and jobs is not None
+    if service.provider is None:
+        raise HTTPException(status_code=503,
+                            detail="ANTHROPIC_API_KEY not set")
+    limit = body.limit
+
+    if body.mode == "sync":
+        async def _run():
+            return str(await service.run_sync(limit))
+        kind = "enrich_t1_sync"
+    else:
+        async def _run():
+            return str(await service.run_batch(limit))
+        kind = "enrich_t1_batch"
+
+    job_id = jobs.submit(kind, {"mode": body.mode, "limit": limit}, _run)
+    return JobAccepted(job_id=job_id)

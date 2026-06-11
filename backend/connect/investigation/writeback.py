@@ -19,16 +19,16 @@ Rules enforced here:
 
 from __future__ import annotations
 
-import json
 import logging
-import sqlite3
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
+
+import psycopg
 
 from connect.analysis import grounding
 from connect.domain import enums as E
 from connect.investigation.schema import ReactionCandidate, ScopePack
 from connect.storage import edges as edge_dao
-from connect.storage.db import utc_now
+from connect.storage.pg import Jsonb, utc_now
 
 log = logging.getLogger(__name__)
 
@@ -46,17 +46,18 @@ def _require(condition: bool, reason: str) -> None:
         raise FindingValidationError(reason)
 
 
-def _node_exists(conn: sqlite3.Connection, node_type: str,
-                 node_id: int) -> bool:
+async def _node_exists(conn: psycopg.AsyncConnection, node_type: str,
+                       node_id: int) -> bool:
     table = _NODE_TABLES.get(node_type)
     if table is None:
         return False
-    return conn.execute(f"SELECT 1 FROM {table} WHERE id = ?",
-                        (node_id,)).fetchone() is not None
+    cur = await conn.execute(f"SELECT 1 FROM {table} WHERE id = %s",
+                             (node_id,))
+    return await cur.fetchone() is not None
 
 
-def _validate_evidence(conn: sqlite3.Connection,
-                       evidence: Any) -> list[dict[str, Any]]:
+async def _validate_evidence(conn: psycopg.AsyncConnection,
+                             evidence: Any) -> list[dict[str, Any]]:
     _require(isinstance(evidence, list),
              "evidence must be a list of {document_id, quote}")
     cleaned: list[dict[str, Any]] = []
@@ -70,9 +71,10 @@ def _validate_evidence(conn: sqlite3.Connection,
                  f"evidence[{i}].document_id must be an integer")
         _require(isinstance(quote, str) and quote.strip() != "",
                  f"evidence[{i}].quote must be a non-empty string")
-        row = conn.execute(
-            "SELECT content_text FROM document WHERE id = ?",
-            (doc_id,)).fetchone()
+        cur = await conn.execute(
+            "SELECT content_text FROM document WHERE id = %s",
+            (doc_id,))
+        row = await cur.fetchone()
         _require(row is not None,
                  f"evidence[{i}]: document {doc_id} not found")
         content = row["content_text"] or ""
@@ -86,8 +88,8 @@ def _validate_evidence(conn: sqlite3.Connection,
     return cleaned
 
 
-def _validate_link(conn: sqlite3.Connection,
-                   link: Any) -> dict[str, Any]:
+async def _validate_link(conn: psycopg.AsyncConnection,
+                         link: Any) -> dict[str, Any]:
     _require(isinstance(link, dict),
              "link must be an object {src_type, src_id, relation,"
              " dst_type, dst_id}")
@@ -108,15 +110,16 @@ def _validate_link(conn: sqlite3.Connection,
         node_type, node_id = link[f"{side}_type"], link[f"{side}_id"]
         _require(isinstance(node_id, int),
                  f"link.{side}_id must be an integer")
-        _require(_node_exists(conn, node_type, node_id),
+        _require(await _node_exists(conn, node_type, node_id),
                  f"link.{side}: {node_type} {node_id} does not exist")
     return dict(link)
 
 
-def record_finding(conn: sqlite3.Connection, *, dossier_id: int,
-                   scope_pack: ScopePack, args: dict[str, Any],
-                   emit: Callable[[str, dict[str, Any]], Any] | None = None,
-                   ) -> dict[str, Any]:
+async def record_finding(
+        conn: psycopg.AsyncConnection, *, dossier_id: int,
+        scope_pack: ScopePack, args: dict[str, Any],
+        emit: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None,
+        ) -> dict[str, Any]:
     """Validate + persist one finding. Returns the persisted summary dict;
     raises FindingValidationError with the exact reason on any violation."""
     kind = args.get("kind")
@@ -132,7 +135,7 @@ def record_finding(conn: sqlite3.Connection, *, dossier_id: int,
                  "confidence must be a number")
         confidence = min(1.0, max(0.0, float(confidence)))
 
-    evidence = _validate_evidence(conn, args.get("evidence", []))
+    evidence = await _validate_evidence(conn, args.get("evidence", []))
 
     # rule 2: alternatives are mined, never invented
     if kind == "alternative":
@@ -166,14 +169,14 @@ def record_finding(conn: sqlite3.Connection, *, dossier_id: int,
     # rule 5: validate the explicit link (or derive one from the candidate)
     link = args.get("link")
     if link is not None:
-        link = _validate_link(conn, link)
+        link = await _validate_link(conn, link)
     elif candidate is not None and kind in ("reaction", "trigger"):
         relation = "reaction_to" if kind == "reaction" else "triggered_by"
         link = {"src_type": "event", "src_id": candidate.src_event_id,
                 "dst_type": "event", "dst_id": candidate.dst_event_id,
                 "relation": relation}
         for side in ("src", "dst"):
-            _require(_node_exists(conn, "event", link[f"{side}_id"]),
+            _require(await _node_exists(conn, "event", link[f"{side}_id"]),
                      f"candidate {candidate.candidate_id}: event"
                      f" {link[f'{side}_id']} does not exist")
 
@@ -182,9 +185,10 @@ def record_finding(conn: sqlite3.Connection, *, dossier_id: int,
     if question_id is not None:
         _require(isinstance(question_id, int),
                  "question_id must be an integer")
-        row = conn.execute(
-            "SELECT dossier_id FROM question WHERE id = ?",
-            (question_id,)).fetchone()
+        cur = await conn.execute(
+            "SELECT dossier_id FROM question WHERE id = %s",
+            (question_id,))
+        row = await cur.fetchone()
         _require(row is not None, f"question {question_id} not found")
         _require(int(row["dossier_id"]) == dossier_id,
                  f"question {question_id} belongs to another dossier")
@@ -199,18 +203,18 @@ def record_finding(conn: sqlite3.Connection, *, dossier_id: int,
             "cosine": candidate.cosine,
         }
     now = utc_now()
-    with conn:
-        cur = conn.execute(
+    async with conn.transaction():
+        cur = await conn.execute(
             "INSERT INTO finding (dossier_id, kind, text, speculation,"
             " confidence, question_id, payload, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?)",
-            (dossier_id, kind, text.strip(), int(speculation), confidence,
-             question_id, json.dumps(payload), now))
-        finding_id = int(cur.lastrowid)  # type: ignore[arg-type]
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (dossier_id, kind, text.strip(), bool(speculation), confidence,
+             question_id, Jsonb(payload), now))
+        finding_id = int((await cur.fetchone())["id"])
         for item in evidence:
-            conn.execute(
+            await conn.execute(
                 "INSERT INTO finding_evidence (finding_id, document_id,"
-                " quote, quote_start, quote_end) VALUES (?,?,?,?,?)",
+                " quote, quote_start, quote_end) VALUES (%s,%s,%s,%s,%s)",
                 (finding_id, item["document_id"], item["quote"],
                  item["quote_start"], item["quote_end"]))
 
@@ -223,7 +227,7 @@ def record_finding(conn: sqlite3.Connection, *, dossier_id: int,
         }
         if "score_components" in payload:
             properties["score_components"] = payload["score_components"]
-        edge_id = edge_dao.insert_causal(
+        edge_id = await edge_dao.insert_causal(
             conn,
             src_type=link["src_type"], src_id=link["src_id"],
             dst_type=link["dst_type"], dst_id=link["dst_id"],
@@ -232,40 +236,42 @@ def record_finding(conn: sqlite3.Connection, *, dossier_id: int,
                                     if evidence else None),
             provenance_dossier_id=dossier_id,
             confidence=confidence, grade=2)
-        with conn:
-            conn.execute("UPDATE finding SET edge_id = ? WHERE id = ?",
-                         (edge_id, finding_id))
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE finding SET edge_id = %s WHERE id = %s",
+                (edge_id, finding_id))
 
     if question_id is not None:
-        _attach_finding_to_question(conn, question_id, finding_id)
+        await _attach_finding_to_question(conn, question_id, finding_id)
 
     result = {"finding_id": finding_id, "kind": kind,
               "speculation": speculation, "edge_id": edge_id,
               "question_id": question_id,
               "evidence_count": len(evidence)}
     if emit is not None:
-        emit("finding_recorded", result)
+        await emit("finding_recorded", result)
     return result
 
 
-def _attach_finding_to_question(conn: sqlite3.Connection, question_id: int,
-                                finding_id: int) -> None:
+async def _attach_finding_to_question(conn: psycopg.AsyncConnection,
+                                      question_id: int,
+                                      finding_id: int) -> None:
     """Append the finding id and flip an 'open' question to 'partial'
     (answered/dropped statuses are left alone)."""
-    row = conn.execute(
-        "SELECT status, answer_finding_ids FROM question WHERE id = ?",
-        (question_id,)).fetchone()
+    cur = await conn.execute(
+        "SELECT status, answer_finding_ids FROM question WHERE id = %s",
+        (question_id,))
+    row = await cur.fetchone()
     if row is None:  # validated above; defensive
         return
-    try:
-        ids = json.loads(row["answer_finding_ids"] or "[]")
-    except ValueError:
+    ids = row["answer_finding_ids"]
+    if not isinstance(ids, list):
         ids = []
     if finding_id not in ids:
         ids.append(finding_id)
     new_status = "partial" if row["status"] == "open" else row["status"]
-    with conn:
-        conn.execute(
-            "UPDATE question SET status = ?, answer_finding_ids = ?,"
-            " updated_at = ? WHERE id = ?",
-            (new_status, json.dumps(ids), utc_now(), question_id))
+    async with conn.transaction():
+        await conn.execute(
+            "UPDATE question SET status = %s, answer_finding_ids = %s,"
+            " updated_at = %s WHERE id = %s",
+            (new_status, Jsonb(ids), utc_now(), question_id))

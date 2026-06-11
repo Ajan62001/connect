@@ -17,7 +17,7 @@ full adjudication payload for gray-zone calls) so thresholds can be tuned
 against logged decisions.
 
 T2 input is T1-enriched docs: entities exist (entity_mention) and the doc
-embedding exists from T0 (document_embedding / vec_document).
+embedding exists from T0 (document_embedding, pgvector).
 """
 
 from __future__ import annotations
@@ -25,19 +25,21 @@ from __future__ import annotations
 import json
 import logging
 import math
-import sqlite3
 from dataclasses import dataclass
+from typing import Any, Mapping
 
+import psycopg
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from connect.knowledge.vector import _pack, _unpack
 from connect.llm import spend
 from connect.llm.provider import LLMError, LLMProvider
 from connect.llm.spend import BudgetExceeded, Governor
 from connect.llm.tiers import ModelTier
-from connect.storage.db import utc_now
+from connect.storage.pg import Vector, utc_now
 
 log = logging.getLogger(__name__)
+
+_Row = Mapping[str, Any]
 
 # -- thresholds & weights (design doc result.pipeline) ---------------------------
 
@@ -168,74 +170,77 @@ def update_centroid(centroid: list[float], n: int,
 
 # -- vector / entity plumbing ------------------------------------------------------
 
-def get_document_vector(conn: sqlite3.Connection,
-                        document_id: int) -> list[float] | None:
-    row = conn.execute(
-        "SELECT vector FROM document_embedding WHERE document_id = ?",
-        (document_id,)).fetchone()
-    if row is not None:
-        return _unpack(row[0])
-    try:  # sqlite-vec backend stores in vec_document instead
-        row = conn.execute(
-            "SELECT embedding FROM vec_document WHERE rowid = ?",
-            (document_id,)).fetchone()
-    except sqlite3.Error:
-        return None
-    return _unpack(row[0]) if row is not None else None
+async def get_document_vector(conn: psycopg.AsyncConnection,
+                              document_id: int) -> list[float] | None:
+    cur = await conn.execute(
+        "SELECT embedding FROM document_embedding WHERE document_id = %s",
+        (document_id,))
+    row = await cur.fetchone()
+    return [float(x) for x in row["embedding"]] if row is not None else None
 
 
-def get_event_centroid(conn: sqlite3.Connection,
-                       event_id: int) -> list[float] | None:
-    row = conn.execute(
-        "SELECT vector FROM event_embedding WHERE event_id = ?",
-        (event_id,)).fetchone()
-    return _unpack(row[0]) if row is not None else None
+async def get_event_centroid(conn: psycopg.AsyncConnection,
+                             event_id: int) -> list[float] | None:
+    cur = await conn.execute(
+        "SELECT embedding FROM event_embedding WHERE event_id = %s",
+        (event_id,))
+    row = await cur.fetchone()
+    return [float(x) for x in row["embedding"]] if row is not None else None
 
 
-def _set_event_centroid(conn: sqlite3.Connection, event_id: int,
-                        vector: list[float], model: str) -> None:
-    conn.execute(
-        "INSERT OR REPLACE INTO event_embedding (event_id, model, dim,"
-        " vector) VALUES (?,?,?,?)",
-        (event_id, model, len(vector), _pack(vector)))
+async def _set_event_centroid(conn: psycopg.AsyncConnection, event_id: int,
+                              vector: list[float], model: str) -> None:
+    await conn.execute(
+        "INSERT INTO event_embedding (event_id, model, embedding)"
+        " VALUES (%s,%s,%s)"
+        " ON CONFLICT (event_id) DO UPDATE SET"
+        " model = EXCLUDED.model, embedding = EXCLUDED.embedding",
+        (event_id, model, Vector(vector)))
 
 
-def document_entity_ids(conn: sqlite3.Connection,
-                        document_id: int) -> set[int]:
-    return {r[0] for r in conn.execute(
-        "SELECT DISTINCT entity_id FROM entity_mention WHERE document_id = ?",
-        (document_id,))}
+async def document_entity_ids(conn: psycopg.AsyncConnection,
+                              document_id: int) -> set[int]:
+    cur = await conn.execute(
+        "SELECT DISTINCT entity_id FROM entity_mention"
+        " WHERE document_id = %s",
+        (document_id,))
+    return {r["entity_id"] for r in await cur.fetchall()}
 
 
-def event_entity_ids(conn: sqlite3.Connection, event_id: int) -> set[int]:
+async def event_entity_ids(conn: psycopg.AsyncConnection,
+                           event_id: int) -> set[int]:
     """Union of member documents' linked entities."""
-    return {r[0] for r in conn.execute(
+    cur = await conn.execute(
         "SELECT DISTINCT m.entity_id FROM entity_mention m"
         " WHERE m.document_id IN (SELECT document_id FROM event_assignment"
-        "                         WHERE event_id = ?)", (event_id,))}
+        "                         WHERE event_id = %s)", (event_id,))
+    return {r["entity_id"] for r in await cur.fetchall()}
 
 
 # -- candidate retrieval -----------------------------------------------------------
 
-def find_candidates(conn: sqlite3.Connection, *, doc_date: str,
-                    doc_vector: list[float] | None,
-                    doc_entities: set[int],
-                    doc_event_type: str) -> list[Candidate]:
+async def find_candidates(conn: psycopg.AsyncConnection, *, doc_date: str,
+                          doc_vector: list[float] | None,
+                          doc_entities: set[int],
+                          doc_event_type: str) -> list[Candidate]:
     """Score every event whose activity window covers the document date;
     best-first. Window length comes from the EVENT's event_type taxonomy row
     (event_type.window_days), measured from the event's last activity."""
-    rows = conn.execute(
+    cur = await conn.execute(
         "SELECT e.id, e.title, e.description, e.event_type, e.occurred_on,"
         " e.doc_count"
         " FROM event e LEFT JOIN event_type et ON et.name = e.event_type"
-        " WHERE ABS(julianday(?) - julianday(COALESCE(e.last_seen_at,"
-        "   e.occurred_on, substr(e.created_at, 1, 10))))"
-        "   <= COALESCE(et.window_days, ?)",
-        (doc_date, DEFAULT_WINDOW_DAYS)).fetchall()
+        " WHERE ABS(%s::date - COALESCE(e.last_seen_at, e.occurred_on,"
+        "   (e.created_at AT TIME ZONE 'utc')::date))"
+        "   <= COALESCE(et.window_days, %s)",
+        (doc_date, DEFAULT_WINDOW_DAYS))
+    rows = await cur.fetchall()
     candidates: list[Candidate] = []
     for row in rows:
-        cos = cosine_similarity(doc_vector, get_event_centroid(conn, row["id"]))
-        jac = entity_jaccard(doc_entities, event_entity_ids(conn, row["id"]))
+        cos = cosine_similarity(
+            doc_vector, await get_event_centroid(conn, row["id"]))
+        jac = entity_jaccard(
+            doc_entities, await event_entity_ids(conn, row["id"]))
         same = row["event_type"] == doc_event_type
         candidates.append(Candidate(
             event_id=row["id"], title=row["title"],
@@ -250,23 +255,25 @@ def find_candidates(conn: sqlite3.Connection, *, doc_date: str,
 
 # -- the decision -------------------------------------------------------------------
 
-async def assign_document(conn: sqlite3.Connection,
+async def assign_document(conn: psycopg.AsyncConnection,
                           provider: LLMProvider | None,
                           governor: Governor,
                           document_id: int) -> AssignmentResult | None:
     """Cluster one T1-enriched document into an event. Returns None when the
     document is missing or not T1-enriched (T2 requires T1 output)."""
-    doc = conn.execute(
+    cur = await conn.execute(
         "SELECT d.id, d.title,"
-        " substr(COALESCE(d.published_at, d.fetched_at), 1, 10) AS doc_date,"
+        " (COALESCE(d.published_at, d.fetched_at) AT TIME ZONE 'utc')::date"
+        "   AS doc_date,"
         " de.summary, de.event_type, de.model, de.prompt_version"
         " FROM document d JOIN document_enrichment de ON de.document_id = d.id"
-        " WHERE d.id = ?", (document_id,)).fetchone()
+        " WHERE d.id = %s", (document_id,))
+    doc = await cur.fetchone()
     if doc is None:
         return None
-    doc_vector = get_document_vector(conn, document_id)
-    doc_entities = document_entity_ids(conn, document_id)
-    candidates = find_candidates(
+    doc_vector = await get_document_vector(conn, document_id)
+    doc_entities = await document_entity_ids(conn, document_id)
+    candidates = await find_candidates(
         conn, doc_date=doc["doc_date"], doc_vector=doc_vector,
         doc_entities=doc_entities, doc_event_type=doc["event_type"])
     best = candidates[0] if candidates else None
@@ -276,9 +283,9 @@ async def assign_document(conn: sqlite3.Connection,
                              doc_vector=doc_vector, candidate=best,
                              method="attach", adjudication=None)
     if best is None or best.score <= NEW_EVENT_THRESHOLD:
-        return _create_new(conn, doc=doc, doc_vector=doc_vector,
-                           score=best.score if best else None,
-                           method="new", adjudication=None)
+        return await _create_new(conn, doc=doc, doc_vector=doc_vector,
+                                 score=best.score if best else None,
+                                 method="new", adjudication=None)
 
     # -- gray zone: ONE FAST closed-menu adjudication -----------------------------
     menu = candidates[:TOP_K_ADJUDICATION]
@@ -295,7 +302,7 @@ async def assign_document(conn: sqlite3.Connection,
     else:
         model = provider.model_for(ModelTier.FAST)
         try:
-            governor.check(spend.cost_usd(
+            await governor.check(spend.cost_usd(
                 model, input_tokens=EST_ADJ_INPUT_TOKENS,
                 output_tokens=EST_ADJ_OUTPUT_TOKENS))
             completion = await provider.complete_structured(
@@ -304,8 +311,9 @@ async def assign_document(conn: sqlite3.Connection,
                            "content": _adjudication_message(doc, menu)}],
                 schema=EventAdjudication, tier=ModelTier.FAST,
                 max_tokens=128)
-            spend.record_call(conn, purpose=PURPOSE_ADJUDICATION,
-                              model=completion.model, usage=completion.usage)
+            await spend.record_call(conn, purpose=PURPOSE_ADJUDICATION,
+                                    model=completion.model,
+                                    usage=completion.usage)
             choice = completion.output.choice
             payload["choice"] = choice
             payload["model"] = completion.model
@@ -322,11 +330,12 @@ async def assign_document(conn: sqlite3.Connection,
                              candidate=menu[choice - 1],
                              method="adjudicated", adjudication=payload)
     method = "adjudicated" if choice is not None else "new"
-    return _create_new(conn, doc=doc, doc_vector=doc_vector,
-                       score=best.score, method=method, adjudication=payload)
+    return await _create_new(conn, doc=doc, doc_vector=doc_vector,
+                             score=best.score, method=method,
+                             adjudication=payload)
 
 
-def _adjudication_message(doc: sqlite3.Row, menu: list[Candidate]) -> str:
+def _adjudication_message(doc: _Row, menu: list[Candidate]) -> str:
     lines = [
         "DOCUMENT:",
         f"  title: {doc['title'] or '(untitled)'}",
@@ -349,33 +358,40 @@ def _adjudication_message(doc: sqlite3.Row, menu: list[Candidate]) -> str:
 
 # -- attach / create ---------------------------------------------------------------
 
-async def _attach(conn: sqlite3.Connection, provider: LLMProvider | None,
-                  governor: Governor, *, doc: sqlite3.Row,
+async def _attach(conn: psycopg.AsyncConnection,
+                  provider: LLMProvider | None,
+                  governor: Governor, *, doc: _Row,
                   doc_vector: list[float] | None, candidate: Candidate,
                   method: str, adjudication: dict | None) -> AssignmentResult:
     now = utc_now()
     event_id = candidate.event_id
-    with conn:
-        cur = conn.execute(
+    async with conn.transaction():
+        cur = await conn.execute(
             "INSERT INTO event_assignment (document_id, event_id, method,"
-            " score, adjudication, created_at) VALUES (?,?,?,?,?,?)",
+            " score, adjudication, created_at) VALUES (%s,%s,%s,%s,%s,%s)"
+            " RETURNING id",
             (doc["id"], event_id, method, candidate.score,
              json.dumps(adjudication) if adjudication else None, now))
-        assignment_id = int(cur.lastrowid)  # type: ignore[arg-type]
+        assignment_id = int((await cur.fetchone())["id"])
         # centroid running mean over the pre-attach member count
         if doc_vector is not None:
-            centroid = get_event_centroid(conn, event_id)
-            n = conn.execute("SELECT doc_count FROM event WHERE id = ?",
-                             (event_id,)).fetchone()[0] or 0
+            centroid = await get_event_centroid(conn, event_id)
+            cur = await conn.execute(
+                "SELECT doc_count FROM event WHERE id = %s", (event_id,))
+            n = (await cur.fetchone())["doc_count"] or 0
             new_centroid = (update_centroid(centroid, n, doc_vector)
                             if centroid is not None and n > 0 else doc_vector)
-            _set_event_centroid(conn, event_id, new_centroid, "centroid")
-        conn.execute(
+            await _set_event_centroid(conn, event_id, new_centroid,
+                                      "centroid")
+        await conn.execute(
             "UPDATE event SET doc_count = doc_count + 1,"
-            " last_seen_at = MAX(COALESCE(last_seen_at, ?), ?),"
-            " window_start = MIN(COALESCE(window_start, ?), ?),"
-            " window_end = MAX(COALESCE(window_end, ?), ?)"
-            " WHERE id = ?",
+            " last_seen_at = GREATEST(COALESCE(last_seen_at, %s::date),"
+            "   %s::date),"
+            " window_start = LEAST(COALESCE(window_start, %s::date),"
+            "   %s::date),"
+            " window_end = GREATEST(COALESCE(window_end, %s::date),"
+            "   %s::date)"
+            " WHERE id = %s",
             (doc["doc_date"], doc["doc_date"], doc["doc_date"],
              doc["doc_date"], doc["doc_date"], doc["doc_date"], event_id))
     refreshed = await _maybe_refresh_summary(conn, provider, governor,
@@ -385,60 +401,65 @@ async def _attach(conn: sqlite3.Connection, provider: LLMProvider | None,
                             created_event=False, summary_refreshed=refreshed)
 
 
-def _create_new(conn: sqlite3.Connection, *, doc: sqlite3.Row,
-                doc_vector: list[float] | None, score: float | None,
-                method: str, adjudication: dict | None) -> AssignmentResult:
+async def _create_new(conn: psycopg.AsyncConnection, *, doc: _Row,
+                      doc_vector: list[float] | None, score: float | None,
+                      method: str,
+                      adjudication: dict | None) -> AssignmentResult:
     now = utc_now()
     title = (doc["title"] or doc["summary"] or "Untitled event")[:200]
-    with conn:
-        cur = conn.execute(
+    async with conn.transaction():
+        cur = await conn.execute(
             "INSERT INTO event (title, description, event_type, occurred_on,"
             " date_precision, doc_count, window_start, window_end,"
             " last_seen_at, grade, extractor_model, prompt_version,"
-            " created_at) VALUES (?,?,?,?, 'day', 1, ?, ?, ?, 1, ?, ?, ?)",
+            " created_at) VALUES (%s,%s,%s,%s, 'day', 1, %s, %s, %s, 1,"
+            " %s, %s, %s) RETURNING id",
             (title, doc["summary"], doc["event_type"], doc["doc_date"],
              doc["doc_date"], doc["doc_date"], doc["doc_date"],
              doc["model"], doc["prompt_version"], now))
-        event_id = int(cur.lastrowid)  # type: ignore[arg-type]
+        event_id = int((await cur.fetchone())["id"])
         if doc_vector is not None:
-            _set_event_centroid(conn, event_id, doc_vector, "centroid")
-        cur = conn.execute(
+            await _set_event_centroid(conn, event_id, doc_vector, "centroid")
+        cur = await conn.execute(
             "INSERT INTO event_assignment (document_id, event_id, method,"
-            " score, adjudication, created_at) VALUES (?,?,?,?,?,?)",
+            " score, adjudication, created_at) VALUES (%s,%s,%s,%s,%s,%s)"
+            " RETURNING id",
             (doc["id"], event_id, method, score,
              json.dumps(adjudication) if adjudication else None, now))
-        assignment_id = int(cur.lastrowid)  # type: ignore[arg-type]
+        assignment_id = int((await cur.fetchone())["id"])
     return AssignmentResult(assignment_id=assignment_id, event_id=event_id,
                             method=method, score=score, created_event=True)
 
 
 # -- title/summary refresh (log schedule: 3, 10, 25) -------------------------------
 
-async def _maybe_refresh_summary(conn: sqlite3.Connection,
+async def _maybe_refresh_summary(conn: psycopg.AsyncConnection,
                                  provider: LLMProvider | None,
                                  governor: Governor,
                                  event_id: int) -> bool:
     """One FAST call when the cluster crosses a refresh size; non-fatal."""
-    count = conn.execute("SELECT doc_count FROM event WHERE id = ?",
-                         (event_id,)).fetchone()[0]
+    cur = await conn.execute(
+        "SELECT doc_count FROM event WHERE id = %s", (event_id,))
+    count = (await cur.fetchone())["doc_count"]
     if count not in SUMMARY_REFRESH_SIZES or provider is None:
         return False
     model = provider.model_for(ModelTier.FAST)
     try:
-        governor.check(spend.cost_usd(
+        await governor.check(spend.cost_usd(
             model, input_tokens=EST_SUMMARY_INPUT_TOKENS,
             output_tokens=EST_SUMMARY_OUTPUT_TOKENS))
     except BudgetExceeded as e:
         log.warning("event summary refresh skipped (event %s): %s",
                     event_id, e)
         return False
-    rows = conn.execute(
+    cur = await conn.execute(
         "SELECT d.title, de.summary FROM event_assignment ea"
         " JOIN document d ON d.id = ea.document_id"
         " LEFT JOIN document_enrichment de ON de.document_id = d.id"
-        " WHERE ea.event_id = ?"
-        " ORDER BY COALESCE(d.published_at, d.fetched_at) DESC LIMIT ?",
-        (event_id, SUMMARY_MAX_DOCS)).fetchall()
+        " WHERE ea.event_id = %s"
+        " ORDER BY COALESCE(d.published_at, d.fetched_at) DESC LIMIT %s",
+        (event_id, SUMMARY_MAX_DOCS))
+    rows = await cur.fetchall()
     lines = [f"- {r['title'] or '(untitled)'}: {r['summary'] or ''}"
              for r in rows]
     try:
@@ -451,11 +472,11 @@ async def _maybe_refresh_summary(conn: sqlite3.Connection,
         log.warning("event summary refresh failed (event %s): %s",
                     event_id, e)
         return False
-    spend.record_call(conn, purpose=PURPOSE_SUMMARY,
-                      model=completion.model, usage=completion.usage)
-    with conn:
-        conn.execute("UPDATE event SET title = ?, description = ?"
-                     " WHERE id = ?",
-                     (completion.output.title, completion.output.summary,
-                      event_id))
+    await spend.record_call(conn, purpose=PURPOSE_SUMMARY,
+                            model=completion.model, usage=completion.usage)
+    async with conn.transaction():
+        await conn.execute("UPDATE event SET title = %s, description = %s"
+                           " WHERE id = %s",
+                           (completion.output.title,
+                            completion.output.summary, event_id))
     return True

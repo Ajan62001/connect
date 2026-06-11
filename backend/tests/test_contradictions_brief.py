@@ -11,7 +11,7 @@ from kb_factories import add_mentions, insert_doc, insert_source
 from connect.api.main import create_app
 from connect.knowledge import briefing, contradictions
 from connect.llm.spend import today_utc
-from connect.storage.db import utc_now
+from connect.storage.pg import utc_now
 
 
 @pytest.fixture()
@@ -21,42 +21,42 @@ def env(settings):
         yield client, app.state.container
 
 
-def make_claim(conn, text, verdict="unverified"):
-    with conn:
-        cur = conn.execute(
-            "INSERT INTO claim (text, verdict, created_at) VALUES (?,?,?)",
-            (text, verdict, utc_now()))
-    return int(cur.lastrowid)
+async def make_claim(conn, text, verdict="unverified"):
+    cur = await conn.execute(
+        "INSERT INTO claim (text, verdict, created_at) VALUES (%s,%s,%s)"
+        " RETURNING id",
+        (text, verdict, utc_now()))
+    return int((await cur.fetchone())["id"])
 
 
-def add_sighting(conn, claim_id, doc_id, stance="asserts"):
-    with conn:
-        conn.execute(
-            "INSERT INTO claim_sighting (claim_id, document_id, stance,"
-            " created_at) VALUES (?,?,?,?)",
-            (claim_id, doc_id, stance, utc_now()))
+async def add_sighting(conn, claim_id, doc_id, stance="asserts"):
+    await conn.execute(
+        "INSERT INTO claim_sighting (claim_id, document_id, stance,"
+        " created_at) VALUES (%s,%s,%s,%s)",
+        (claim_id, doc_id, stance, utc_now()))
 
 
-def add_evidence(conn, claim_id, doc_id, stance):
-    with conn:
-        conn.execute(
-            "INSERT INTO evidence (claim_id, document_id, stance, grade,"
-            " created_at) VALUES (?,?,?,2,?)",
-            (claim_id, doc_id, stance, utc_now()))
+async def add_evidence(conn, claim_id, doc_id, stance):
+    await conn.execute(
+        "INSERT INTO evidence (claim_id, document_id, stance, grade,"
+        " created_at) VALUES (%s,%s,%s,2,%s)",
+        (claim_id, doc_id, stance, utc_now()))
 
 
 # --- /api/contradictions ----------------------------------------------------------
 
-def test_contradictions_endpoints(env):
+async def test_contradictions_endpoints(env, db):
     client, container = env
-    conn = container.db
-    pib = insert_source(conn, "PIB", tier=1)
-    et = insert_source(conn, "ET", tier=2)
-    claim_id = make_claim(conn, "GST revenue doubled", verdict="mixed")
-    add_evidence(conn, claim_id, insert_doc(conn, source_id=pib),
-                 "supports")
-    add_evidence(conn, claim_id, insert_doc(conn, source_id=et), "refutes")
-    assert contradictions.scan(conn) == 1
+    conn = db
+    pib = await insert_source(conn, "PIB", tier=1)
+    et = await insert_source(conn, "ET", tier=2)
+    claim_id = await make_claim(conn, "GST revenue doubled",
+                                verdict="mixed")
+    await add_evidence(conn, claim_id,
+                       await insert_doc(conn, source_id=pib), "supports")
+    await add_evidence(conn, claim_id,
+                       await insert_doc(conn, source_id=et), "refutes")
+    assert await contradictions.scan(conn) == 1
 
     page = client.get("/api/contradictions").json()
     assert page["total"] == 1
@@ -90,16 +90,17 @@ def test_contradictions_endpoints(env):
 
 # --- brief: contradiction section ----------------------------------------------------
 
-def test_brief_contradiction_section(env):
+async def test_brief_contradiction_section(env, db):
     client, container = env
-    conn = container.db
-    pib = insert_source(conn, "PIB", tier=1)
-    et = insert_source(conn, "ET", tier=2)
-    claim_id = make_claim(conn, "Repo rate was hiked twice")
-    add_evidence(conn, claim_id, insert_doc(conn, source_id=pib),
-                 "supports")
-    add_evidence(conn, claim_id, insert_doc(conn, source_id=et), "refutes")
-    contradictions.scan(conn)
+    conn = db
+    pib = await insert_source(conn, "PIB", tier=1)
+    et = await insert_source(conn, "ET", tier=2)
+    claim_id = await make_claim(conn, "Repo rate was hiked twice")
+    await add_evidence(conn, claim_id,
+                       await insert_doc(conn, source_id=pib), "supports")
+    await add_evidence(conn, claim_id,
+                       await insert_doc(conn, source_id=et), "refutes")
+    await contradictions.scan(conn)
 
     sections = client.get("/api/brief/today").json()["sections"]
     items = sections["contradiction"]
@@ -114,17 +115,17 @@ def test_brief_contradiction_section(env):
 
 # --- brief: trending_claim section -----------------------------------------------------
 
-def test_brief_trending_section(env):
+async def test_brief_trending_section(env, db):
     client, container = env
-    conn = container.db
-    a = insert_source(conn, "ET", tier=2)
-    b = insert_source(conn, "Scroll", tier=3)
-    trending = make_claim(conn, "Centre to widen PLI scheme")
-    add_sighting(conn, trending, insert_doc(conn, source_id=a))
-    add_sighting(conn, trending, insert_doc(conn, source_id=b))
+    conn = db
+    a = await insert_source(conn, "ET", tier=2)
+    b = await insert_source(conn, "Scroll", tier=3)
+    trending = await make_claim(conn, "Centre to widen PLI scheme")
+    await add_sighting(conn, trending, await insert_doc(conn, source_id=a))
+    await add_sighting(conn, trending, await insert_doc(conn, source_id=b))
     # one source only -> below the threshold, never trends
-    quiet = make_claim(conn, "Single-source claim")
-    add_sighting(conn, quiet, insert_doc(conn, source_id=a))
+    quiet = await make_claim(conn, "Single-source claim")
+    await add_sighting(conn, quiet, await insert_doc(conn, source_id=a))
 
     sections = client.get("/api/brief/today").json()["sections"]
     items = sections["trending_claim"]
@@ -138,34 +139,34 @@ def test_brief_trending_section(env):
 
 # --- brief: suggestion scoring -----------------------------------------------------------
 
-def test_suggestion_scoring_components_and_reason(env):
+async def test_suggestion_scoring_components_and_reason(env, db):
     """A claim firing contradiction(2) + trending(1) + watch(2) +
     official-gap(1) scores 6; a trending-only claim scores
     trending(1) + official-gap(1) = 2; ordering follows the score."""
     client, container = env
-    conn = container.db
-    et = insert_source(conn, "ET", tier=2)
-    scroll = insert_source(conn, "Scroll", tier=3)
+    conn = db
+    et = await insert_source(conn, "ET", tier=2)
+    scroll = await insert_source(conn, "Scroll", tier=3)
 
-    hot = make_claim(conn, "SEBI fined the exchange")
-    d1 = insert_doc(conn, source_id=et)
-    d2 = insert_doc(conn, source_id=scroll)
-    add_sighting(conn, hot, d1)
-    add_sighting(conn, hot, d2)
-    add_evidence(conn, hot, d1, "supports")
-    add_evidence(conn, hot, d2, "refutes")
-    contradictions.scan(conn)
-    add_mentions(conn, d1, ("SEBI",))
-    entity_id = conn.execute("SELECT id FROM entity WHERE name='SEBI'"
-                             ).fetchone()[0]
-    with conn:
-        conn.execute(
-            "INSERT INTO watch (kind, label, entity_id, created_at)"
-            " VALUES ('entity', 'SEBI', ?, ?)", (entity_id, utc_now()))
+    hot = await make_claim(conn, "SEBI fined the exchange")
+    d1 = await insert_doc(conn, source_id=et)
+    d2 = await insert_doc(conn, source_id=scroll)
+    await add_sighting(conn, hot, d1)
+    await add_sighting(conn, hot, d2)
+    await add_evidence(conn, hot, d1, "supports")
+    await add_evidence(conn, hot, d2, "refutes")
+    await contradictions.scan(conn)
+    await add_mentions(conn, d1, ("SEBI",))
+    cur = await conn.execute("SELECT id FROM entity WHERE name='SEBI'")
+    entity_id = (await cur.fetchone())["id"]
+    await conn.execute(
+        "INSERT INTO watch (kind, label, entity_id, created_at)"
+        " VALUES ('entity', 'SEBI', %s, %s)", (entity_id, utc_now()))
 
-    warm = make_claim(conn, "Two-source trending claim")
-    add_sighting(conn, warm, insert_doc(conn, source_id=et))
-    add_sighting(conn, warm, insert_doc(conn, source_id=scroll))
+    warm = await make_claim(conn, "Two-source trending claim")
+    await add_sighting(conn, warm, await insert_doc(conn, source_id=et))
+    await add_sighting(conn, warm,
+                       await insert_doc(conn, source_id=scroll))
 
     sections = client.get("/api/brief/today").json()["sections"]
     items = sections["suggestion"]
@@ -183,36 +184,36 @@ def test_suggestion_scoring_components_and_reason(env):
     assert items[1]["reason"] == "2 sources in 48h · no tier-1 source yet"
 
 
-def test_suggestion_calendar_and_tier1_components(container):
+async def test_suggestion_calendar_and_tier1_components(container, db):
     """Calendar proximity (+1) fires for a claim whose linked event falls
     <= 90d before a calendar entry; a tier-1 sighting suppresses the
     official-gap component."""
-    conn = container.db
-    pib = insert_source(conn, "PIB", tier=1)
-    et = insert_source(conn, "ET", tier=2)
-    claim_id = make_claim(conn, "Scheme announced before the polls")
-    d1 = insert_doc(conn, source_id=pib)
-    d2 = insert_doc(conn, source_id=et)
-    add_sighting(conn, claim_id, d1)
-    add_sighting(conn, claim_id, d2)
+    conn = db
+    pib = await insert_source(conn, "PIB", tier=1)
+    et = await insert_source(conn, "ET", tier=2)
+    claim_id = await make_claim(conn, "Scheme announced before the polls")
+    d1 = await insert_doc(conn, source_id=pib)
+    d2 = await insert_doc(conn, source_id=et)
+    await add_sighting(conn, claim_id, d1)
+    await add_sighting(conn, claim_id, d2)
 
     today = today_utc()
-    with conn:
-        cur = conn.execute(
-            "INSERT INTO event (title, event_type, occurred_on, created_at)"
-            " VALUES ('Scheme launch', 'scheme_announcement', ?, ?)",
-            (today, utc_now()))
-        event_id = int(cur.lastrowid)
-        conn.execute(
-            "INSERT INTO event_assignment (document_id, event_id, method,"
-            " created_at) VALUES (?,?, 'attach', ?)",
-            (d1, event_id, utc_now()))
-        conn.execute(
-            "INSERT INTO calendar_event (kind, scope, occurs_on, label)"
-            " VALUES ('election', 'BR', date(?, '+30 days'),"
-            " 'Bihar election')", (today,))
+    cur = await conn.execute(
+        "INSERT INTO event (title, event_type, occurred_on, created_at)"
+        " VALUES ('Scheme launch', 'scheme_announcement', %s, %s)"
+        " RETURNING id",
+        (today, utc_now()))
+    event_id = int((await cur.fetchone())["id"])
+    await conn.execute(
+        "INSERT INTO event_assignment (document_id, event_id, method,"
+        " created_at) VALUES (%s,%s, 'attach', %s)",
+        (d1, event_id, utc_now()))
+    await conn.execute(
+        "INSERT INTO calendar_event (kind, scope, occurs_on, label)"
+        " VALUES ('election', 'BR', %s::date + 30, 'Bihar election')",
+        (today,))
 
-    drafts = briefing._suggestion_items(conn, today)
+    drafts = await briefing._suggestion_items(conn, today)
     assert len(drafts) == 1
     draft = drafts[0]
     # trending(1) + calendar(1); tier-1 source present -> NO official gap

@@ -21,6 +21,7 @@ from connect.analysis.schema import (
     StanceJudgment,
 )
 from connect.api.main import create_app
+from dbutil import q1, qall, qv
 
 
 @pytest.fixture()
@@ -30,14 +31,14 @@ def env(settings):
         yield client, app.state.container
 
 
-def wait_for_dossier(conn, dossier_id, timeout=10.0):
+async def wait_for_dossier(conn, dossier_id, timeout=10.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        row = conn.execute("SELECT status, error FROM dossier WHERE id=?",
-                           (dossier_id,)).fetchone()
+        row = await q1(conn, "SELECT status, error FROM dossier"
+                             " WHERE id=%s", dossier_id)
         if row and row["status"] in ("completed", "failed", "cancelled"):
             return row
-        time.sleep(0.02)
+        await asyncio.sleep(0.02)
     raise AssertionError(f"dossier {dossier_id} did not finish: {dict(row)}")
 
 
@@ -82,39 +83,42 @@ def make_provider() -> MockProvider:
     })
 
 
-def seed_corpus(conn) -> dict[str, int]:
-    pib = insert_source(conn, "PIB", tier=1)
-    et = insert_source(conn, "ET", tier=2)
-    scroll = insert_source(conn, "Scroll", tier=2)
-    d1 = insert_doc(conn, title="RBI raises repo rate", source_id=pib,
-                    text="The RBI raised the repo rate by 25 basis points "
-                         "on Friday, the central bank announced.")
-    d2 = insert_doc(conn, title="Repo rate hiked", source_id=et,
-                    text="Officials said the RBI raised the repo rate to "
-                         "curb inflation across markets.")
-    d3 = insert_doc(conn, title="Denial report", source_id=scroll,
-                    text="Contrary to reports, the RBI did not raise the "
-                         "repo rate this month, raised repo rate talk "
-                         "notwithstanding.")
+async def seed_corpus(conn) -> dict[str, int]:
+    pib = await insert_source(conn, "PIB", tier=1)
+    et = await insert_source(conn, "ET", tier=2)
+    scroll = await insert_source(conn, "Scroll", tier=2)
+    d1 = await insert_doc(
+        conn, title="RBI raises repo rate", source_id=pib,
+        text="The RBI raised the repo rate by 25 basis points "
+             "on Friday, the central bank announced.")
+    d2 = await insert_doc(
+        conn, title="Repo rate hiked", source_id=et,
+        text="Officials said the RBI raised the repo rate to "
+             "curb inflation across markets.")
+    d3 = await insert_doc(
+        conn, title="Denial report", source_id=scroll,
+        text="Contrary to reports, the RBI did not raise the "
+             "repo rate this month, raised repo rate talk "
+             "notwithstanding.")
     return {"d1": d1, "d2": d2, "d3": d3}
 
 
-def run_analysis(client, container) -> tuple[int, int]:
+async def run_analysis(client, container, db) -> tuple[int, int]:
     container.analysis.provider = make_provider()
     res = client.post("/api/analyses", json={
         "input_text": "RBI raised the repo rate and should cut it"})
     assert res.status_code == 202
     body = res.json()
-    wait_for_dossier(container.db, body["analysis_id"])
+    await wait_for_dossier(db, body["analysis_id"])
     return body["analysis_id"], body["job_id"]
 
 
 # --- create / detail / list ----------------------------------------------------------------
 
-def test_analysis_happy_path(env):
+async def test_analysis_happy_path(env, db):
     client, container = env
-    docs = seed_corpus(container.db)
-    analysis_id, job_id = run_analysis(client, container)
+    docs = await seed_corpus(db)
+    analysis_id, job_id = await run_analysis(client, container, db)
 
     detail = client.get(f"/api/analyses/{analysis_id}").json()
     assert detail["status"] == "completed"
@@ -163,27 +167,29 @@ def test_analysis_happy_path(env):
     assert "did not raise" in evidence[docs["d3"]]["quote"]
 
     # KB writeback: canonical claim verdict + history + grade-2 evidence
-    conn = container.db
-    claim_row = conn.execute("SELECT verdict, confidence FROM claim"
-                             " WHERE id=?", (checkable["id"],)).fetchone()
+    conn = db
+    claim_row = await q1(conn, "SELECT verdict, confidence FROM claim"
+                               " WHERE id=%s", checkable["id"])
     assert claim_row["verdict"] == "supported"
-    history = conn.execute(
+    history = await qall(
+        conn,
         'SELECT verdict, "trigger", evidence_snapshot FROM verdict_history'
-        " WHERE claim_id=?", (checkable["id"],)).fetchall()
+        " WHERE claim_id=%s", checkable["id"])
     assert [h["verdict"] for h in history] == ["supported"]
     assert history[0]["trigger"] == f"analysis:{analysis_id}"
-    assert len(json.loads(history[0]["evidence_snapshot"])) == 3
-    assert conn.execute("SELECT COUNT(*) FROM evidence WHERE claim_id=?"
-                        " AND grade=2", (checkable["id"],)).fetchone()[0] == 3
+    assert len(history[0]["evidence_snapshot"]) == 3
+    assert await qv(conn, "SELECT COUNT(*) FROM evidence WHERE claim_id=%s"
+                          " AND grade=2", checkable["id"]) == 3
 
     # contradiction scan ran after the evidence inserts
-    k = conn.execute("SELECT n_support, n_refute, status FROM contradiction"
-                     " WHERE claim_id=?", (checkable["id"],)).fetchone()
+    k = await q1(conn,
+                 "SELECT n_support, n_refute, status FROM contradiction"
+                 " WHERE claim_id=%s", checkable["id"])
     assert (k["n_support"], k["n_refute"], k["status"]) == (2, 1, "open")
 
     # spend was ledgered under the analysis purpose
-    assert conn.execute("SELECT COUNT(*) FROM llm_call WHERE"
-                        " purpose='analysis'").fetchone()[0] > 0
+    assert await qv(conn, "SELECT COUNT(*) FROM llm_call WHERE"
+                          " purpose='analysis'") > 0
 
     # list endpoint carries the verdict_summary
     page = client.get("/api/analyses").json()
@@ -212,15 +218,15 @@ def test_analysis_keyless_503(env):
     assert res.status_code == 503
 
 
-def test_analysis_options_cap_k(env):
+async def test_analysis_options_cap_k(env, db):
     client, container = env
-    seed_corpus(container.db)
+    await seed_corpus(db)
     container.analysis.provider = make_provider()
     res = client.post("/api/analyses", json={
         "input_text": "RBI", "options": {"max_evidence_per_claim": 1}})
     assert res.status_code == 202
     analysis_id = res.json()["analysis_id"]
-    wait_for_dossier(container.db, analysis_id)
+    await wait_for_dossier(db, analysis_id)
     detail = client.get(f"/api/analyses/{analysis_id}").json()
     checkable = [c for c in detail["claims"] if c["checkable"]][0]
     assert len(checkable["evidence"]) == 1  # K capped the evidence pool
@@ -242,10 +248,10 @@ def parse_sse(text: str) -> list[tuple[int, str, dict]]:
     return events
 
 
-def test_sse_replay_ordering_and_resume(env):
+async def test_sse_replay_ordering_and_resume(env, db):
     client, container = env
-    seed_corpus(container.db)
-    analysis_id, _job_id = run_analysis(client, container)
+    await seed_corpus(db)
+    analysis_id, _job_id = await run_analysis(client, container, db)
 
     with client.stream("GET",
                        f"/api/analyses/{analysis_id}/events") as res:
@@ -296,13 +302,13 @@ def test_sse_replay_ordering_and_resume(env):
     assert tail == []
 
 
-def test_sse_error_event_on_failure(env):
+async def test_sse_error_event_on_failure(env, db):
     client, container = env
     # provider with no responders -> normalize raises -> analysis fails
     container.analysis.provider = MockProvider(respond_by_schema={})
     res = client.post("/api/analyses", json={"input_text": "x"})
     analysis_id = res.json()["analysis_id"]
-    row = wait_for_dossier(container.db, analysis_id)
+    row = await wait_for_dossier(db, analysis_id)
     assert row["status"] == "failed"
     detail = client.get(f"/api/analyses/{analysis_id}").json()
     assert detail["status"] == "failed"
@@ -324,36 +330,35 @@ class HangingProvider(MockProvider):
         return await super().complete_structured(**kwargs)  # pragma: no cover
 
 
-def test_cancel_running_analysis(env):
+async def test_cancel_running_analysis(env, db):
     client, container = env
     container.analysis.provider = HangingProvider()
     res = client.post("/api/analyses", json={"input_text": "x"})
     analysis_id = res.json()["analysis_id"]
     job_id = res.json()["job_id"]
-    conn = container.db
+    conn = db
 
     # wait until the job is actually running (normalize stage started)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        row = conn.execute("SELECT status FROM dossier WHERE id=?",
-                           (analysis_id,)).fetchone()
+        row = await q1(conn, "SELECT status FROM dossier WHERE id=%s",
+                       analysis_id)
         if row["status"] == "running":
             break
-        time.sleep(0.02)
+        await asyncio.sleep(0.02)
     assert row["status"] == "running"
 
     assert client.post(
         f"/api/analyses/{analysis_id}/cancel").status_code == 202
-    row = wait_for_dossier(conn, analysis_id)
+    row = await wait_for_dossier(conn, analysis_id)
     assert row["status"] == "cancelled"
 
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        job = conn.execute("SELECT status FROM job WHERE id=?",
-                           (job_id,)).fetchone()
+        job = await q1(conn, "SELECT status FROM job WHERE id=%s", job_id)
         if job["status"] == "cancelled":
             break
-        time.sleep(0.02)
+        await asyncio.sleep(0.02)
     assert job["status"] == "cancelled"
 
     detail = client.get(f"/api/analyses/{analysis_id}").json()

@@ -1,0 +1,179 @@
+# connect v0.2 — six-container topology (design: docs/design/v02-runtime-deploy.md §1/§7).
+#
+#   caddy ── /api/* ─► api (uvicorn x2) ─┐
+#     └──── /*     ─► frontend (next)    ├─► postgres (pgvector/pg17)
+#   worker x2 (queue + beat-in-worker) ──┘      ▲
+#   migrate (one-shot, gates api/worker) ───────┘
+#   backup (prod profile: pg_dump + blob snapshots)
+#
+# There is deliberately NO separate beat service: the scheduler is a
+# coroutine inside every worker; exactly one leads via a PG advisory lock.
+#
+# Usage
+#   cp .env.example .env   # set POSTGRES_PASSWORD at minimum
+#   docker compose up -d --build          # full stack (localhost)
+#   docker compose --profile prod up -d   # ... plus the backup sidecar
+#   docker compose up -d postgres         # dev profile in practice: only PG,
+#                                         # run uvicorn/worker/npm on the host
+#   docker compose up -d --scale worker=3 # more workers
+#
+# HOST PORTS — this machine vs a real deployment:
+#   The defaults below avoid every live port on this box (8000 unrelated
+#   app, 8001 live v0.1 backend, 3000 live v0.1 frontend, 5432 unrelated
+#   Postgres, 55432 db-test):
+#     http  -> ${CONNECT_HTTP_PORT:-8080}     (VPS: set CONNECT_HTTP_PORT=80)
+#     https -> ${CONNECT_HTTPS_PORT:-8443}    (VPS: set CONNECT_HTTPS_PORT=443)
+#     pg    -> 127.0.0.1:${CONNECT_PG_HOST_PORT:-55433} (no-docker dev DSN)
+#   On a VPS, ports 80/443 are REQUIRED for Caddy's Let's Encrypt issuance
+#   when CONNECT_DOMAIN is set.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17 # ships vector + contrib (pg_trgm) — no custom build
+    environment:
+      POSTGRES_DB: connect
+      POSTGRES_USER: connect
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # loopback-only, for the no-docker dev flow (uvicorn/pytest on the
+      # host). NEVER 5432 (occupied) / 55432 (db-test) on this machine.
+      - "127.0.0.1:${CONNECT_PG_HOST_PORT:-55433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U connect -d connect"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # One-shot: creates/migrates the schema, then exits 0. api/worker gate on
+  # it (service_completed_successfully); init_db's pg_advisory_xact_lock
+  # makes even racing manual starts safe — single-flight twice over.
+  migrate:
+    build: ./backend
+    image: connect-backend
+    command: python -m connect.tools.migrate
+    env_file: .env
+    environment:
+      CONNECT_DATABASE_URL: ${CONNECT_DATABASE_URL:-postgresql://connect:${POSTGRES_PASSWORD:-}@postgres:5432/connect}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: ./backend
+    image: connect-backend
+    # the image's default CMD, restated for greppability: api = uvicorn x2
+    # workers; --proxy-headers because Caddy terminates TLS
+    command:
+      [
+        "uvicorn",
+        "connect.api.main:app",
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--workers", "2",
+        "--proxy-headers",
+        "--forwarded-allow-ips", "*",
+      ]
+    env_file: .env
+    environment:
+      CONNECT_DATABASE_URL: ${CONNECT_DATABASE_URL:-postgresql://connect:${POSTGRES_PASSWORD:-}@postgres:5432/connect}
+      CONNECT_BLOB_DIR: /data/blobs
+    volumes:
+      - blobs:/data/blobs
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-m", "connect.tools.healthcheck"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  worker:
+    build: ./backend
+    image: connect-backend
+    command: python -m connect.workers.main
+    env_file: .env
+    environment:
+      CONNECT_DATABASE_URL: ${CONNECT_DATABASE_URL:-postgresql://connect:${POSTGRES_PASSWORD:-}@postgres:5432/connect}
+      CONNECT_BLOB_DIR: /data/blobs
+    volumes:
+      - blobs:/data/blobs
+    deploy:
+      replicas: 2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-m", "connect.tools.healthcheck", "--worker"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    image: connect-frontend
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  proxy:
+    image: caddy:2-alpine
+    ports:
+      - "${CONNECT_HTTP_PORT:-8080}:80"
+      - "${CONNECT_HTTPS_PORT:-8443}:443"
+    environment:
+      # :- (not just -): an EMPTY CONNECT_DOMAIN in .env must also become
+      # "localhost" — Caddy's {$VAR:default} only covers the UNSET case,
+      # and an empty site address turns the block into global options
+      CONNECT_DOMAIN: ${CONNECT_DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # certificates/ACME state — must persist
+      - caddy_config:/config
+    depends_on:
+      - api
+      - frontend
+    restart: unless-stopped
+
+  # prod profile only: nightly pg_dump + hardlink blob snapshots into the
+  # backups volume (7 daily + 4 weekly). See ops/backup/.
+  backup:
+    profiles: [prod]
+    build: ./ops/backup
+    image: connect-backup
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: connect
+      PGUSER: connect
+      PGPASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      - blobs:/blobs:ro
+      - backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata: {}
+  blobs: {} # shared by api (uploads) + workers (ingest); content-addressed
+  caddy_data: {}
+  caddy_config: {}
+  backups: {} # on a VPS: bind to a separate disk / offsite rsync target

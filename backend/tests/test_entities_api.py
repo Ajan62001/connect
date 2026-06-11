@@ -30,7 +30,7 @@ def t1(entities, *, topics=("markets",), claims=()):
 
 
 @pytest.fixture()
-def corpus(env):
+async def corpus(env, db):
     """3 docs: SEBI in all; Adani Group in 2; RBI in 1 -> SEBI+Adani
     co-occur twice (kept, lift 2/2=1.0), SEBI+RBI once (dropped, <2)."""
     client, container = env
@@ -44,20 +44,20 @@ def corpus(env):
         "for foreign portfolio investors in government bonds.",
     ]
     for body in bodies:
-        result = container.pipeline.ingest_text(body)
+        result = await container.pipeline.ingest_text(db, body)
         docs.append(result.document)
-    persist.persist_t1(
-        container.db, document_id=docs[0].id, model="m",
+    await persist.persist_t1(
+        db, document_id=docs[0].id, model="m",
         result=t1([("SEBI", "organization"), ("Adani Group", "company")],
                   topics=("securities-regulation", "markets"),
                   claims=[("SEBI cited audit gaps.", 0.8,
                            "cited audit gaps in the order")]))
-    persist.persist_t1(
-        container.db, document_id=docs[1].id, model="m",
+    await persist.persist_t1(
+        db, document_id=docs[1].id, model="m",
         result=t1([("SEBI", "organization"), ("Adani Group", "company")],
                   topics=("securities-regulation",)))
-    persist.persist_t1(
-        container.db, document_id=docs[2].id, model="m",
+    await persist.persist_t1(
+        db, document_id=docs[2].id, model="m",
         result=t1([("SEBI", "organization"),
                    ("Reserve Bank of India", "organization")],
                   topics=("banking", "markets")))

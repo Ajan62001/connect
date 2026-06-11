@@ -12,8 +12,9 @@ deterministic paths are free, so T2 never blocks on budget — it degrades.
 from __future__ import annotations
 
 import logging
-import sqlite3
 from typing import Any
+
+import psycopg
 
 from connect.knowledge.linking import event_clusterer, story_threader
 from connect.llm.provider import LLMProvider
@@ -22,23 +23,25 @@ from connect.llm.spend import Governor
 log = logging.getLogger(__name__)
 
 
-def already_assigned(conn: sqlite3.Connection, document_id: int) -> int | None:
+async def already_assigned(conn: psycopg.AsyncConnection,
+                           document_id: int) -> int | None:
     """The event this doc is already clustered into, if any (idempotence)."""
-    row = conn.execute(
+    cur = await conn.execute(
         "SELECT event_id FROM event_assignment"
-        " WHERE document_id = ? AND event_id IS NOT NULL"
-        " ORDER BY id DESC LIMIT 1", (document_id,)).fetchone()
-    return int(row[0]) if row else None
+        " WHERE document_id = %s AND event_id IS NOT NULL"
+        " ORDER BY id DESC LIMIT 1", (document_id,))
+    row = await cur.fetchone()
+    return int(row["event_id"]) if row else None
 
 
-async def process_document(conn: sqlite3.Connection,
-                            provider: LLMProvider | None,
-                            governor: Governor, document_id: int, *,
-                            triggers: list[str]) -> dict[str, Any]:
+async def process_document(conn: psycopg.AsyncConnection,
+                           provider: LLMProvider | None,
+                           governor: Governor, document_id: int, *,
+                           triggers: list[str]) -> dict[str, Any]:
     """Event assignment (+ threading for new events) for one T1-enriched
     document. Idempotent: an already-assigned doc is left alone."""
     stats: dict[str, Any] = {"document_id": document_id, "triggers": triggers}
-    existing = already_assigned(conn, document_id)
+    existing = await already_assigned(conn, document_id)
     if existing is not None:
         stats["skipped"] = "already_assigned"
         stats["event_id"] = existing
@@ -60,14 +63,16 @@ async def process_document(conn: sqlite3.Connection,
         stats["threading"] = threading
     else:
         # attaching to an event inside a story moves the thread
-        row = conn.execute("SELECT story_id FROM event WHERE id = ?",
-                           (result.event_id,)).fetchone()
+        cur = await conn.execute(
+            "SELECT story_id FROM event WHERE id = %s", (result.event_id,))
+        row = await cur.fetchone()
         if row is not None and row["story_id"] is not None:
-            story_threader.refresh_story(conn, row["story_id"])
+            await story_threader.refresh_story(conn, row["story_id"])
             stats["story_id"] = row["story_id"]
 
-    with conn:
-        conn.execute(
-            "UPDATE document SET enrichment_tier = MAX(enrichment_tier, 2)"
-            " WHERE id = ?", (document_id,))
+    async with conn.transaction():
+        await conn.execute(
+            "UPDATE document SET"
+            " enrichment_tier = GREATEST(enrichment_tier, 2)"
+            " WHERE id = %s", (document_id,))
     return stats

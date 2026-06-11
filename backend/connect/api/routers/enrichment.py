@@ -23,16 +23,7 @@ async def sweep(body: EnrichmentSweepRequest,
                             detail="ANTHROPIC_API_KEY not set")
     limit = body.limit
     target = body.target  # 'statements' = the pre-t1-v2 backfill
-
-    if body.mode == "sync":
-        async def _run():
-            return str(await service.run_sync(limit, target=target))
-        kind = "enrich_t1_sync"
-    else:
-        async def _run():
-            return str(await service.run_batch(limit, target=target))
-        kind = "enrich_t1_batch"
-
-    job_id = jobs.submit(kind, {"mode": body.mode, "limit": limit,
-                                "target": target}, _run)
+    kind = "enrich_t1_sync" if body.mode == "sync" else "enrich_t1_batch"
+    job_id = await jobs.enqueue(kind, {"mode": body.mode, "limit": limit,
+                                       "target": target})
     return JobAccepted(job_id=job_id)

@@ -1,28 +1,52 @@
 """The storage contract — the ONLY module in the codebase that contains DDL.
 
-Schema v1 is the FULL schema (core + KB tables) so later phases only ever
-add migrations, never rewrite. Every CHECK vocabulary is built from
-domain/enums.py — the single home of controlled vocabularies.
+v0.2: the canonical schema is the PostgreSQL baseline (``PG_SCHEMA_VERSION``,
+``PG_DDL``, ``create_all_pg``) — the full v9 SQLite schema translated per
+docs/design/v02-postgres-port.md §1 PLUS the tenancy DDL from
+docs/design/v02-tenancy-auth.md §2 (app_user / user_session / invite /
+app_setting and the ownership/visibility columns), shipped together so there
+is exactly one schema cutover and no PG-side rebuild a week later.
 
-Conventions (log_buster discipline):
-- INTEGER PRIMARY KEY ids everywhere (rowid-backed).
-- Timestamps are ISO-8601 UTC TEXT.
-- FTS5 external-content table over document(title, content_text), trigger-
-  maintained.
-- ``SCHEMA_VERSION`` is an integer starting at 1; migrations.py reconciles
-  older DBs forward and refuses newer ones.
-- The sqlite-vec virtual table DDL lives here too (VEC_DOCUMENT_DDL) but is
-  executed only by knowledge/vector.py when the extension actually loads —
-  vector availability must never break startup.
+PG conventions:
+- ``bigint GENERATED ALWAYS AS IDENTITY`` PKs (the ETL inserts explicit ids
+  with ``OVERRIDING SYSTEM VALUE`` then ``setval``).
+- ``timestamptz`` for timestamps, ``date`` for day-precision columns; both
+  are read back as the v0.1 ISO strings via the loaders in storage/pg.py, so
+  the frozen Pydantic contracts (timestamps as ``str``) stay untouched.
+- ``jsonb`` for JSON-in-TEXT columns (same ``'{}'``/``'[]'`` defaults).
+- Every CHECK constraint has an explicit name (``ck_<table>_<column>``) so
+  vocabulary changes become one ``ALTER TABLE ... DROP/ADD CONSTRAINT`` —
+  the SQLite copy-out/drop/recreate rebuild dance is dead.
+- FTS5 external-content tables + their 6 sync triggers are replaced by
+  GENERATED tsvector columns + GIN (desync structurally impossible);
+  pg_trgm GIN indexes keep entity substring-search parity.
+- Vector BLOBs become pgvector ``vector(384)`` + HNSW (dim column dies —
+  the type enforces 384).
+- Self/circular FKs (document.canonical_document_id, edge.superseded_by_
+  edge_id, dossier.parent_question_id) are DEFERRABLE INITIALLY IMMEDIATE:
+  free at runtime, lets the one-shot ETL defer.
+- Tenancy ownership columns ship NULLABLE with single-user-safe defaults
+  (visibility 'shared', origin 'polled', owner/user NULL = system) so the
+  v0.1 code paths keep working before the auth workstream lands; NOT NULL
+  tightening and the view_cursor PK swap are cheap PG ALTERs owned by that
+  workstream (no rebuild).
+
+Every CHECK vocabulary is built from domain/enums.py — the single home of
+controlled vocabularies. ``PG_SCHEMA_VERSION`` starts a FRESH lineage at 1
+(the SQLite v1–v10 lineage below is closed; the ETL targets PG v1).
+
+The closed v0.1 SQLite lineage moved to connect/tools/legacy_sqlite/ at
+port phase P2 (dead reference for the one-shot ETL only).
 """
 
 from __future__ import annotations
 
-import sqlite3
+from typing import TYPE_CHECKING
 
 from connect.domain import enums as E
 
-SCHEMA_VERSION = 9
+if TYPE_CHECKING:  # psycopg is only needed at runtime by storage/pg.py
+    import psycopg
 
 
 # --- error hierarchy ---------------------------------------------------------
@@ -35,335 +59,513 @@ class StorageVersionError(StorageError):
     """DB schema_version is newer than this code's — refuse to open."""
 
 
-# --- DDL ----------------------------------------------------------------------
+# ==============================================================================
+# PostgreSQL baseline schema (v0.2, the canonical DDL) — fresh lineage, v1.
+# ==============================================================================
 
-_DDL_META = """
+PG_SCHEMA_VERSION = 2
+
+# Extensions first: the compose image is pgvector/pgvector:pg17, so both are
+# present; IF NOT EXISTS keeps re-entry harmless.
+_PG_DDL_EXTENSIONS = (
+    "CREATE EXTENSION IF NOT EXISTS vector",
+    "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+)
+
+_PG_DDL_META = """
 CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+    key   text PRIMARY KEY,
+    value text NOT NULL
 )"""
 
-_DDL_SOURCE = f"""
+
+# --- tenancy (v02-tenancy-auth.md §2; tables only — auth CODE is the next
+# workstream). 'app_user' not 'user': reserved word in PG. ---------------------
+
+_PG_DDL_APP_USER = f"""
+CREATE TABLE IF NOT EXISTS app_user (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    google_sub  text UNIQUE,
+    email       text NOT NULL UNIQUE,
+    name        text,
+    avatar_url  text,
+    role        text NOT NULL DEFAULT 'member'
+                CONSTRAINT ck_app_user_role CHECK (role IN {E.sql_in(E.ROLES)}),
+    disabled    boolean NOT NULL DEFAULT false,
+    daily_budget_usd               double precision,
+    investigation_daily_budget_usd double precision,
+    created_at    timestamptz NOT NULL,
+    last_login_at timestamptz
+)"""
+# google_sub is NULLABLE: the ETL pre-creates the admin by email; filled at
+# first login. daily budget columns NULL = member default from app_setting.
+
+_PG_DDL_USER_SESSION = """
+CREATE TABLE IF NOT EXISTS user_session (
+    id           text PRIMARY KEY,
+    user_id      bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    created_at   timestamptz NOT NULL,
+    expires_at   timestamptz NOT NULL,
+    last_seen_at timestamptz
+)"""
+
+_PG_DDL_USER_SESSION_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_session_expires ON user_session(expires_at)",
+)
+
+_PG_DDL_INVITE = """
+CREATE TABLE IF NOT EXISTS invite (
+    email      text PRIMARY KEY,
+    invited_by bigint REFERENCES app_user(id),
+    note       text,
+    created_at timestamptz NOT NULL
+)"""
+
+_PG_DDL_APP_SETTING = """
+CREATE TABLE IF NOT EXISTS app_setting (
+    key   text PRIMARY KEY,
+    value text NOT NULL
+)"""
+
+
+# --- core ingestion ----------------------------------------------------------
+
+_PG_DDL_SOURCE = f"""
 CREATE TABLE IF NOT EXISTS source (
-    id                 INTEGER PRIMARY KEY,
-    name               TEXT NOT NULL UNIQUE,
-    type               TEXT NOT NULL CHECK (type IN {E.sql_in(E.SOURCE_TYPES)}),
-    config             TEXT NOT NULL DEFAULT '{{}}',
-    credibility_tier   INTEGER NOT NULL DEFAULT 3
+    id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name               text NOT NULL UNIQUE,
+    type               text NOT NULL
+                       CONSTRAINT ck_source_type CHECK (type IN {E.sql_in(E.SOURCE_TYPES)}),
+    config             jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    credibility_tier   integer NOT NULL DEFAULT 3
+                       CONSTRAINT ck_source_credibility_tier
                        CHECK (credibility_tier IN {E.sql_in(E.CREDIBILITY_TIERS)}),
-    enabled            INTEGER NOT NULL DEFAULT 1,
-    t1_exempt          INTEGER NOT NULL DEFAULT 0,
-    notes              TEXT,
-    max_items_per_poll INTEGER,
-    max_items_per_day  INTEGER,
-    quality_score      REAL,
-    created_at         TEXT NOT NULL,
-    last_polled_at     TEXT,
-    last_poll_status   TEXT
+    enabled            boolean NOT NULL DEFAULT true,
+    t1_exempt          boolean NOT NULL DEFAULT false,
+    notes              text,
+    max_items_per_poll integer,
+    max_items_per_day  integer,
+    quality_score      double precision,
+    created_at         timestamptz NOT NULL,
+    last_polled_at     timestamptz,
+    last_poll_status   text
 )"""
 
-_DDL_DOCUMENT = f"""
+# search_tsv replaces the FTS5 external-content table + 3 triggers. The
+# left(..., 200000) guard exists because tsvector rows cap at ~1MB and
+# positions at 16383 — a runaway PDF must not fail the INSERT.
+# to_tsvector with an explicit config is IMMUTABLE, so the generated column
+# is legal. Ownership: owner NULL = system (polled/web docs); visibility
+# 'shared' + origin 'polled' are the single-user-safe defaults.
+_PG_DDL_DOCUMENT = f"""
 CREATE TABLE IF NOT EXISTS document (
-    id                    INTEGER PRIMARY KEY,
-    source_id             INTEGER REFERENCES source(id) ON DELETE SET NULL,
-    url                   TEXT,
-    canonical_url         TEXT,
-    title                 TEXT,
-    author                TEXT,
-    published_at          TEXT,
-    fetched_at            TEXT NOT NULL,
-    media_type            TEXT NOT NULL DEFAULT 'html'
+    id                    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    source_id             bigint REFERENCES source(id) ON DELETE SET NULL,
+    url                   text,
+    canonical_url         text,
+    title                 text,
+    author                text,
+    published_at          timestamptz,
+    fetched_at            timestamptz NOT NULL,
+    media_type            text NOT NULL DEFAULT 'html'
+                          CONSTRAINT ck_document_media_type
                           CHECK (media_type IN {E.sql_in(E.MEDIA_TYPES)}),
-    language              TEXT,
-    content_text          TEXT NOT NULL,
-    content_hash          TEXT NOT NULL UNIQUE,
-    raw_blob_path         TEXT,
-    enrichment_tier       INTEGER NOT NULL DEFAULT 0,
-    enrichment_status     TEXT NOT NULL DEFAULT 'pending'
+    language              text,
+    content_text          text NOT NULL,
+    content_hash          text NOT NULL UNIQUE,
+    raw_blob_path         text,
+    enrichment_tier       integer NOT NULL DEFAULT 0,
+    enrichment_status     text NOT NULL DEFAULT 'pending'
+                          CONSTRAINT ck_document_enrichment_status
                           CHECK (enrichment_status IN {E.sql_in(E.ENRICHMENT_STATUSES)}),
-    simhash               INTEGER,
-    canonical_document_id INTEGER REFERENCES document(id),
-    watch_hit             INTEGER NOT NULL DEFAULT 0
+    simhash               bigint,
+    canonical_document_id bigint REFERENCES document(id)
+                          DEFERRABLE INITIALLY IMMEDIATE,
+    watch_hit             boolean NOT NULL DEFAULT false,
+    owner_id              bigint REFERENCES app_user(id),
+    visibility            text NOT NULL DEFAULT 'shared'
+                          CONSTRAINT ck_document_visibility
+                          CHECK (visibility IN {E.sql_in(E.VISIBILITIES)}),
+    origin                text NOT NULL DEFAULT 'polled'
+                          CONSTRAINT ck_document_origin
+                          CHECK (origin IN {E.sql_in(E.DOCUMENT_ORIGINS)}),
+    search_tsv            tsvector GENERATED ALWAYS AS (
+        setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+        setweight(to_tsvector('english', left(content_text, 200000)), 'B')
+    ) STORED
 )"""
 
-_DDL_DOCUMENT_INDEXES = (
+_PG_DDL_DOCUMENT_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_document_source ON document(source_id)",
     "CREATE INDEX IF NOT EXISTS idx_document_url ON document(url)",
     "CREATE INDEX IF NOT EXISTS idx_document_published ON document(published_at)",
     "CREATE INDEX IF NOT EXISTS idx_document_fetched ON document(fetched_at)",
     "CREATE INDEX IF NOT EXISTS idx_document_status ON document(enrichment_status)",
+    "CREATE INDEX IF NOT EXISTS idx_document_tsv ON document USING gin(search_tsv)",
+    "CREATE INDEX IF NOT EXISTS idx_document_owner ON document(owner_id)"
+    " WHERE owner_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_document_visibility_fetched"
+    " ON document(visibility, fetched_at DESC)",
 )
 
-# FTS5 external-content table + sync triggers (the canonical FTS5 pattern).
-_DDL_DOCUMENT_FTS = """
-CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(
-    title, content_text,
-    content='document', content_rowid='id'
-)"""
-
-_DDL_DOCUMENT_FTS_TRIGGERS = (
-    """
-CREATE TRIGGER IF NOT EXISTS document_ai AFTER INSERT ON document BEGIN
-    INSERT INTO document_fts(rowid, title, content_text)
-    VALUES (new.id, new.title, new.content_text);
-END""",
-    """
-CREATE TRIGGER IF NOT EXISTS document_ad AFTER DELETE ON document BEGIN
-    INSERT INTO document_fts(document_fts, rowid, title, content_text)
-    VALUES ('delete', old.id, old.title, old.content_text);
-END""",
-    """
-CREATE TRIGGER IF NOT EXISTS document_au
-AFTER UPDATE OF title, content_text ON document BEGIN
-    INSERT INTO document_fts(document_fts, rowid, title, content_text)
-    VALUES ('delete', old.id, old.title, old.content_text);
-    INSERT INTO document_fts(rowid, title, content_text)
-    VALUES (new.id, new.title, new.content_text);
-END""",
-)
-
-# v2: in-content links extracted from a document's raw HTML. Lineage of a
-# followed link lives here (resolved_document_id) AND as a document-[links_to]->
-# document edge — the table is the work queue, the edge is the graph.
-_DDL_DOCUMENT_LINK = f"""
+_PG_DDL_DOCUMENT_LINK = f"""
 CREATE TABLE IF NOT EXISTS document_link (
-    id                   INTEGER PRIMARY KEY,
-    document_id          INTEGER NOT NULL REFERENCES document(id),
-    url                  TEXT NOT NULL,
-    anchor_text          TEXT,
-    is_file              INTEGER NOT NULL DEFAULT 0,
-    is_official          INTEGER NOT NULL DEFAULT 0,
-    status               TEXT NOT NULL DEFAULT 'not_followed'
+    id                   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    document_id          bigint NOT NULL REFERENCES document(id),
+    url                  text NOT NULL,
+    anchor_text          text,
+    is_file              boolean NOT NULL DEFAULT false,
+    is_official          boolean NOT NULL DEFAULT false,
+    status               text NOT NULL DEFAULT 'not_followed'
+                         CONSTRAINT ck_document_link_status
                          CHECK (status IN {E.sql_in(E.LINK_STATUSES)}),
-    resolved_document_id INTEGER REFERENCES document(id),
-    error                TEXT,
-    created_at           TEXT,
+    resolved_document_id bigint REFERENCES document(id),
+    error                text,
+    created_at           timestamptz,
     UNIQUE (document_id, url)
 )"""
 
-_DDL_DOCUMENT_LINK_INDEXES = (
+_PG_DDL_DOCUMENT_LINK_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_document_link_document"
     " ON document_link(document_id)",
     "CREATE INDEX IF NOT EXISTS idx_document_link_resolved"
     " ON document_link(resolved_document_id)",
 )
 
-# Exported for migrations.py (migrate_1_to_2 mirrors the fresh-create DDL —
-# schema.py stays the single source of truth).
-DOCUMENT_LINK_DDL: tuple[str, ...] = (
-    _DDL_DOCUMENT_LINK, *_DDL_DOCUMENT_LINK_INDEXES)
-
-# Exported for migrations.py (migrate_2_to_3 rebuilds source & document with
-# the EXACT fresh-create DDL strings, so migrated and fresh DBs declare
-# byte-identical tables; the index/trigger tuples are recreated after the
-# rebuild because DROP TABLE removes them with the table).
-SOURCE_TABLE_DDL: str = _DDL_SOURCE
-DOCUMENT_TABLE_DDL: str = _DDL_DOCUMENT
-DOCUMENT_INDEX_DDL: tuple[str, ...] = _DDL_DOCUMENT_INDEXES
-DOCUMENT_FTS_TRIGGER_DDL: tuple[str, ...] = _DDL_DOCUMENT_FTS_TRIGGERS
-
-_DDL_DOCUMENT_TOPIC = f"""
+_PG_DDL_DOCUMENT_TOPIC = f"""
 CREATE TABLE IF NOT EXISTS document_topic (
-    document_id INTEGER NOT NULL REFERENCES document(id) ON DELETE CASCADE,
-    topic       TEXT NOT NULL,
-    source      TEXT NOT NULL CHECK (source IN {E.sql_in(E.TOPIC_SOURCES)}),
+    document_id bigint NOT NULL REFERENCES document(id) ON DELETE CASCADE,
+    topic       text NOT NULL,
+    source      text NOT NULL
+                CONSTRAINT ck_document_topic_source
+                CHECK (source IN {E.sql_in(E.TOPIC_SOURCES)}),
     PRIMARY KEY (document_id, topic)
 )"""
 
-# v4: one row per T1-enriched document (summary + event_type + provenance).
-# Topics/mentions/claims live in their own tables; this row is the marker
-# that T1 ran, with which model/prompt — re-enrichment replaces it.
-_DDL_DOCUMENT_ENRICHMENT = """
+_PG_DDL_DOCUMENT_ENRICHMENT = """
 CREATE TABLE IF NOT EXISTS document_enrichment (
-    document_id    INTEGER PRIMARY KEY REFERENCES document(id) ON DELETE CASCADE,
-    summary        TEXT NOT NULL,
-    event_type     TEXT NOT NULL,
-    model          TEXT NOT NULL,
-    prompt_version TEXT NOT NULL,
-    created_at     TEXT NOT NULL
+    document_id    bigint PRIMARY KEY REFERENCES document(id) ON DELETE CASCADE,
+    summary        text NOT NULL,
+    event_type     text NOT NULL,
+    model          text NOT NULL,
+    prompt_version text NOT NULL,
+    created_at     timestamptz NOT NULL
 )"""
 
-# Exported for migrations.py (migrate_3_to_4 creates the same table).
-DOCUMENT_ENRICHMENT_DDL: tuple[str, ...] = (_DDL_DOCUMENT_ENRICHMENT,)
 
-_DDL_CLAIM = f"""
+# --- claims / evidence -------------------------------------------------------
+
+_PG_DDL_CLAIM = f"""
 CREATE TABLE IF NOT EXISTS claim (
-    id                 INTEGER PRIMARY KEY,
-    text               TEXT NOT NULL,
-    claim_type         TEXT CHECK (claim_type IN {E.sql_in(E.CLAIM_TYPES)}),
-    first_document_id  INTEGER REFERENCES document(id),
-    verdict            TEXT NOT NULL DEFAULT 'unverified'
+    id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    text               text NOT NULL,
+    claim_type         text CONSTRAINT ck_claim_claim_type
+                       CHECK (claim_type IN {E.sql_in(E.CLAIM_TYPES)}),
+    first_document_id  bigint REFERENCES document(id),
+    verdict            text NOT NULL DEFAULT 'unverified'
+                       CONSTRAINT ck_claim_verdict
                        CHECK (verdict IN {E.sql_in(E.VERDICTS)}),
-    confidence         REAL,
-    check_worthiness   REAL,
-    verdict_updated_at TEXT,
-    created_at         TEXT NOT NULL
+    confidence         double precision,
+    check_worthiness   double precision,
+    verdict_updated_at timestamptz,
+    created_at         timestamptz NOT NULL,
+    search_tsv         tsvector GENERATED ALWAYS AS
+                       (to_tsvector('english', text)) STORED
 )"""
 
-_DDL_CLAIM_FTS = """
-CREATE VIRTUAL TABLE IF NOT EXISTS claim_fts USING fts5(
-    text,
-    content='claim', content_rowid='id'
-)"""
-
-_DDL_CLAIM_FTS_TRIGGERS = (
-    """
-CREATE TRIGGER IF NOT EXISTS claim_ai AFTER INSERT ON claim BEGIN
-    INSERT INTO claim_fts(rowid, text) VALUES (new.id, new.text);
-END""",
-    """
-CREATE TRIGGER IF NOT EXISTS claim_ad AFTER DELETE ON claim BEGIN
-    INSERT INTO claim_fts(claim_fts, rowid, text)
-    VALUES ('delete', old.id, old.text);
-END""",
-    """
-CREATE TRIGGER IF NOT EXISTS claim_au AFTER UPDATE OF text ON claim BEGIN
-    INSERT INTO claim_fts(claim_fts, rowid, text)
-    VALUES ('delete', old.id, old.text);
-    INSERT INTO claim_fts(rowid, text) VALUES (new.id, new.text);
-END""",
+_PG_DDL_CLAIM_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_claim_tsv ON claim USING gin(search_tsv)",
 )
 
-# Derived-knowledge tables all carry the provenance grade triple:
-# grade (1=enriched 2=analyzed 3=curated) + extractor_model + prompt_version.
-_GRADE_COLS = f"""
-    grade           INTEGER NOT NULL DEFAULT 1 CHECK (grade IN {E.sql_in(E.GRADES)}),
-    extractor_model TEXT,
-    prompt_version  TEXT"""
 
-_DDL_EVIDENCE = f"""
+def _pg_grade_cols(table: str) -> str:
+    """The provenance grade triple with a per-table named CHECK.
+
+    grade (1=enriched 2=analyzed 3=curated) + extractor_model +
+    prompt_version — same columns as v0.1's _GRADE_COLS.
+    """
+    return f"""
+    grade           integer NOT NULL DEFAULT 1
+                    CONSTRAINT ck_{table}_grade CHECK (grade IN {E.sql_in(E.GRADES)}),
+    extractor_model text,
+    prompt_version  text"""
+
+
+_PG_DDL_EVIDENCE = f"""
 CREATE TABLE IF NOT EXISTS evidence (
-    id          INTEGER PRIMARY KEY,
-    claim_id    INTEGER NOT NULL REFERENCES claim(id) ON DELETE CASCADE,
-    document_id INTEGER NOT NULL REFERENCES document(id),
-    stance      TEXT NOT NULL CHECK (stance IN {E.sql_in(E.EVIDENCE_STANCES)}),
-    confidence  REAL,
-    rationale   TEXT,
-    quote       TEXT,
-    method      TEXT CHECK (method IN {E.sql_in(E.EVIDENCE_METHODS)}),
-    model_id    TEXT,
-{_GRADE_COLS},
-    created_at  TEXT NOT NULL,
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    claim_id    bigint NOT NULL REFERENCES claim(id) ON DELETE CASCADE,
+    document_id bigint NOT NULL REFERENCES document(id),
+    stance      text NOT NULL CONSTRAINT ck_evidence_stance
+                CHECK (stance IN {E.sql_in(E.EVIDENCE_STANCES)}),
+    confidence  double precision,
+    rationale   text,
+    quote       text,
+    method      text CONSTRAINT ck_evidence_method
+                CHECK (method IN {E.sql_in(E.EVIDENCE_METHODS)}),
+    model_id    text,
+{_pg_grade_cols('evidence')},
+    created_at  timestamptz NOT NULL,
     UNIQUE (claim_id, document_id)
 )"""
 
-_DDL_ENTITY = f"""
+
+# --- entities ------------------------------------------------------------------
+
+# Two search paths (design §1): ranked word search via the 'simple'-config
+# generated tsvector (proper names must not be stemmed; the jsonb::text cast
+# is immutable, brackets/quotes are punctuation the parser discards) and
+# ILIKE-substring parity via pg_trgm GIN on name and aliases::text.
+_PG_DDL_ENTITY = f"""
 CREATE TABLE IF NOT EXISTS entity (
-    id          INTEGER PRIMARY KEY,
-    name        TEXT NOT NULL,
-    entity_type TEXT NOT NULL DEFAULT 'other'
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name        text NOT NULL,
+    entity_type text NOT NULL DEFAULT 'other'
+                CONSTRAINT ck_entity_entity_type
                 CHECK (entity_type IN {E.sql_in(E.ENTITY_TYPES)}),
-    aliases     TEXT NOT NULL DEFAULT '[]',
-    description TEXT,
-    wikidata_id TEXT,
-    attrs       TEXT NOT NULL DEFAULT '{{}}',
-{_GRADE_COLS},
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT,
+    aliases     jsonb NOT NULL DEFAULT '[]'::jsonb,
+    description text,
+    wikidata_id text,
+    attrs       jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+{_pg_grade_cols('entity')},
+    created_at  timestamptz NOT NULL,
+    updated_at  timestamptz,
+    search_tsv  tsvector GENERATED ALWAYS AS (to_tsvector('simple',
+                    name || ' ' || coalesce(aliases::text, ''))) STORED,
     UNIQUE (name, entity_type)
 )"""
 
-_DDL_ENTITY_MENTION = f"""
-CREATE TABLE IF NOT EXISTS entity_mention (
-    id          INTEGER PRIMARY KEY,
-    document_id INTEGER NOT NULL REFERENCES document(id) ON DELETE CASCADE,
-    entity_id   INTEGER NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
-    surface     TEXT,
-    span_start  INTEGER,
-    span_end    INTEGER,
-    method      TEXT CHECK (method IN {E.sql_in(E.MENTION_METHODS)}),
-{_GRADE_COLS},
-    created_at  TEXT NOT NULL
-)"""
-
-_DDL_ENTITY_MENTION_INDEXES = (
-    "CREATE INDEX IF NOT EXISTS idx_mention_entity ON entity_mention(entity_id, document_id)",
-    "CREATE INDEX IF NOT EXISTS idx_mention_document ON entity_mention(document_id)",
+_PG_DDL_ENTITY_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_entity_tsv ON entity USING gin(search_tsv)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_name_trgm"
+    " ON entity USING gin (name gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_aliases_trgm"
+    " ON entity USING gin ((aliases::text) gin_trgm_ops)",
 )
 
-_DDL_EVENT_TYPE = """
+_PG_DDL_ENTITY_MENTION = f"""
+CREATE TABLE IF NOT EXISTS entity_mention (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    document_id bigint NOT NULL REFERENCES document(id) ON DELETE CASCADE,
+    entity_id   bigint NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+    surface     text,
+    span_start  integer,
+    span_end    integer,
+    method      text CONSTRAINT ck_entity_mention_method
+                CHECK (method IN {E.sql_in(E.MENTION_METHODS)}),
+{_pg_grade_cols('entity_mention')},
+    created_at  timestamptz NOT NULL
+)"""
+
+_PG_DDL_ENTITY_MENTION_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_mention_entity"
+    " ON entity_mention(entity_id, document_id)",
+    "CREATE INDEX IF NOT EXISTS idx_mention_document"
+    " ON entity_mention(document_id)",
+)
+
+
+# --- events / stories ----------------------------------------------------------
+
+_PG_DDL_EVENT_TYPE = """
 CREATE TABLE IF NOT EXISTS event_type (
-    id              INTEGER PRIMARY KEY,
-    name            TEXT NOT NULL UNIQUE,
-    lifecycle_group TEXT,
-    window_days     INTEGER NOT NULL DEFAULT 7
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name            text NOT NULL UNIQUE,
+    lifecycle_group text,
+    window_days     integer NOT NULL DEFAULT 7
 )"""
 
-_DDL_STORY = f"""
+_PG_DDL_STORY = f"""
 CREATE TABLE IF NOT EXISTS story (
-    id            INTEGER PRIMARY KEY,
-    title         TEXT,
-    root_event_id INTEGER,
-    status        TEXT NOT NULL DEFAULT 'active'
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    title         text,
+    root_event_id bigint,
+    status        text NOT NULL DEFAULT 'active'
+                  CONSTRAINT ck_story_status
                   CHECK (status IN {E.sql_in(E.STORY_STATUSES)}),
-    doc_count     INTEGER NOT NULL DEFAULT 0,
-    summary_text  TEXT,
-    summary_stale INTEGER NOT NULL DEFAULT 0,
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT
+    doc_count     integer NOT NULL DEFAULT 0,
+    summary_text  text,
+    summary_stale boolean NOT NULL DEFAULT false,
+    created_at    timestamptz NOT NULL,
+    updated_at    timestamptz
 )"""
 
-_DDL_EVENT = f"""
+# occurred_on / window_start / window_end / last_seen_at all receive
+# doc_date (the first 10 chars of published_at|fetched_at) — day-precision
+# by construction, so they are `date` and round-trip as 'YYYY-MM-DD'.
+_PG_DDL_EVENT = f"""
 CREATE TABLE IF NOT EXISTS event (
-    id             INTEGER PRIMARY KEY,
-    title          TEXT NOT NULL,
-    description    TEXT,
-    event_type     TEXT NOT NULL DEFAULT 'other',
-    story_id       INTEGER REFERENCES story(id),
-    occurred_on    TEXT,
-    date_precision TEXT CHECK (date_precision IN {E.sql_in(E.DATE_PRECISIONS)}),
-    geo_scope      TEXT,
-    doc_count      INTEGER NOT NULL DEFAULT 0,
-    window_start   TEXT,
-    window_end     TEXT,
-    last_seen_at   TEXT,
-{_GRADE_COLS},
-    created_at     TEXT NOT NULL
+    id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    title          text NOT NULL,
+    description    text,
+    event_type     text NOT NULL DEFAULT 'other',
+    story_id       bigint REFERENCES story(id),
+    occurred_on    date,
+    date_precision text CONSTRAINT ck_event_date_precision
+                   CHECK (date_precision IN {E.sql_in(E.DATE_PRECISIONS)}),
+    geo_scope      text,
+    doc_count      integer NOT NULL DEFAULT 0,
+    window_start   date,
+    window_end     date,
+    last_seen_at   date,
+{_pg_grade_cols('event')},
+    created_at     timestamptz NOT NULL
 )"""
 
-_DDL_EVENT_INDEXES = (
+_PG_DDL_EVENT_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_event_story ON event(story_id)",
     "CREATE INDEX IF NOT EXISTS idx_event_type ON event(event_type)",
     "CREATE INDEX IF NOT EXISTS idx_event_occurred ON event(occurred_on)",
 )
 
-_DDL_EVENT_ASSIGNMENT = f"""
+_PG_DDL_EVENT_ASSIGNMENT = f"""
 CREATE TABLE IF NOT EXISTS event_assignment (
-    id           INTEGER PRIMARY KEY,
-    document_id  INTEGER NOT NULL REFERENCES document(id) ON DELETE CASCADE,
-    event_id     INTEGER REFERENCES event(id),
-    method       TEXT NOT NULL CHECK (method IN {E.sql_in(E.ASSIGNMENT_METHODS)}),
-    score        REAL,
-    adjudication TEXT,
-    created_at   TEXT NOT NULL
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    document_id  bigint NOT NULL REFERENCES document(id) ON DELETE CASCADE,
+    event_id     bigint REFERENCES event(id),
+    method       text NOT NULL CONSTRAINT ck_event_assignment_method
+                 CHECK (method IN {E.sql_in(E.ASSIGNMENT_METHODS)}),
+    score        double precision,
+    adjudication text,
+    created_at   timestamptz NOT NULL
 )"""
 
-# Polymorphic typed-edge table = the knowledge graph; bitemporal (SCD2):
-# single-valued relations close the old edge (status='superseded'), never
-# delete. Uniqueness applies only to ACTIVE edges (partial index below).
-_DDL_EDGE = f"""
+
+# --- dossiers / questions / findings (Postgres validates FK targets at
+# CREATE TABLE, so: dossier is created WITHOUT the parent_question_id FK,
+# question follows, then the FK is added by ALTER — both directions
+# DEFERRABLE for the ETL). ------------------------------------------------------
+
+_PG_DDL_DOSSIER = f"""
+CREATE TABLE IF NOT EXISTS dossier (
+    id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    kind               text NOT NULL DEFAULT 'analysis'
+                       CONSTRAINT ck_dossier_kind
+                       CHECK (kind IN {E.sql_in(E.DOSSIER_KINDS)}),
+    title              text,
+    input_text         text NOT NULL,
+    input_type         text CONSTRAINT ck_dossier_input_type
+                       CHECK (input_type IN {E.sql_in(E.DOSSIER_INPUT_TYPES)}),
+    input_document_id  bigint REFERENCES document(id),
+    parent_question_id bigint,
+    budget_usd         double precision,
+    status             text NOT NULL DEFAULT 'pending'
+                       CONSTRAINT ck_dossier_status
+                       CHECK (status IN {E.sql_in(E.DOSSIER_STATUSES)}),
+    current_stage      text CONSTRAINT ck_dossier_current_stage
+                       CHECK (current_stage IN {E.sql_in(E.DOSSIER_STAGES)}),
+    error              text,
+    model_usage        jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    created_at         timestamptz NOT NULL,
+    started_at         timestamptz,
+    finished_at        timestamptz,
+    owner_id           bigint REFERENCES app_user(id),
+    visibility         text NOT NULL DEFAULT 'shared'
+                       CONSTRAINT ck_dossier_visibility
+                       CHECK (visibility IN {E.sql_in(E.VISIBILITIES)})
+)"""
+# owner_id is NULLABLE in the baseline (NULL = the single-user 'system
+# viewer'); the auth workstream backfills and tightens to NOT NULL — a
+# cheap ALTER, not a rebuild.
+
+_PG_DDL_DOSSIER_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_dossier_owner"
+    " ON dossier(owner_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_dossier_visible"
+    " ON dossier(visibility, kind, created_at DESC)",
+)
+
+_PG_DDL_DOSSIER_SECTION = f"""
+CREATE TABLE IF NOT EXISTS dossier_section (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dossier_id bigint NOT NULL REFERENCES dossier(id) ON DELETE CASCADE,
+    stage      text NOT NULL CONSTRAINT ck_dossier_section_stage
+               CHECK (stage IN {E.sql_in(E.DOSSIER_STAGES)}),
+    status     text NOT NULL DEFAULT 'pending'
+               CONSTRAINT ck_dossier_section_status
+               CHECK (status IN {E.sql_in(E.SECTION_STATUSES)}),
+    content    jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    created_at timestamptz NOT NULL,
+    updated_at timestamptz,
+    UNIQUE (dossier_id, stage)
+)"""
+
+_PG_DDL_QUESTION = f"""
+CREATE TABLE IF NOT EXISTS question (
+    id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dossier_id         bigint NOT NULL REFERENCES dossier(id) ON DELETE CASCADE,
+    qtype              text NOT NULL CONSTRAINT ck_question_qtype
+                       CHECK (qtype IN {E.sql_in(E.QUESTION_TYPES)}),
+    text               text NOT NULL,
+    about_type         text CONSTRAINT ck_question_about_type
+                       CHECK (about_type IN {E.sql_in(E.NODE_TYPES)}),
+    about_id           bigint,
+    status             text NOT NULL DEFAULT 'open'
+                       CONSTRAINT ck_question_status
+                       CHECK (status IN {E.sql_in(E.QUESTION_STATUSES)}),
+    priority           double precision NOT NULL DEFAULT 0.5,
+    answer_summary     text,
+    answer_finding_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+    spawned_dossier_id bigint REFERENCES dossier(id),
+    created_at         timestamptz NOT NULL,
+    updated_at         timestamptz
+)"""
+
+_PG_DDL_QUESTION_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_question_dossier ON question(dossier_id)",
+    "CREATE INDEX IF NOT EXISTS idx_question_about"
+    " ON question(about_type, about_id)",
+)
+
+# Closes the dossier <-> question circular pair; idempotent (guarded ALTER —
+# ADD CONSTRAINT has no IF NOT EXISTS).
+_PG_DDL_DOSSIER_PARENT_QUESTION_FK = """
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'fk_dossier_parent_question') THEN
+        ALTER TABLE dossier
+            ADD CONSTRAINT fk_dossier_parent_question
+            FOREIGN KEY (parent_question_id) REFERENCES question(id)
+            DEFERRABLE INITIALLY IMMEDIATE;
+    END IF;
+END $$"""
+
+
+# --- the knowledge graph ------------------------------------------------------
+
+# Polymorphic typed-edge table; bitemporal (SCD2): single-valued relations
+# close the old edge (status='superseded'), never delete. Uniqueness applies
+# only to ACTIVE edges (native partial unique index, also the ON CONFLICT
+# target for the idempotent insert). superseded_by_edge_id points to NEWER
+# rows — DEFERRABLE for the ETL. valid_from/valid_to are day-precision
+# validity bounds (date); asserted_at is a real timestamp.
+_PG_DDL_EDGE = f"""
 CREATE TABLE IF NOT EXISTS edge (
-    id                      INTEGER PRIMARY KEY,
-    src_type                TEXT NOT NULL CHECK (src_type IN {E.sql_in(E.NODE_TYPES)}),
-    src_id                  INTEGER NOT NULL,
-    dst_type                TEXT NOT NULL CHECK (dst_type IN {E.sql_in(E.NODE_TYPES)}),
-    dst_id                  INTEGER NOT NULL,
-    relation                TEXT NOT NULL,
-    properties              TEXT NOT NULL DEFAULT '{{}}',
-    provenance_document_id  INTEGER REFERENCES document(id),
-    provenance_dossier_id   INTEGER REFERENCES dossier(id),
-    confidence              REAL,
-    valid_from              TEXT,
-    valid_to                TEXT,
-    asserted_at             TEXT,
-    status                  TEXT NOT NULL DEFAULT 'active'
+    id                      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    src_type                text NOT NULL CONSTRAINT ck_edge_src_type
+                            CHECK (src_type IN {E.sql_in(E.NODE_TYPES)}),
+    src_id                  bigint NOT NULL,
+    dst_type                text NOT NULL CONSTRAINT ck_edge_dst_type
+                            CHECK (dst_type IN {E.sql_in(E.NODE_TYPES)}),
+    dst_id                  bigint NOT NULL,
+    relation                text NOT NULL,
+    properties              jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    provenance_document_id  bigint REFERENCES document(id),
+    provenance_dossier_id   bigint REFERENCES dossier(id),
+    confidence              double precision,
+    valid_from              date,
+    valid_to                date,
+    asserted_at             timestamptz,
+    status                  text NOT NULL DEFAULT 'active'
+                            CONSTRAINT ck_edge_status
                             CHECK (status IN {E.sql_in(E.EDGE_STATUSES)}),
-    superseded_by_edge_id   INTEGER REFERENCES edge(id),
-{_GRADE_COLS},
-    created_at              TEXT NOT NULL
+    superseded_by_edge_id   bigint REFERENCES edge(id)
+                            DEFERRABLE INITIALLY IMMEDIATE,
+{_pg_grade_cols('edge')},
+    created_at              timestamptz NOT NULL
 )"""
 
-_DDL_EDGE_INDEXES = (
+_PG_DDL_EDGE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_edge_src ON edge(src_type, src_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_dst ON edge(dst_type, dst_id)",
     "CREATE INDEX IF NOT EXISTS idx_edge_relation ON edge(relation)",
@@ -372,484 +574,502 @@ _DDL_EDGE_INDEXES = (
        WHERE status = 'active'""",
 )
 
-_DDL_CLAIM_SIGHTING = f"""
-CREATE TABLE IF NOT EXISTS claim_sighting (
-    id          INTEGER PRIMARY KEY,
-    claim_id    INTEGER NOT NULL REFERENCES claim(id) ON DELETE CASCADE,
-    document_id INTEGER NOT NULL REFERENCES document(id),
-    quote       TEXT,
-    quote_start INTEGER,
-    quote_end   INTEGER,
-    stance      TEXT NOT NULL CHECK (stance IN {E.sql_in(E.SIGHTING_STANCES)}),
-{_GRADE_COLS},
-    created_at  TEXT NOT NULL
-)"""
-
-_DDL_CLAIM_SIGHTING_INDEXES = (
-    "CREATE INDEX IF NOT EXISTS idx_sighting_claim ON claim_sighting(claim_id)",
-    "CREATE INDEX IF NOT EXISTS idx_sighting_document ON claim_sighting(document_id)",
-)
-
-_DDL_VERDICT_HISTORY = f"""
-CREATE TABLE IF NOT EXISTS verdict_history (
-    id                INTEGER PRIMARY KEY,
-    claim_id          INTEGER NOT NULL REFERENCES claim(id) ON DELETE CASCADE,
-    verdict           TEXT NOT NULL CHECK (verdict IN {E.sql_in(E.VERDICTS)}),
-    computed_at       TEXT NOT NULL,
-    "trigger"         TEXT,
-    evidence_snapshot TEXT NOT NULL DEFAULT '[]'
-)"""
-
-_DDL_CONTRADICTION = f"""
-CREATE TABLE IF NOT EXISTS contradiction (
-    id                  INTEGER PRIMARY KEY,
-    claim_id            INTEGER NOT NULL UNIQUE REFERENCES claim(id) ON DELETE CASCADE,
-    n_support           INTEGER NOT NULL DEFAULT 0,
-    n_refute            INTEGER NOT NULL DEFAULT 0,
-    best_tier_support   INTEGER,
-    best_tier_refute    INTEGER,
-    status              TEXT NOT NULL DEFAULT 'open'
-                        CHECK (status IN {E.sql_in(E.CONTRADICTION_STATUSES)}),
-    resolved_dossier_id INTEGER REFERENCES dossier(id),
-    detected_at         TEXT NOT NULL,
-    resolved_at         TEXT
-)"""
-
-# v8 adds kind (analysis|investigation), parent_question_id (manual question
-# recursion lineage) and budget_usd (the per-run cap frozen at creation).
-_DDL_DOSSIER = f"""
-CREATE TABLE IF NOT EXISTS dossier (
-    id                 INTEGER PRIMARY KEY,
-    kind               TEXT NOT NULL DEFAULT 'analysis'
-                       CHECK (kind IN {E.sql_in(E.DOSSIER_KINDS)}),
-    title              TEXT,
-    input_text         TEXT NOT NULL,
-    input_type         TEXT CHECK (input_type IN {E.sql_in(E.DOSSIER_INPUT_TYPES)}),
-    input_document_id  INTEGER REFERENCES document(id),
-    parent_question_id INTEGER REFERENCES question(id),
-    budget_usd         REAL,
-    status             TEXT NOT NULL DEFAULT 'pending'
-                       CHECK (status IN {E.sql_in(E.DOSSIER_STATUSES)}),
-    current_stage      TEXT CHECK (current_stage IN {E.sql_in(E.DOSSIER_STAGES)}),
-    error              TEXT,
-    model_usage        TEXT NOT NULL DEFAULT '{{}}',
-    created_at         TEXT NOT NULL,
-    started_at         TEXT,
-    finished_at        TEXT
-)"""
-
-_DDL_DOSSIER_SECTION = f"""
-CREATE TABLE IF NOT EXISTS dossier_section (
-    id         INTEGER PRIMARY KEY,
-    dossier_id INTEGER NOT NULL REFERENCES dossier(id) ON DELETE CASCADE,
-    stage      TEXT NOT NULL CHECK (stage IN {E.sql_in(E.DOSSIER_STAGES)}),
-    status     TEXT NOT NULL DEFAULT 'pending'
-               CHECK (status IN {E.sql_in(E.SECTION_STATUSES)}),
-    content    TEXT NOT NULL DEFAULT '{{}}',
-    created_at TEXT NOT NULL,
-    updated_at TEXT,
-    UNIQUE (dossier_id, stage)
-)"""
-
-# v8 (investigation mode): typed why-questions — first-class persisted
-# objects; the loop's work queue and the open-questions product surface.
-# question <-> dossier FKs are mutually circular; SQLite resolves FK targets
-# at DML time, so declaration order is irrelevant.
-_DDL_QUESTION = f"""
-CREATE TABLE IF NOT EXISTS question (
-    id                 INTEGER PRIMARY KEY,
-    dossier_id         INTEGER NOT NULL REFERENCES dossier(id) ON DELETE CASCADE,
-    qtype              TEXT NOT NULL CHECK (qtype IN {E.sql_in(E.QUESTION_TYPES)}),
-    text               TEXT NOT NULL,
-    about_type         TEXT CHECK (about_type IN {E.sql_in(E.NODE_TYPES)}),
-    about_id           INTEGER,
-    status             TEXT NOT NULL DEFAULT 'open'
-                       CHECK (status IN {E.sql_in(E.QUESTION_STATUSES)}),
-    priority           REAL NOT NULL DEFAULT 0.5,
-    answer_summary     TEXT,
-    answer_finding_ids TEXT NOT NULL DEFAULT '[]',
-    spawned_dossier_id INTEGER REFERENCES dossier(id),
-    created_at         TEXT NOT NULL,
-    updated_at         TEXT
-)"""
-
-_DDL_QUESTION_INDEXES = (
-    "CREATE INDEX IF NOT EXISTS idx_question_dossier ON question(dossier_id)",
-    "CREATE INDEX IF NOT EXISTS idx_question_about"
-    " ON question(about_type, about_id)",
-)
-
-# v8: one grounded (or explicitly speculative) connection the loop recorded;
-# persisted incrementally so a crash loses nothing already found.
-_DDL_FINDING = f"""
+_PG_DDL_FINDING = f"""
 CREATE TABLE IF NOT EXISTS finding (
-    id          INTEGER PRIMARY KEY,
-    dossier_id  INTEGER NOT NULL REFERENCES dossier(id) ON DELETE CASCADE,
-    kind        TEXT NOT NULL CHECK (kind IN {E.sql_in(E.FINDING_KINDS)}),
-    text        TEXT NOT NULL,
-    speculation INTEGER NOT NULL DEFAULT 0,
-    confidence  REAL,
-    question_id INTEGER REFERENCES question(id),
-    edge_id     INTEGER REFERENCES edge(id),
-    payload     TEXT NOT NULL DEFAULT '{{}}',
-    created_at  TEXT NOT NULL
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dossier_id  bigint NOT NULL REFERENCES dossier(id) ON DELETE CASCADE,
+    kind        text NOT NULL CONSTRAINT ck_finding_kind
+                CHECK (kind IN {E.sql_in(E.FINDING_KINDS)}),
+    text        text NOT NULL,
+    speculation boolean NOT NULL DEFAULT false,
+    confidence  double precision,
+    question_id bigint REFERENCES question(id),
+    edge_id     bigint REFERENCES edge(id),
+    payload     jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    created_at  timestamptz NOT NULL
 )"""
 
-_DDL_FINDING_INDEXES = (
+_PG_DDL_FINDING_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_finding_dossier ON finding(dossier_id)",
 )
 
-# v8: span-verified verbatim quotes backing a finding (offsets best-effort).
-_DDL_FINDING_EVIDENCE = """
+_PG_DDL_FINDING_EVIDENCE = """
 CREATE TABLE IF NOT EXISTS finding_evidence (
-    id          INTEGER PRIMARY KEY,
-    finding_id  INTEGER NOT NULL REFERENCES finding(id) ON DELETE CASCADE,
-    document_id INTEGER NOT NULL REFERENCES document(id),
-    quote       TEXT NOT NULL,
-    quote_start INTEGER,
-    quote_end   INTEGER
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    finding_id  bigint NOT NULL REFERENCES finding(id) ON DELETE CASCADE,
+    document_id bigint NOT NULL REFERENCES document(id),
+    quote       text NOT NULL,
+    quote_start integer,
+    quote_end   integer
 )"""
 
-_DDL_FINDING_EVIDENCE_INDEXES = (
+_PG_DDL_FINDING_EVIDENCE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_finding_evidence_finding"
     " ON finding_evidence(finding_id)",
 )
 
-# Exported for migrations.py (migrate_7_to_8 creates the same tables and
-# rebuilds dossier/dossier_section/job with the EXACT fresh-create DDL).
-DOSSIER_TABLE_DDL: str = _DDL_DOSSIER
-DOSSIER_SECTION_TABLE_DDL: str = _DDL_DOSSIER_SECTION
-QUESTION_DDL: tuple[str, ...] = (_DDL_QUESTION, *_DDL_QUESTION_INDEXES)
-FINDING_DDL: tuple[str, ...] = (_DDL_FINDING, *_DDL_FINDING_INDEXES)
-FINDING_EVIDENCE_DDL: tuple[str, ...] = (
-    _DDL_FINDING_EVIDENCE, *_DDL_FINDING_EVIDENCE_INDEXES)
-
-# v9 (leader views): one attributed utterance — a speaker entity SAID the
-# verbatim quote in a document. Distinct from claim (checkable fact):
-# statements capture POSITIONS/views and always carry attribution. Replaced
-# per-document with the other T1 rows (idempotent re-enrichment).
-_DDL_STATEMENT = f"""
-CREATE TABLE IF NOT EXISTS statement (
-    id               INTEGER PRIMARY KEY,
-    document_id      INTEGER NOT NULL REFERENCES document(id) ON DELETE CASCADE,
-    entity_id        INTEGER NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
-    quote            TEXT NOT NULL,
-    quote_start      INTEGER,
-    quote_end        INTEGER,
-    topics           TEXT NOT NULL DEFAULT '[]',
-    position_summary TEXT,
-    stated_at        TEXT,
-{_GRADE_COLS},
-    created_at       TEXT NOT NULL
+_PG_DDL_CLAIM_SIGHTING = f"""
+CREATE TABLE IF NOT EXISTS claim_sighting (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    claim_id    bigint NOT NULL REFERENCES claim(id) ON DELETE CASCADE,
+    document_id bigint NOT NULL REFERENCES document(id),
+    quote       text,
+    quote_start integer,
+    quote_end   integer,
+    stance      text NOT NULL CONSTRAINT ck_claim_sighting_stance
+                CHECK (stance IN {E.sql_in(E.SIGHTING_STANCES)}),
+{_pg_grade_cols('claim_sighting')},
+    created_at  timestamptz NOT NULL
 )"""
 
-_DDL_STATEMENT_INDEXES = (
+_PG_DDL_CLAIM_SIGHTING_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_sighting_claim ON claim_sighting(claim_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sighting_document"
+    " ON claim_sighting(document_id)",
+)
+
+
+# --- statements / position tracking -------------------------------------------
+
+_PG_DDL_STATEMENT = f"""
+CREATE TABLE IF NOT EXISTS statement (
+    id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    document_id      bigint NOT NULL REFERENCES document(id) ON DELETE CASCADE,
+    entity_id        bigint NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+    quote            text NOT NULL,
+    quote_start      integer,
+    quote_end        integer,
+    topics           jsonb NOT NULL DEFAULT '[]'::jsonb,
+    position_summary text,
+    stated_at        timestamptz,
+{_pg_grade_cols('statement')},
+    created_at       timestamptz NOT NULL
+)"""
+
+_PG_DDL_STATEMENT_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_statement_entity"
     " ON statement(entity_id, stated_at)",
     "CREATE INDEX IF NOT EXISTS idx_statement_document"
     " ON statement(document_id)",
 )
 
-# v9: detected drift between two of a speaker's statements on one topic.
-# Both sides are verbatim quotes, so a shift is grounded by construction.
-# Statement FKs cascade: re-enriching a document replaces its statements
-# and any shift built on a replaced quote dies with it.
-_DDL_POSITION_SHIFT = f"""
+_PG_DDL_POSITION_SHIFT = f"""
 CREATE TABLE IF NOT EXISTS position_shift (
-    id                INTEGER PRIMARY KEY,
-    entity_id         INTEGER NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
-    topic             TEXT NOT NULL,
-    from_statement_id INTEGER NOT NULL REFERENCES statement(id) ON DELETE CASCADE,
-    to_statement_id   INTEGER NOT NULL REFERENCES statement(id) ON DELETE CASCADE,
-    kind              TEXT CHECK (kind IN {E.sql_in(E.POSITION_SHIFT_KINDS)}),
-    note              TEXT,
-    detected_at       TEXT NOT NULL,
-    status            TEXT NOT NULL DEFAULT 'open'
+    id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    entity_id         bigint NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+    topic             text NOT NULL,
+    from_statement_id bigint NOT NULL REFERENCES statement(id) ON DELETE CASCADE,
+    to_statement_id   bigint NOT NULL REFERENCES statement(id) ON DELETE CASCADE,
+    kind              text CONSTRAINT ck_position_shift_kind
+                      CHECK (kind IN {E.sql_in(E.POSITION_SHIFT_KINDS)}),
+    note              text,
+    detected_at       timestamptz NOT NULL,
+    status            text NOT NULL DEFAULT 'open'
+                      CONSTRAINT ck_position_shift_status
                       CHECK (status IN {E.sql_in(E.POSITION_SHIFT_STATUSES)})
 )"""
 
-_DDL_POSITION_SHIFT_INDEXES = (
+_PG_DDL_POSITION_SHIFT_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_position_shift_entity"
     " ON position_shift(entity_id, topic)",
 )
 
-# v9: cached per-(entity, topic) evolution summary — regenerated lazily on
-# read when stale (statement count grew by >= 2 or a newer shift exists);
-# fresh reads are $0. citations = JSON int list of statement ids.
-_DDL_VIEW_SUMMARY = """
+_PG_DDL_VIEW_SUMMARY = """
 CREATE TABLE IF NOT EXISTS view_summary (
-    entity_id              INTEGER NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
-    topic                  TEXT NOT NULL,
-    text                   TEXT,
-    citations              TEXT NOT NULL DEFAULT '[]',
-    statement_count_at_gen INTEGER,
-    generated_at           TEXT,
+    entity_id              bigint NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+    topic                  text NOT NULL,
+    text                   text,
+    citations              jsonb NOT NULL DEFAULT '[]'::jsonb,
+    statement_count_at_gen integer,
+    generated_at           timestamptz,
     PRIMARY KEY (entity_id, topic)
 )"""
 
-# Exported for migrations.py (migrate_8_to_9 creates the same tables and
-# rebuilds brief_item with the EXACT fresh-create DDL — the v9 BRIEF_SECTIONS
-# vocabulary adds 'position_shift').
-STATEMENT_DDL: tuple[str, ...] = (_DDL_STATEMENT, *_DDL_STATEMENT_INDEXES)
-POSITION_SHIFT_DDL: tuple[str, ...] = (
-    _DDL_POSITION_SHIFT, *_DDL_POSITION_SHIFT_INDEXES)
-VIEW_SUMMARY_DDL: tuple[str, ...] = (_DDL_VIEW_SUMMARY,)
 
-_DDL_JOB = f"""
+# --- verification --------------------------------------------------------------
+
+_PG_DDL_VERDICT_HISTORY = f"""
+CREATE TABLE IF NOT EXISTS verdict_history (
+    id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    claim_id          bigint NOT NULL REFERENCES claim(id) ON DELETE CASCADE,
+    verdict           text NOT NULL CONSTRAINT ck_verdict_history_verdict
+                      CHECK (verdict IN {E.sql_in(E.VERDICTS)}),
+    computed_at       timestamptz NOT NULL,
+    "trigger"         text,
+    evidence_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb
+)"""
+
+_PG_DDL_CONTRADICTION = f"""
+CREATE TABLE IF NOT EXISTS contradiction (
+    id                  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    claim_id            bigint NOT NULL UNIQUE REFERENCES claim(id) ON DELETE CASCADE,
+    n_support           integer NOT NULL DEFAULT 0,
+    n_refute            integer NOT NULL DEFAULT 0,
+    best_tier_support   integer,
+    best_tier_refute    integer,
+    status              text NOT NULL DEFAULT 'open'
+                        CONSTRAINT ck_contradiction_status
+                        CHECK (status IN {E.sql_in(E.CONTRADICTION_STATUSES)}),
+    resolved_dossier_id bigint REFERENCES dossier(id),
+    detected_at         timestamptz NOT NULL,
+    resolved_at         timestamptz
+)"""
+
+
+# --- jobs ----------------------------------------------------------------------
+
+# v2 (runtime design §2): the job table IS the queue — SKIP LOCKED claims
+# order by (priority, run_at, id); 10 = interactive, 50 = enrichment/
+# background, 90 = polls. claimed_by/heartbeat_at drive the beat's orphan
+# reclaim (replaces startup reconcile_orphans, which is wrong with >1
+# process); max_attempts bounds requeues (polls get 1; the idempotent
+# batch poll gets 3). run_at is the visibility time (retry backoff, brief
+# pre-gen stagger).
+_PG_DDL_JOB = f"""
 CREATE TABLE IF NOT EXISTS job (
-    id          INTEGER PRIMARY KEY,
-    kind        TEXT NOT NULL CHECK (kind IN {E.sql_in(E.JOB_KINDS)}),
-    payload     TEXT NOT NULL DEFAULT '{{}}',
-    dossier_id  INTEGER REFERENCES dossier(id),
-    status      TEXT NOT NULL DEFAULT 'queued'
-                CHECK (status IN {E.sql_in(E.JOB_STATUSES)}),
-    attempts    INTEGER NOT NULL DEFAULT 0,
-    error       TEXT,
-    created_at  TEXT NOT NULL,
-    started_at  TEXT,
-    finished_at TEXT
+    id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    kind             text NOT NULL CONSTRAINT ck_job_kind
+                     CHECK (kind IN {E.sql_in(E.JOB_KINDS)}),
+    priority         smallint NOT NULL DEFAULT 50,
+    payload          jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    dossier_id       bigint REFERENCES dossier(id),
+    status           text NOT NULL DEFAULT 'queued'
+                     CONSTRAINT ck_job_status
+                     CHECK (status IN {E.sql_in(E.JOB_STATUSES)}),
+    attempts         integer NOT NULL DEFAULT 0,
+    max_attempts     integer NOT NULL DEFAULT 1,
+    run_at           timestamptz NOT NULL DEFAULT now(),
+    cancel_requested boolean NOT NULL DEFAULT false,
+    claimed_by       text,
+    heartbeat_at     timestamptz,
+    error            text,
+    created_at       timestamptz NOT NULL,
+    started_at       timestamptz,
+    finished_at      timestamptz,
+    owner_id         bigint REFERENCES app_user(id)
 )"""
+# owner_id NULL = system job (poller sweeps, batch enrichment).
 
-# Exported for migrations.py (migrate_3_to_4 rebuilds job with the EXACT
-# fresh-create DDL string — the v4 JOB_KINDS vocabulary adds 'enrich_t1_sync').
-JOB_TABLE_DDL: str = _DDL_JOB
+_PG_DDL_JOB_INDEXES = (
+    # the claim path: queued jobs in claim order
+    "CREATE INDEX IF NOT EXISTS idx_job_claim ON job (priority, run_at, id)"
+    " WHERE status = 'queued'",
+    # the orphan sweep: running jobs by heartbeat staleness
+    "CREATE INDEX IF NOT EXISTS idx_job_heartbeat ON job (heartbeat_at)"
+    " WHERE status = 'running'",
+    # dedup: at most one LIVE poll job per source (beat enqueues blindly;
+    # the enqueue's ON CONFLICT targets this index)
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_poll_source"
+    " ON job ((payload->>'source_id'))"
+    " WHERE kind = 'poll_source' AND status IN ('queued','running')",
+)
 
-_DDL_JOB_EVENT = """
+# seq: identity values are allocated at INSERT, not commit — globally, a
+# later-committed row can carry a smaller seq. Harmless here: SSE replay is
+# always scoped WHERE job_id = %s AND seq > %s and one job's events are
+# written sequentially by one worker task, so per-job monotonicity (the only
+# property the SSE contract needs) holds.
+_PG_DDL_JOB_EVENT = """
 CREATE TABLE IF NOT EXISTS job_event (
-    seq    INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id INTEGER NOT NULL REFERENCES job(id) ON DELETE CASCADE,
-    ts     TEXT NOT NULL,
-    type   TEXT NOT NULL,
-    data   TEXT NOT NULL DEFAULT '{}'
+    seq    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    job_id bigint NOT NULL REFERENCES job(id) ON DELETE CASCADE,
+    ts     timestamptz NOT NULL,
+    type   text NOT NULL,
+    data   jsonb NOT NULL DEFAULT '{}'::jsonb
 )"""
 
-_DDL_JOB_EVENT_INDEX = (
+_PG_DDL_JOB_EVENT_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_job_event_job ON job_event(job_id, seq)",
 )
 
-_DDL_WATCH = f"""
-CREATE TABLE IF NOT EXISTS watch (
-    id           INTEGER PRIMARY KEY,
-    kind         TEXT NOT NULL CHECK (kind IN {E.sql_in(E.WATCH_KINDS)}),
-    label        TEXT NOT NULL,
-    entity_id    INTEGER REFERENCES entity(id),
-    thread_id    INTEGER REFERENCES story(id),
-    claim_id     INTEGER REFERENCES claim(id),
-    query_fts    TEXT,
-    promote      INTEGER NOT NULL DEFAULT 1,
-    muted        INTEGER NOT NULL DEFAULT 0,
-    last_seen_at TEXT,
-    created_at   TEXT NOT NULL
+
+# --- shared runtime state (v2, runtime design §4) -------------------------------
+
+# Per-domain politeness across processes: one atomic slot reservation per
+# fetch (GREATEST handles idle domains — no backlog accumulation). Callers
+# sleep locally until their reserved slot; the UPDATE must commit
+# immediately (autocommit), never inside a larger transaction.
+_PG_DDL_FETCH_DOMAIN = """
+CREATE TABLE IF NOT EXISTS fetch_domain (
+    domain  text PRIMARY KEY,
+    next_at timestamptz NOT NULL
 )"""
 
-_DDL_WATCH_HIT = f"""
+# Shared robots.txt cache (TTL enforced at read time, 1h); body NULL keeps
+# the v0.1 "unreachable robots => allow" semantics. Parsing stays local.
+_PG_DDL_ROBOTS_CACHE = """
+CREATE TABLE IF NOT EXISTS robots_cache (
+    origin     text PRIMARY KEY,
+    body       text,
+    fetched_at timestamptz NOT NULL
+)"""
+
+# Beat's once-per-period guard (nightly batch, brief pre-gen): leader
+# restarts must not double-fire a period's task.
+_PG_DDL_BEAT_RUN = """
+CREATE TABLE IF NOT EXISTS beat_run (
+    task        text PRIMARY KEY,
+    last_run_at timestamptz NOT NULL
+)"""
+
+
+# --- watches / consumption ------------------------------------------------------
+
+_PG_DDL_WATCH = f"""
+CREATE TABLE IF NOT EXISTS watch (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    kind         text NOT NULL CONSTRAINT ck_watch_kind
+                 CHECK (kind IN {E.sql_in(E.WATCH_KINDS)}),
+    label        text NOT NULL,
+    entity_id    bigint REFERENCES entity(id),
+    thread_id    bigint REFERENCES story(id),
+    claim_id     bigint REFERENCES claim(id),
+    query_fts    text,
+    promote      boolean NOT NULL DEFAULT true,
+    muted        boolean NOT NULL DEFAULT false,
+    last_seen_at timestamptz,
+    created_at   timestamptz NOT NULL,
+    user_id      bigint REFERENCES app_user(id) ON DELETE CASCADE
+)"""
+# user_id NULLABLE in the baseline (single-user); tightened by the auth
+# workstream after backfill.
+
+_PG_DDL_WATCH_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_watch_user ON watch(user_id)",
+)
+
+_PG_DDL_WATCH_HIT = f"""
 CREATE TABLE IF NOT EXISTS watch_hit (
-    watch_id    INTEGER NOT NULL REFERENCES watch(id) ON DELETE CASCADE,
-    object_type TEXT NOT NULL
+    watch_id    bigint NOT NULL REFERENCES watch(id) ON DELETE CASCADE,
+    object_type text NOT NULL
+                CONSTRAINT ck_watch_hit_object_type
                 CHECK (object_type IN {E.sql_in(E.WATCH_HIT_OBJECT_TYPES)}),
-    object_id   INTEGER NOT NULL,
-    created_at  TEXT NOT NULL,
+    object_id   bigint NOT NULL,
+    created_at  timestamptz NOT NULL,
     PRIMARY KEY (watch_id, object_type, object_id)
 )"""
 
-_DDL_WATCH_HIT_INDEX = (
-    "CREATE INDEX IF NOT EXISTS idx_watch_hit_created ON watch_hit(watch_id, created_at)",
+_PG_DDL_WATCH_HIT_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_watch_hit_created"
+    " ON watch_hit(watch_id, created_at)",
 )
 
-_DDL_BRIEF = """
+# UNIQUE NULLS NOT DISTINCT (PG 15+): single-user rows (user_id NULL) keep
+# the v0.1 one-brief-per-day dedupe; per-user uniqueness comes for free when
+# the auth workstream backfills user_id — no rebuild.
+_PG_DDL_BRIEF = """
 CREATE TABLE IF NOT EXISTS brief (
-    id           INTEGER PRIMARY KEY,
-    brief_date   TEXT NOT NULL UNIQUE,
-    generated_at TEXT NOT NULL,
-    gloss_text   TEXT,
-    gloss_model  TEXT
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    brief_date   date NOT NULL,
+    generated_at timestamptz NOT NULL,
+    gloss_text   text,
+    gloss_model  text,
+    user_id      bigint REFERENCES app_user(id) ON DELETE CASCADE,
+    UNIQUE NULLS NOT DISTINCT (user_id, brief_date)
 )"""
 
-# v6 adds payload: denormalized display fields (title/date/source/counts)
-# frozen at generation time so the brief is stable all day.
-_DDL_BRIEF_ITEM = f"""
+_PG_DDL_BRIEF_ITEM = f"""
 CREATE TABLE IF NOT EXISTS brief_item (
-    id          INTEGER PRIMARY KEY,
-    brief_id    INTEGER NOT NULL REFERENCES brief(id) ON DELETE CASCADE,
-    section     TEXT NOT NULL CHECK (section IN {E.sql_in(E.BRIEF_SECTIONS)}),
-    rank        INTEGER NOT NULL,
-    object_type TEXT NOT NULL,
-    object_id   INTEGER NOT NULL,
-    reason_json TEXT NOT NULL DEFAULT '{{}}',
-    payload     TEXT NOT NULL DEFAULT '{{}}',
-    seen        INTEGER NOT NULL DEFAULT 0
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    brief_id    bigint NOT NULL REFERENCES brief(id) ON DELETE CASCADE,
+    section     text NOT NULL CONSTRAINT ck_brief_item_section
+                CHECK (section IN {E.sql_in(E.BRIEF_SECTIONS)}),
+    rank        integer NOT NULL,
+    object_type text NOT NULL,
+    object_id   bigint NOT NULL,
+    reason_json jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    payload     jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    seen        boolean NOT NULL DEFAULT false
 )"""
 
-_DDL_BRIEF_ITEM_INDEX = (
+_PG_DDL_BRIEF_ITEM_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_brief_item_brief ON brief_item(brief_id)",
 )
 
-# Exported for migrations.py (migrate_5_to_6 rebuilds brief_item with the
-# EXACT fresh-create DDL string — the v6 payload column).
-BRIEF_ITEM_TABLE_DDL: str = _DDL_BRIEF_ITEM
-BRIEF_ITEM_INDEX_DDL: tuple[str, ...] = _DDL_BRIEF_ITEM_INDEX
-
-_DDL_VIEW_CURSOR = """
+# PK stays (surface, ref_id) in the baseline (current upsert key); the
+# tenancy workstream swaps it to (user_id, surface, ref_id) once user_id is
+# backfilled NOT NULL — DROP/ADD PRIMARY KEY, a cheap ALTER in PG.
+_PG_DDL_VIEW_CURSOR = """
 CREATE TABLE IF NOT EXISTS view_cursor (
-    surface      TEXT NOT NULL,
-    ref_id       INTEGER NOT NULL DEFAULT 0,
-    last_seen_at TEXT NOT NULL,
+    surface      text NOT NULL,
+    ref_id       bigint NOT NULL DEFAULT 0,
+    last_seen_at timestamptz NOT NULL,
+    user_id      bigint REFERENCES app_user(id) ON DELETE CASCADE,
     PRIMARY KEY (surface, ref_id)
 )"""
 
-_DDL_CALENDAR_EVENT = f"""
+_PG_DDL_CALENDAR_EVENT = f"""
 CREATE TABLE IF NOT EXISTS calendar_event (
-    id        INTEGER PRIMARY KEY,
-    kind      TEXT NOT NULL CHECK (kind IN {E.sql_in(E.CALENDAR_KINDS)}),
-    scope     TEXT,
-    occurs_on TEXT NOT NULL,
-    ends_on   TEXT,
-    label     TEXT NOT NULL
+    id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    kind      text NOT NULL CONSTRAINT ck_calendar_event_kind
+              CHECK (kind IN {E.sql_in(E.CALENDAR_KINDS)}),
+    scope     text,
+    occurs_on date NOT NULL,
+    ends_on   date,
+    label     text NOT NULL
 )"""
 
-_DDL_LLM_CALL = """
+_PG_DDL_LLM_CALL = """
 CREATE TABLE IF NOT EXISTS llm_call (
-    id                INTEGER PRIMARY KEY,
-    purpose           TEXT NOT NULL,
-    model             TEXT NOT NULL,
-    input_tokens      INTEGER NOT NULL DEFAULT 0,
-    output_tokens     INTEGER NOT NULL DEFAULT 0,
-    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-    batch_id          TEXT,
-    cost_estimate     REAL,
-    created_at        TEXT NOT NULL
+    id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    purpose           text NOT NULL,
+    model             text NOT NULL,
+    input_tokens      integer NOT NULL DEFAULT 0,
+    output_tokens     integer NOT NULL DEFAULT 0,
+    cache_read_tokens integer NOT NULL DEFAULT 0,
+    batch_id          text,
+    cost_estimate     double precision,
+    created_at        timestamptz NOT NULL,
+    user_id           bigint REFERENCES app_user(id)
 )"""
+# user_id NULL = system spend (poller-driven sweeps, batch, T2 triggers).
 
-_DDL_SOURCE_STATS = """
+_PG_DDL_LLM_CALL_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_llm_call_user_day"
+    " ON llm_call(user_id, created_at)",
+)
+
+_PG_DDL_SOURCE_STATS = """
 CREATE TABLE IF NOT EXISTS source_stats (
-    source_id        INTEGER NOT NULL REFERENCES source(id) ON DELETE CASCADE,
-    day              TEXT NOT NULL,
-    items            INTEGER NOT NULL DEFAULT 0,
-    dups             INTEGER NOT NULL DEFAULT 0,
-    t1_failures      INTEGER NOT NULL DEFAULT 0,
-    claims_extracted INTEGER NOT NULL DEFAULT 0,
-    claims_false     INTEGER NOT NULL DEFAULT 0,
-    quality_score    REAL,
+    source_id        bigint NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+    day              date NOT NULL,
+    items            integer NOT NULL DEFAULT 0,
+    dups             integer NOT NULL DEFAULT 0,
+    t1_failures      integer NOT NULL DEFAULT 0,
+    claims_extracted integer NOT NULL DEFAULT 0,
+    claims_false     integer NOT NULL DEFAULT 0,
+    quality_score    double precision,
     PRIMARY KEY (source_id, day)
 )"""
 
-# Fallback vector store (plain table + brute-force cosine in Python). Always
-# created; used when sqlite-vec cannot load (SQLite < 3.41 on this machine).
-_DDL_DOCUMENT_EMBEDDING = """
+
+# --- vectors (pgvector) ---------------------------------------------------------
+
+# Same 1:1-table layout as v0.1 — vector availability never breaks the
+# aggregate, and `model` provenance survives. vector(384) enforces the dim
+# (the v0.1 dim column dies). HNSW everywhere: documents need it; claims/
+# events were brute-force in v0.1 and an exact ORDER BY <=> scan reproduces
+# that, but the index costs nothing and removes a scale cliff.
+_PG_DDL_DOCUMENT_EMBEDDING = """
 CREATE TABLE IF NOT EXISTS document_embedding (
-    document_id INTEGER PRIMARY KEY REFERENCES document(id) ON DELETE CASCADE,
-    model       TEXT NOT NULL,
-    dim         INTEGER NOT NULL,
-    vector      BLOB NOT NULL
+    document_id bigint PRIMARY KEY REFERENCES document(id) ON DELETE CASCADE,
+    model       text NOT NULL,
+    embedding   vector(384) NOT NULL
 )"""
 
-# v6: event centroid vectors (running mean over member-doc embeddings).
-# Plain BLOB table — events number in the hundreds at this corpus scale, so
-# brute-force cosine within the candidate window is always sufficient and
-# works identically under both vector backends.
-_DDL_EVENT_EMBEDDING = """
+_PG_DDL_EVENT_EMBEDDING = """
 CREATE TABLE IF NOT EXISTS event_embedding (
-    event_id INTEGER PRIMARY KEY REFERENCES event(id) ON DELETE CASCADE,
-    model    TEXT NOT NULL,
-    dim      INTEGER NOT NULL,
-    vector   BLOB NOT NULL
+    event_id  bigint PRIMARY KEY REFERENCES event(id) ON DELETE CASCADE,
+    model     text NOT NULL,
+    embedding vector(384) NOT NULL
 )"""
 
-# Exported for migrations.py (migrate_5_to_6 creates the same table).
-EVENT_EMBEDDING_DDL: tuple[str, ...] = (_DDL_EVENT_EMBEDDING,)
-
-# v7 (Phase 3 verification): claim text vectors for claim reconciliation
-# (vec >= 0.92 auto-merge / 0.80-0.92 adjudication). Plain BLOB table —
-# claims number in the thousands at this scale, brute-force cosine is fine
-# and works identically under both vector backends.
-_DDL_CLAIM_EMBEDDING = """
+_PG_DDL_CLAIM_EMBEDDING = """
 CREATE TABLE IF NOT EXISTS claim_embedding (
-    claim_id INTEGER PRIMARY KEY REFERENCES claim(id) ON DELETE CASCADE,
-    model    TEXT NOT NULL,
-    dim      INTEGER NOT NULL,
-    vector   BLOB NOT NULL
+    claim_id  bigint PRIMARY KEY REFERENCES claim(id) ON DELETE CASCADE,
+    model     text NOT NULL,
+    embedding vector(384) NOT NULL
 )"""
 
-# Exported for migrations.py (migrate_6_to_7 creates the same table).
-CLAIM_EMBEDDING_DDL: tuple[str, ...] = (_DDL_CLAIM_EMBEDDING,)
-
-# sqlite-vec virtual table — executed by knowledge/vector.py ONLY when the
-# extension loads; kept here because schema.py owns all DDL text.
-VEC_DOCUMENT_DDL = """
-CREATE VIRTUAL TABLE IF NOT EXISTS vec_document USING vec0(
-    embedding float[384]
-)"""
-
-
-ALL_DDL: tuple[str, ...] = (
-    _DDL_META,
-    _DDL_SOURCE,
-    _DDL_DOCUMENT,
-    *_DDL_DOCUMENT_INDEXES,
-    _DDL_DOCUMENT_FTS,
-    *_DDL_DOCUMENT_FTS_TRIGGERS,
-    _DDL_DOCUMENT_LINK,
-    *_DDL_DOCUMENT_LINK_INDEXES,
-    _DDL_DOCUMENT_TOPIC,
-    _DDL_DOCUMENT_ENRICHMENT,
-    _DDL_CLAIM,
-    _DDL_CLAIM_FTS,
-    *_DDL_CLAIM_FTS_TRIGGERS,
-    _DDL_EVIDENCE,
-    _DDL_ENTITY,
-    _DDL_ENTITY_MENTION,
-    *_DDL_ENTITY_MENTION_INDEXES,
-    _DDL_EVENT_TYPE,
-    _DDL_STORY,
-    _DDL_EVENT,
-    *_DDL_EVENT_INDEXES,
-    _DDL_EVENT_ASSIGNMENT,
-    _DDL_DOSSIER,          # before edge (edge FKs dossier)
-    _DDL_DOSSIER_SECTION,
-    _DDL_QUESTION,         # FKs dossier; dossier's FK back is name-resolved
-    *_DDL_QUESTION_INDEXES,
-    _DDL_EDGE,
-    *_DDL_EDGE_INDEXES,
-    _DDL_FINDING,          # FKs dossier + question + edge
-    *_DDL_FINDING_INDEXES,
-    _DDL_FINDING_EVIDENCE,
-    *_DDL_FINDING_EVIDENCE_INDEXES,
-    _DDL_CLAIM_SIGHTING,
-    *_DDL_CLAIM_SIGHTING_INDEXES,
-    _DDL_STATEMENT,          # FKs document + entity
-    *_DDL_STATEMENT_INDEXES,
-    _DDL_POSITION_SHIFT,     # FKs entity + statement
-    *_DDL_POSITION_SHIFT_INDEXES,
-    _DDL_VIEW_SUMMARY,
-    _DDL_VERDICT_HISTORY,
-    _DDL_CONTRADICTION,
-    _DDL_JOB,
-    _DDL_JOB_EVENT,
-    *_DDL_JOB_EVENT_INDEX,
-    _DDL_WATCH,
-    _DDL_WATCH_HIT,
-    *_DDL_WATCH_HIT_INDEX,
-    _DDL_BRIEF,
-    _DDL_BRIEF_ITEM,
-    *_DDL_BRIEF_ITEM_INDEX,
-    _DDL_VIEW_CURSOR,
-    _DDL_CALENDAR_EVENT,
-    _DDL_LLM_CALL,
-    _DDL_SOURCE_STATS,
-    _DDL_DOCUMENT_EMBEDDING,
-    _DDL_EVENT_EMBEDDING,
-    _DDL_CLAIM_EMBEDDING,
+_PG_DDL_EMBEDDING_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_document_embedding_hnsw"
+    " ON document_embedding USING hnsw (embedding vector_cosine_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_event_embedding_hnsw"
+    " ON event_embedding USING hnsw (embedding vector_cosine_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_claim_embedding_hnsw"
+    " ON claim_embedding USING hnsw (embedding vector_cosine_ops)",
 )
 
 
-def create_all(conn: sqlite3.Connection) -> None:
-    """Create the full current schema and stamp ``meta.schema_version``.
+# FK-dependency order; PG validates FK targets at CREATE TABLE (unlike
+# SQLite's name-resolution at DML time), so app_user precedes everything
+# that carries ownership columns and the dossier<->question circular pair
+# is closed by the guarded ALTER after both exist.
+PG_DDL: tuple[str, ...] = (
+    *_PG_DDL_EXTENSIONS,
+    _PG_DDL_META,
+    _PG_DDL_APP_USER,
+    _PG_DDL_USER_SESSION,
+    *_PG_DDL_USER_SESSION_INDEXES,
+    _PG_DDL_INVITE,
+    _PG_DDL_APP_SETTING,
+    _PG_DDL_SOURCE,
+    _PG_DDL_DOCUMENT,
+    *_PG_DDL_DOCUMENT_INDEXES,
+    _PG_DDL_DOCUMENT_LINK,
+    *_PG_DDL_DOCUMENT_LINK_INDEXES,
+    _PG_DDL_DOCUMENT_TOPIC,
+    _PG_DDL_DOCUMENT_ENRICHMENT,
+    _PG_DDL_CLAIM,
+    *_PG_DDL_CLAIM_INDEXES,
+    _PG_DDL_EVIDENCE,
+    _PG_DDL_ENTITY,
+    *_PG_DDL_ENTITY_INDEXES,
+    _PG_DDL_ENTITY_MENTION,
+    *_PG_DDL_ENTITY_MENTION_INDEXES,
+    _PG_DDL_EVENT_TYPE,
+    _PG_DDL_STORY,
+    _PG_DDL_EVENT,
+    *_PG_DDL_EVENT_INDEXES,
+    _PG_DDL_EVENT_ASSIGNMENT,
+    _PG_DDL_DOSSIER,           # without the parent_question FK (added below)
+    *_PG_DDL_DOSSIER_INDEXES,
+    _PG_DDL_DOSSIER_SECTION,
+    _PG_DDL_QUESTION,
+    *_PG_DDL_QUESTION_INDEXES,
+    _PG_DDL_DOSSIER_PARENT_QUESTION_FK,
+    _PG_DDL_EDGE,
+    *_PG_DDL_EDGE_INDEXES,
+    _PG_DDL_FINDING,           # FKs dossier + question + edge
+    *_PG_DDL_FINDING_INDEXES,
+    _PG_DDL_FINDING_EVIDENCE,
+    *_PG_DDL_FINDING_EVIDENCE_INDEXES,
+    _PG_DDL_CLAIM_SIGHTING,
+    *_PG_DDL_CLAIM_SIGHTING_INDEXES,
+    _PG_DDL_STATEMENT,
+    *_PG_DDL_STATEMENT_INDEXES,
+    _PG_DDL_POSITION_SHIFT,
+    *_PG_DDL_POSITION_SHIFT_INDEXES,
+    _PG_DDL_VIEW_SUMMARY,
+    _PG_DDL_VERDICT_HISTORY,
+    _PG_DDL_CONTRADICTION,
+    _PG_DDL_JOB,
+    *_PG_DDL_JOB_INDEXES,
+    _PG_DDL_JOB_EVENT,
+    *_PG_DDL_JOB_EVENT_INDEXES,
+    _PG_DDL_FETCH_DOMAIN,
+    _PG_DDL_ROBOTS_CACHE,
+    _PG_DDL_BEAT_RUN,
+    _PG_DDL_WATCH,
+    *_PG_DDL_WATCH_INDEXES,
+    _PG_DDL_WATCH_HIT,
+    *_PG_DDL_WATCH_HIT_INDEXES,
+    _PG_DDL_BRIEF,
+    _PG_DDL_BRIEF_ITEM,
+    *_PG_DDL_BRIEF_ITEM_INDEXES,
+    _PG_DDL_VIEW_CURSOR,
+    _PG_DDL_CALENDAR_EVENT,
+    _PG_DDL_LLM_CALL,
+    *_PG_DDL_LLM_CALL_INDEXES,
+    _PG_DDL_SOURCE_STATS,
+    _PG_DDL_DOCUMENT_EMBEDDING,
+    _PG_DDL_EVENT_EMBEDDING,
+    _PG_DDL_CLAIM_EMBEDDING,
+    *_PG_DDL_EMBEDDING_INDEXES,
+)
 
-    Idempotent (IF NOT EXISTS everywhere); runs in one transaction.
+
+async def create_all_pg(conn: "psycopg.AsyncConnection") -> None:
+    """Create the full PG baseline schema and stamp ``meta.schema_version``.
+
+    Idempotent (IF NOT EXISTS everywhere; the one ALTER is guarded). The
+    caller owns the transaction AND the migration advisory lock
+    (storage/migrations.py::pg_migrate) — PG DDL is transactional, so a
+    failed create leaves nothing behind.
     """
-    with conn:
-        for ddl in ALL_DDL:
-            conn.execute(ddl)
-        conn.execute(
-            "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
-            (str(SCHEMA_VERSION),))
+    for ddl in PG_DDL:
+        await conn.execute(ddl)
+    await conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', %s)"
+        " ON CONFLICT (key) DO NOTHING",
+        (str(PG_SCHEMA_VERSION),))

@@ -23,31 +23,36 @@ from connect.analysis.schema import (
 from connect.analysis.stages import verify
 from connect.knowledge import contradictions
 from connect.knowledge.embedder import NullEmbedder
-from connect.knowledge.vector import _pack
 from connect.llm.spend import Governor
 from connect.retrieval.search_client import NullSearchClient
-from connect.storage.db import utc_now
+from connect.storage.pg import Vector, utc_now
+from dbutil import q1, qv
+from kb_factories import pad
 
 
 class FakeEmbedder:
     model_name = "fake"
-    dim = 3
+    dim = 384
 
     def __init__(self, mapping: dict[str, list[float]]):
         self.mapping = mapping
 
     def embed(self, texts):
-        return [self.mapping[t] for t in texts if t in self.mapping]
+        return [pad(self.mapping[t]) for t in texts if t in self.mapping]
 
 
-def make_ctx(conn, provider=None, *, cap=2.0, k=6, embedder=None,
+async def _noop_emit(t, d):
+    return 0
+
+
+def make_ctx(pool, conn, provider=None, *, cap=2.0, k=6, embedder=None,
              search=None, emit=None):
     return AnalysisContext(
         conn=conn, provider=provider or MockProvider(),
-        governor=Governor(conn, 100.0), budget=AnalysisBudget(cap),
+        governor=Governor(pool, 100.0), budget=AnalysisBudget(cap),
         search=search or NullSearchClient(), ingest=None,
         embedder=embedder or NullEmbedder(), vectors=None, dossier_id=1,
-        max_evidence_per_claim=k, emit=emit or (lambda t, d: None))
+        max_evidence_per_claim=k, emit=emit or _noop_emit)
 
 
 # --- weighting math (engine design 2c: 1.0/0.8/0.5/0.3, unknown 0.2, --------------
@@ -159,26 +164,28 @@ def test_evidence_menu_rejects_off_menu_ids():
 
 # --- stance: span-verification discard path -------------------------------------------
 
-async def test_stance_discard_after_failed_retry(container):
-    conn = container.db
-    doc_id = insert_doc(conn, title="RBI", text="The RBI raised the repo "
-                        "rate by 25 basis points on Friday.")
-    doc = verify._doc_row(conn, doc_id)
+async def test_stance_discard_after_failed_retry(container, db):
+    conn = db
+    doc_id = await insert_doc(conn, title="RBI",
+                              text="The RBI raised the repo "
+                              "rate by 25 basis points on Friday.")
+    doc = await verify._doc_row(conn, doc_id)
     bad = StanceJudgment(stance="supports", quoted_span="totally invented",
                          relevance=0.9, note="")
     provider = MockProvider(respond=bad)
-    ctx = make_ctx(conn, provider)
+    ctx = make_ctx(container.pool, conn, provider)
     assert await verify.stance_one(ctx, "RBI raised rates", doc) is None
     # exactly one retry happened, with the failure shown
     assert len(provider.calls) == 2
     assert "PREVIOUS ATTEMPT REJECTED" in provider.calls[1]["user_text"]
 
 
-async def test_stance_retry_recovers(container):
-    conn = container.db
-    doc_id = insert_doc(conn, title="RBI", text="The RBI raised the repo "
-                        "rate by 25 basis points on Friday.")
-    doc = verify._doc_row(conn, doc_id)
+async def test_stance_retry_recovers(container, db):
+    conn = db
+    doc_id = await insert_doc(conn, title="RBI",
+                              text="The RBI raised the repo "
+                              "rate by 25 basis points on Friday.")
+    doc = await verify._doc_row(conn, doc_id)
     answers = iter([
         StanceJudgment(stance="supports", quoted_span="invented",
                        relevance=0.9, note=""),
@@ -187,32 +194,32 @@ async def test_stance_retry_recovers(container):
                        relevance=0.9, note=""),
     ])
     provider = MockProvider(respond=lambda _user: next(answers))
-    ctx = make_ctx(conn, provider)
+    ctx = make_ctx(container.pool, conn, provider)
     judgment = await verify.stance_one(ctx, "RBI raised rates", doc)
     assert judgment is not None
     assert judgment.quoted_span.startswith("raised the repo rate")
 
 
-async def test_stance_unrelated_discarded(container):
-    conn = container.db
-    doc_id = insert_doc(conn, text="Entirely about cricket scores.")
-    doc = verify._doc_row(conn, doc_id)
+async def test_stance_unrelated_discarded(container, db):
+    conn = db
+    doc_id = await insert_doc(conn, text="Entirely about cricket scores.")
+    doc = await verify._doc_row(conn, doc_id)
     provider = MockProvider(respond=StanceJudgment(
         stance="unrelated", quoted_span="", relevance=0.0, note=""))
-    ctx = make_ctx(conn, provider)
+    ctx = make_ctx(container.pool, conn, provider)
     assert await verify.stance_one(ctx, "RBI raised rates", doc) is None
     assert len(provider.calls) == 1  # no retry for honest unrelated
 
 
 # --- reasoning: menu-constrained, fallback template -------------------------------------
 
-async def test_reasoning_off_menu_falls_back_to_template(container):
-    conn = container.db
+async def test_reasoning_off_menu_falls_back_to_template(container, db):
+    conn = db
     menu = grounding.EvidenceMenu()
     menu.add(document_id=1, quote="q1")
     provider = MockProvider(respond=ClaimReasoning(
         reasoning="bogus [E9]", cited_evidence_ids=["E9"]))
-    ctx = make_ctx(conn, provider)
+    ctx = make_ctx(container.pool, conn, provider)
     out = await verify.write_reasoning(
         ctx, claim_text="c", verdict="supported", menu=menu,
         fallback="TEMPLATE")
@@ -221,20 +228,20 @@ async def test_reasoning_off_menu_falls_back_to_template(container):
     assert "PREVIOUS ATTEMPT REJECTED" in provider.calls[1]["user_text"]
 
 
-async def test_reasoning_accepts_on_menu_citations(container):
-    conn = container.db
+async def test_reasoning_accepts_on_menu_citations(container, db):
+    conn = db
     menu = grounding.EvidenceMenu()
     menu.add(document_id=1, quote="q1")
     provider = MockProvider(respond=ClaimReasoning(
         reasoning="Grounded by [E1].", cited_evidence_ids=["E1"]))
-    ctx = make_ctx(conn, provider)
+    ctx = make_ctx(container.pool, conn, provider)
     out = await verify.write_reasoning(
         ctx, claim_text="c", verdict="supported", menu=menu, fallback="T")
     assert out == "Grounded by [E1]."
 
 
-async def test_reasoning_empty_menu_uses_template(container):
-    ctx = make_ctx(container.db, MockProvider())
+async def test_reasoning_empty_menu_uses_template(container, db):
+    ctx = make_ctx(container.pool, db, MockProvider())
     out = await verify.write_reasoning(
         ctx, claim_text="c", verdict="unverified",
         menu=grounding.EvidenceMenu(), fallback="T")
@@ -250,115 +257,116 @@ def test_template_reasoning_is_deterministic():
 
 # --- claim reconciliation merge paths -------------------------------------------------
 
-def _seed_claim(conn, text, vec=None):
-    with conn:
-        cur = conn.execute(
-            "INSERT INTO claim (text, created_at) VALUES (?, ?)",
-            (text, utc_now()))
-        claim_id = int(cur.lastrowid)
-        if vec is not None:
-            conn.execute(
-                "INSERT INTO claim_embedding (claim_id, model, dim, vector)"
-                " VALUES (?, 'fake', ?, ?)", (claim_id, len(vec), _pack(vec)))
+async def _seed_claim(conn, text, vec=None):
+    cur = await conn.execute(
+        "INSERT INTO claim (text, created_at) VALUES (%s, %s) RETURNING id",
+        (text, utc_now()))
+    claim_id = int((await cur.fetchone())["id"])
+    if vec is not None:
+        await conn.execute(
+            "INSERT INTO claim_embedding (claim_id, model, embedding)"
+            " VALUES (%s, 'fake', %s)", (claim_id, Vector(pad(vec))))
     return claim_id
 
 
-async def test_reconcile_exact_text_match(container):
-    conn = container.db
-    existing = _seed_claim(conn, "The RBI raised the repo rate.")
-    ctx = make_ctx(conn)
+async def test_reconcile_exact_text_match(container, db):
+    conn = db
+    existing = await _seed_claim(conn, "The RBI raised the repo rate.")
+    ctx = make_ctx(container.pool, conn)
     claim_id, method = await writeback.reconcile_claim(
         ctx, text="the RBI  raised the repo rate.", kind="factual")
     assert (claim_id, method) == (existing, "exact")
 
 
-async def test_reconcile_vec_merge_above_092(container):
-    conn = container.db
-    existing = _seed_claim(conn, "RBI hiked repo by 25 bps", vec=[1, 0, 0])
-    ctx = make_ctx(conn, embedder=FakeEmbedder(
+async def test_reconcile_vec_merge_above_092(container, db):
+    conn = db
+    existing = await _seed_claim(conn, "RBI hiked repo by 25 bps",
+                                 vec=[1, 0, 0])
+    ctx = make_ctx(container.pool, conn, embedder=FakeEmbedder(
         {"Repo rate increased 25 basis points": [1.0, 0.0, 0.0]}))
     claim_id, method = await writeback.reconcile_claim(
         ctx, text="Repo rate increased 25 basis points", kind="factual")
     assert (claim_id, method) == (existing, "vec_merge")
 
 
-async def test_reconcile_gray_zone_adjudicated_yes(container):
-    conn = container.db
-    existing = _seed_claim(conn, "RBI hiked repo by 25 bps", vec=[1, 0, 0])
+async def test_reconcile_gray_zone_adjudicated_yes(container, db):
+    conn = db
+    existing = await _seed_claim(conn, "RBI hiked repo by 25 bps",
+                                 vec=[1, 0, 0])
     # cosine = 0.85 -> gray zone [0.80, 0.92)
     embedder = FakeEmbedder({"Repo went up 25 points": [0.85, 0.5268, 0.0]})
     provider = MockProvider(
         respond_by_schema={SameProposition: SameProposition(same=True)})
-    ctx = make_ctx(conn, provider, embedder=embedder)
+    ctx = make_ctx(container.pool, conn, provider, embedder=embedder)
     claim_id, method = await writeback.reconcile_claim(
         ctx, text="Repo went up 25 points", kind="factual")
     assert (claim_id, method) == (existing, "adjudicated_merge")
 
 
-async def test_reconcile_gray_zone_adjudicated_no_creates_new(container):
-    conn = container.db
-    existing = _seed_claim(conn, "RBI hiked repo by 25 bps", vec=[1, 0, 0])
+async def test_reconcile_gray_zone_adjudicated_no_creates_new(container,
+                                                              db):
+    conn = db
+    existing = await _seed_claim(conn, "RBI hiked repo by 25 bps",
+                                 vec=[1, 0, 0])
     embedder = FakeEmbedder({"CRR cut by 50 points": [0.85, 0.5268, 0.0]})
     provider = MockProvider(
         respond_by_schema={SameProposition: SameProposition(same=False)})
-    ctx = make_ctx(conn, provider, embedder=embedder)
+    ctx = make_ctx(container.pool, conn, provider, embedder=embedder)
     claim_id, method = await writeback.reconcile_claim(
         ctx, text="CRR cut by 50 points", kind="factual")
     assert claim_id != existing
     assert method == "new"
     # the new claim got its own embedding for future reconciliation
-    assert conn.execute("SELECT COUNT(*) FROM claim_embedding"
-                        ).fetchone()[0] == 2
+    assert await qv(conn, "SELECT COUNT(*) FROM claim_embedding") == 2
 
 
-async def test_reconcile_below_080_is_new_without_adjudication(container):
-    conn = container.db
-    _seed_claim(conn, "RBI hiked repo by 25 bps", vec=[1, 0, 0])
+async def test_reconcile_below_080_is_new_without_adjudication(container,
+                                                               db):
+    conn = db
+    await _seed_claim(conn, "RBI hiked repo by 25 bps", vec=[1, 0, 0])
     embedder = FakeEmbedder({"Parliament passed the bill": [0.0, 1.0, 0.0]})
     provider = MockProvider()  # would assert if any call happened
-    ctx = make_ctx(conn, provider, embedder=embedder)
+    ctx = make_ctx(container.pool, conn, provider, embedder=embedder)
     claim_id, method = await writeback.reconcile_claim(
         ctx, text="Parliament passed the bill", kind="factual")
     assert method == "new"
     assert provider.calls == []
 
 
-async def test_reconcile_kind_maps_claim_type(container):
-    conn = container.db
-    ctx = make_ctx(conn)
+async def test_reconcile_kind_maps_claim_type(container, db):
+    conn = db
+    ctx = make_ctx(container.pool, conn)
     claim_id, _ = await writeback.reconcile_claim(
         ctx, text="The govt should cut taxes", kind="normative")
-    row = conn.execute("SELECT claim_type FROM claim WHERE id = ?",
-                       (claim_id,)).fetchone()
-    assert row["claim_type"] == "opinion"
+    assert await qv(conn, "SELECT claim_type FROM claim WHERE id = %s",
+                    claim_id) == "opinion"
 
 
 # --- contradiction scan (pure SQL) ----------------------------------------------------
 
-def _evidence(conn, claim_id, doc_id, stance):
-    with conn:
-        conn.execute(
-            "INSERT INTO evidence (claim_id, document_id, stance, grade,"
-            " created_at) VALUES (?,?,?,2,?)",
-            (claim_id, doc_id, stance, utc_now()))
+async def _evidence(conn, claim_id, doc_id, stance):
+    await conn.execute(
+        "INSERT INTO evidence (claim_id, document_id, stance, grade,"
+        " created_at) VALUES (%s,%s,%s,2,%s)",
+        (claim_id, doc_id, stance, utc_now()))
 
 
-def test_contradiction_scan_sql(container):
-    conn = container.db
-    tier1 = insert_source(conn, "PIB", tier=1)
-    tier2 = insert_source(conn, "ET", tier=2)
-    d1 = insert_doc(conn, source_id=tier1)
-    d2 = insert_doc(conn, source_id=tier2)
-    d3 = insert_doc(conn)  # no source -> tier treated as 4
-    disputed = _seed_claim(conn, "Disputed claim")
-    onesided = _seed_claim(conn, "One-sided claim")
-    _evidence(conn, disputed, d1, "supports")
-    _evidence(conn, disputed, d2, "refutes")
-    _evidence(conn, disputed, d3, "supports")
-    _evidence(conn, onesided, d1, "supports")
+async def test_contradiction_scan_sql(db):
+    conn = db
+    tier1 = await insert_source(conn, "PIB", tier=1)
+    tier2 = await insert_source(conn, "ET", tier=2)
+    d1 = await insert_doc(conn, source_id=tier1)
+    d2 = await insert_doc(conn, source_id=tier2)
+    d3 = await insert_doc(conn)  # no source -> tier treated as 4
+    disputed = await _seed_claim(conn, "Disputed claim")
+    onesided = await _seed_claim(conn, "One-sided claim")
+    await _evidence(conn, disputed, d1, "supports")
+    await _evidence(conn, disputed, d2, "refutes")
+    await _evidence(conn, disputed, d3, "supports")
+    await _evidence(conn, onesided, d1, "supports")
 
-    assert contradictions.scan(conn) == 1
-    rows, total = contradictions.list_page(conn)
+    assert await contradictions.scan(conn) == 1
+    rows, total = await contradictions.list_page(conn)
     assert total == 1
     row = rows[0]
     assert row["claim"]["id"] == disputed
@@ -367,19 +375,20 @@ def test_contradiction_scan_sql(container):
     assert row["status"] == "open"
 
     # rescan refreshes counts without duplicating rows
-    d4 = insert_doc(conn, source_id=tier2)
-    _evidence(conn, disputed, d4, "refutes")
-    assert contradictions.scan(conn) == 1
-    rows, total = contradictions.list_page(conn)
+    d4 = await insert_doc(conn, source_id=tier2)
+    await _evidence(conn, disputed, d4, "refutes")
+    assert await contradictions.scan(conn) == 1
+    rows, total = await contradictions.list_page(conn)
     assert total == 1
     assert (rows[0]["n_support"], rows[0]["n_refute"]) == (2, 2)
 
     # dismissal is user state — the scanner never reopens it
-    dismissed = contradictions.dismiss(conn, rows[0]["id"])
+    dismissed = await contradictions.dismiss(conn, rows[0]["id"])
     assert dismissed["status"] == "dismissed"
-    contradictions.scan(conn)
-    assert contradictions.get(conn, rows[0]["id"])["status"] == "dismissed"
-    assert contradictions.dismiss(conn, 99999) is None
+    await contradictions.scan(conn)
+    assert (await contradictions.get(conn, rows[0]["id"]))["status"] \
+        == "dismissed"
+    assert await contradictions.dismiss(conn, 99999) is None
 
 
 # --- evidence gathering: web hits fetched through the EXISTING ingest --------------------
@@ -396,19 +405,19 @@ class FakeSearchClient(NullSearchClient):
         return self.hits[:max_results]
 
 
-async def test_gather_evidence_fetches_new_web_docs(container):
+async def test_gather_evidence_fetches_new_web_docs(container, db):
     from canned_web import FakeFetcher, html_page
 
     from connect.retrieval.search_client import SearchHit
 
-    conn = container.db
+    conn = db
     url = "https://news.example.com/repo-hike"
     container.pipeline.fetcher = FakeFetcher({
         url: html_page("RBI raises repo rate",
                        "<p>The RBI raised the repo rate by 25 basis "
                        "points, the central bank said.</p>")})
     search = FakeSearchClient([SearchHit(url=url, title="RBI raises")])
-    ctx = make_ctx(conn, MockProvider(), search=search)
+    ctx = make_ctx(container.pool, conn, MockProvider(), search=search)
     ctx.ingest = container.pipeline
 
     claim = DecomposedClaim(id="C1", text="RBI raised the repo rate",
@@ -419,8 +428,8 @@ async def test_gather_evidence_fetches_new_web_docs(container):
     assert docs[0]["url"] == url
     assert "repo rate" in docs[0]["content_text"]
     # the snapshot landed through the normal ingest (immutable corpus)
-    assert conn.execute("SELECT COUNT(*) FROM document WHERE url = ?",
-                        (url,)).fetchone()[0] == 1
+    assert await qv(conn, "SELECT COUNT(*) FROM document WHERE url = %s",
+                    url) == 1
     # second gather reuses the stored doc instead of refetching
     docs2 = await verify.gather_evidence(ctx, claim, k=3)
     assert [d["id"] for d in docs2] == [docs[0]["id"]]
@@ -429,9 +438,9 @@ async def test_gather_evidence_fetches_new_web_docs(container):
 
 # --- budget: degrade K, then abort-with-partial ------------------------------------------
 
-def test_plan_claim_k_degrades_then_aborts(container):
-    conn = container.db
-    ctx = make_ctx(conn, MockProvider(), cap=2.0, k=6)
+async def test_plan_claim_k_degrades_then_aborts(container, db):
+    conn = db
+    ctx = make_ctx(container.pool, conn, MockProvider(), cap=2.0, k=6)
     full = (6 * ctx.projected_cost(
         verify.ModelTier.FAST, verify.EST_STANCE_IN, verify.EST_STANCE_OUT)
         + ctx.projected_cost(verify.ModelTier.BALANCED,
@@ -452,14 +461,15 @@ def test_plan_claim_k_degrades_then_aborts(container):
     assert verify.plan_claim_k(ctx, 6) == (None, True)
 
 
-async def test_verify_run_budget_abort_partial(container):
+async def test_verify_run_budget_abort_partial(container, db):
     """First claim verifies (degraded K), the second is skipped when the
     budget is exhausted — partial result, summary says so."""
-    conn = container.db
-    src = insert_source(conn, "ET", tier=2)
-    insert_doc(conn, title="RBI raised repo rate",
-               text="The RBI raised the repo rate by 25 basis points.",
-               source_id=src)
+    conn = db
+    src = await insert_source(conn, "ET", tier=2)
+    await insert_doc(conn, title="RBI raised repo rate",
+                     text="The RBI raised the repo rate by 25 basis"
+                          " points.",
+                     source_id=src)
 
     def stance(_user):
         return StanceJudgment(
@@ -473,7 +483,7 @@ async def test_verify_run_budget_abort_partial(container):
             ClaimReasoning: ClaimReasoning(reasoning="ok",
                                            cited_evidence_ids=[]),
         })
-    ctx = make_ctx(conn, provider, cap=0.02, k=6)
+    ctx = make_ctx(container.pool, conn, provider, cap=0.02, k=6)
     normalized = NormalizedInput(
         subject="rbi", input_kind="news_claim",
         claims=[

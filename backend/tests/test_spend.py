@@ -50,24 +50,30 @@ def test_estimated_t1_cost_matches_design():
         "claude-haiku-4-5", batch=True) == pytest.approx(0.00185)
 
 
-def test_record_call_and_daily_rollups(container):
-    conn = container.db
-    spend.record_call(conn, purpose="enrich_t1", model="claude-haiku-4-5",
-                      usage=Usage(input_tokens=2200, output_tokens=300))
-    spend.record_call(conn, purpose="enrich_t1", model="claude-haiku-4-5",
-                      usage=Usage(input_tokens=1000, output_tokens=100),
-                      batch=True, batch_id="b1")
-    rows = conn.execute(
+async def test_record_call_and_daily_rollups(db):
+    conn = db
+    await spend.record_call(conn, purpose="enrich_t1",
+                            model="claude-haiku-4-5",
+                            usage=Usage(input_tokens=2200,
+                                        output_tokens=300))
+    await spend.record_call(conn, purpose="enrich_t1",
+                            model="claude-haiku-4-5",
+                            usage=Usage(input_tokens=1000,
+                                        output_tokens=100),
+                            batch=True, batch_id="b1")
+    from dbutil import qall
+    rows = await qall(
+        conn,
         "SELECT purpose, model, input_tokens, output_tokens, batch_id,"
-        " cost_estimate FROM llm_call ORDER BY id").fetchall()
+        " cost_estimate FROM llm_call ORDER BY id")
     assert rows[0]["cost_estimate"] == pytest.approx(0.0037)
     assert rows[1]["cost_estimate"] == pytest.approx(0.00075)  # 0.0015 * 0.5
     assert rows[1]["batch_id"] == "b1"
 
-    assert spend.spent_today(conn) == pytest.approx(0.00445)
-    assert spend.spent_on(conn, "1999-01-01") == 0.0
+    assert await spend.spent_today(conn) == pytest.approx(0.00445)
+    assert await spend.spent_on(conn, "1999-01-01") == 0.0
 
-    days = spend.daily_breakdown(conn, 3)
+    days = await spend.daily_breakdown(conn, 3)
     assert len(days) == 3  # zero-filled series, oldest first
     assert days[0]["calls"] == 0 and days[0]["cost_usd"] == 0.0
     today = days[-1]
@@ -77,19 +83,19 @@ def test_record_call_and_daily_rollups(container):
     assert today["cost_usd"] == pytest.approx(0.00445)
 
 
-def test_governor(container):
-    conn = container.db
-    governor = Governor(conn, daily_budget_usd=1.0)
-    governor.check(0.5)  # fine: 0 + 0.5 <= 1.0
-    spend.record_call(conn, purpose="x", model="claude-haiku-4-5",
-                      usage=Usage(input_tokens=900_000, output_tokens=0))
-    governor.check(0.05)  # 0.9 + 0.05 <= 1.0
+async def test_governor(container, db):
+    governor = Governor(container.pool, daily_budget_usd=1.0)
+    await governor.check(0.5)  # fine: 0 + 0.5 <= 1.0
+    await spend.record_call(db, purpose="x", model="claude-haiku-4-5",
+                            usage=Usage(input_tokens=900_000,
+                                        output_tokens=0))
+    await governor.check(0.05)  # 0.9 + 0.05 <= 1.0
     with pytest.raises(BudgetExceeded):
-        governor.check(0.2)  # 0.9 + 0.2 > 1.0
+        await governor.check(0.2)  # 0.9 + 0.2 > 1.0
 
 
 def test_tier_models_settings_override(tmp_path):
-    s = Settings(db_path=tmp_path / "x.db", model_fast="my-fast-model")
+    s = Settings(model_fast="my-fast-model")
     models = tier_models(s)
     assert models[ModelTier.FAST] == "my-fast-model"
     assert models[ModelTier.BALANCED] == "claude-sonnet-4-6"
@@ -100,11 +106,12 @@ def test_tier_models_settings_override(tmp_path):
 # --- endpoints --------------------------------------------------------------------
 
 
-def test_spend_endpoint_math(env):
+async def test_spend_endpoint_math(env, db):
     client, container = env
-    spend.record_call(container.db, purpose="enrich_t1",
-                      model="claude-haiku-4-5",
-                      usage=Usage(input_tokens=2200, output_tokens=300))
+    await spend.record_call(db, purpose="enrich_t1",
+                            model="claude-haiku-4-5",
+                            usage=Usage(input_tokens=2200,
+                                        output_tokens=300))
     body = client.get("/api/spend", params={"days": 7}).json()
     assert body["daily_cap_usd"] == 2.0
     assert body["today_spent_usd"] == pytest.approx(0.0037)
@@ -118,7 +125,7 @@ def test_spend_endpoint_math(env):
                                "cost_usd": 0.0}
 
 
-def test_enrichment_sweep_endpoint_runs_job(env):
+async def test_enrichment_sweep_endpoint_runs_job(env, db):
     client, container = env
     # no provider -> 503 with a clear reason
     container.enrichment.provider = None
@@ -141,17 +148,17 @@ def test_enrichment_sweep_endpoint_runs_job(env):
     assert isinstance(job_id, int)
 
     # the job runs on the app's event loop; poll its row via the DB
-    for _ in range(200):
-        row = container.db.execute(
-            "SELECT status, error FROM job WHERE id=?", (job_id,)).fetchone()
+    import asyncio
+    from dbutil import q1, qv
+    for _ in range(500):
+        row = await q1(db, "SELECT status, error FROM job WHERE id=%s",
+                       job_id)
         if row["status"] in ("done", "failed"):
             break
-        import time
-        time.sleep(0.01)
+        await asyncio.sleep(0.01)
     assert row["status"] == "done", row["error"]
-    assert container.db.execute(
-        "SELECT enrichment_status FROM document WHERE id=?",
-        (doc_id,)).fetchone()[0] == "done"
+    assert await qv(db, "SELECT enrichment_status FROM document"
+                        " WHERE id=%s", doc_id) == "done"
 
     # invalid mode rejected
     assert client.post("/api/enrichment/sweep",

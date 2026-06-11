@@ -26,8 +26,8 @@ from connect.investigation.synthesize import (
 )
 from connect.llm.spend import INVESTIGATION_PURPOSES, Governor
 from connect.llm.tiers import DEFAULT_TIER_MODELS, ModelTier
-from connect.storage import db as db_mod
-from connect.storage.db import utc_now
+from connect.storage.pg import utc_now
+from dbutil import qv
 
 
 def test_check_citations_and_strip():
@@ -39,50 +39,44 @@ def test_check_citations_and_strip():
 
 
 @pytest.fixture()
-def conn(tmp_path):
-    c = db_mod.connect(tmp_path / "t.db")
-    db_mod.init_db(c)
-    yield c
-    c.close()
-
-
-@pytest.fixture()
-def env(conn):
-    doc_id = insert_doc(conn, title="doc",
-                        text="The committee objected to the draft.")
-    with conn:
-        conn.execute(
-            "INSERT INTO dossier (kind, input_text, status, created_at)"
-            " VALUES ('investigation', 'draft rules', 'running', ?)",
-            (utc_now(),))
-        conn.execute(
-            "INSERT INTO question (dossier_id, qtype, text, status,"
-            " created_at) VALUES (1, 'why_now', 'Why now?', 'open', ?)",
-            (utc_now(),))
-        # two findings: one grounded, one speculative
-        conn.execute(
-            "INSERT INTO finding (dossier_id, kind, text, speculation,"
-            " created_at) VALUES (1, 'trigger', 'grounded trigger', 0, ?)",
-            (utc_now(),))
-        conn.execute(
-            "INSERT INTO finding_evidence (finding_id, document_id, quote)"
-            " VALUES (1, ?, 'The committee objected to the draft.')",
-            (doc_id,))
-        conn.execute(
-            "INSERT INTO finding (dossier_id, kind, text, speculation,"
-            " created_at) VALUES (1, 'reaction', 'maybe a reaction', 1, ?)",
-            (utc_now(),))
+async def env(db, pool):
+    conn = db
+    doc_id = await insert_doc(conn, title="doc",
+                              text="The committee objected to the draft.")
+    await conn.execute(
+        "INSERT INTO dossier (kind, input_text, status, created_at)"
+        " VALUES ('investigation', 'draft rules', 'running', %s)",
+        (utc_now(),))
+    await conn.execute(
+        "INSERT INTO question (dossier_id, qtype, text, status,"
+        " created_at) VALUES (1, 'why_now', 'Why now?', 'open', %s)",
+        (utc_now(),))
+    # two findings: one grounded, one speculative
+    await conn.execute(
+        "INSERT INTO finding (dossier_id, kind, text, speculation,"
+        " created_at) VALUES (1, 'trigger', 'grounded trigger', FALSE,"
+        " %s)",
+        (utc_now(),))
+    await conn.execute(
+        "INSERT INTO finding_evidence (finding_id, document_id, quote)"
+        " VALUES (1, %s, 'The committee objected to the draft.')",
+        (doc_id,))
+    await conn.execute(
+        "INSERT INTO finding (dossier_id, kind, text, speculation,"
+        " created_at) VALUES (1, 'reaction', 'maybe a reaction', TRUE,"
+        " %s)",
+        (utc_now(),))
     pack = ScopePack(
         input_text="draft rules", input_type="topic",
         calendar=[CalendarItem(calendar_event_id=5, kind="budget",
                                occurs_on="2026-02-01", label="Budget")])
-    return {"conn": conn, "dossier_id": 1, "pack": pack}
+    return {"conn": conn, "pool": pool, "dossier_id": 1, "pack": pack}
 
 
 def write_sections(conn):
     written = {}
 
-    def writer(dossier_id, stage, content, status="completed"):
+    async def writer(dossier_id, stage, content, status="completed"):
         written[stage] = {"status": status, "content": content}
     return written, writer
 
@@ -91,12 +85,16 @@ async def run_synthesis(env, provider, *, budget=None, tier_pref="deep",
                         governor=None):
     written, writer = write_sections(env["conn"])
     emitted = []
+
+    async def emit(t, d=None):
+        emitted.append((t, d))
+
     summary = await synthesize.run(
         env["conn"], provider, dossier_id=env["dossier_id"],
         pack=env["pack"], budget=budget or AnalysisBudget(5.0),
-        governor=governor or Governor(env["conn"], 10.0,
+        governor=governor or Governor(env["pool"], 10.0,
                                       purposes=INVESTIGATION_PURPOSES),
-        emit=lambda t, d=None: emitted.append((t, d)),
+        emit=emit,
         tier_pref=tier_pref, reserve_usd=0.20, section_writer=writer)
     return summary, written, emitted
 
@@ -154,47 +152,46 @@ async def test_grounded_output_passes_first_try(env):
     assert {t for t, _ in emitted} == {"section_completed"}
     # the one structured call was DEEP and ledgered under synthesis
     assert provider.calls[0]["tier"] is ModelTier.DEEP
-    assert env["conn"].execute(
-        "SELECT COUNT(*) FROM llm_call WHERE"
-        " purpose='investigation_synthesis'").fetchone()[0] == 1
+    assert await qv(env["conn"],
+                    "SELECT COUNT(*) FROM llm_call WHERE"
+                    " purpose='investigation_synthesis'") == 1
     assert "2 findings synthesized on deep tier" in summary
 
 
-def test_actor_entity_ids_resolved_not_trusted(env):
+async def test_actor_entity_ids_resolved_not_trusted(env):
     """Live-run regression: the DEEP call never sees the entity table, so
     its actor entity ids are fabricated. They must be resolved by
     name/alias; a model id survives only when its entity name is
     consistent with the actor's; everything else nulls out."""
     conn = env["conn"]
-    with conn:
-        for name, aliases in (("Reserve Bank of India", '["RBI"]'),
-                              ("Federation of Digital Lenders", "[]"),
-                              ("Arjun Malpani", "[]")):
-            conn.execute(
-                "INSERT INTO entity (name, aliases, created_at)"
-                " VALUES (?, ?, ?)", (name, aliases, utc_now()))
+    for name, aliases in (("Reserve Bank of India", '["RBI"]'),
+                          ("Federation of Digital Lenders", "[]"),
+                          ("Arjun Malpani", "[]")):
+        await conn.execute(
+            "INSERT INTO entity (name, aliases, created_at)"
+            " VALUES (%s, %s, %s)", (name, aliases, utc_now()))
     resolve = synthesize._resolve_actor_entity
     # fabricated id, exact name -> resolved to the real row
-    assert resolve(conn, 99, "Federation of Digital Lenders") == 2
+    assert await resolve(conn, 99, "Federation of Digital Lenders") == 2
     # parenthetical acronym stripped before matching
-    assert resolve(conn, 1, "Federation of Digital Lenders (FDL)") == 2
+    assert await resolve(conn, 1,
+                         "Federation of Digital Lenders (FDL)") == 2
     # alias match (case-insensitive)
-    assert resolve(conn, 99, "rbi") == 1
+    assert await resolve(conn, 99, "rbi") == 1
     # supplied id kept when its entity name is consistent with the actor
-    assert resolve(conn, 1, "Reserve Bank of India officials") == 1
+    assert await resolve(conn, 1, "Reserve Bank of India officials") == 1
     # inconsistent id + unknown name -> None (UI renders unlinked card)
-    assert resolve(conn, 2, "World Bank") is None
-    assert resolve(conn, None, "Nobody Known") is None
-    assert resolve(conn, 99, "") is None
+    assert await resolve(conn, 2, "World Bank") is None
+    assert await resolve(conn, None, "Nobody Known") is None
+    assert await resolve(conn, 99, "") is None
 
 
 async def test_actor_entity_resolution_through_pipeline(env):
     conn = env["conn"]
-    with conn:
-        conn.execute(
-            "INSERT INTO entity (name, aliases, created_at)"
-            " VALUES ('Finance Ministry', '[\"Ministry\"]', ?)",
-            (utc_now(),))
+    await conn.execute(
+        "INSERT INTO entity (name, aliases, created_at)"
+        " VALUES ('Finance Ministry', '[\"Ministry\"]', %s)",
+        (utc_now(),))
     provider = MockProvider(respond_by_schema={SynthesisOutput: GOOD})
     _, written, _ = await run_synthesis(env, provider)
     # GOOD's actor claims entity_id=1 with name 'Ministry' -> alias hit
@@ -250,7 +247,7 @@ async def test_over_reserve_falls_back_to_balanced(env):
 
 async def test_budget_skip_persists_code_sections_only(env):
     provider = MockProvider(respond_by_schema={SynthesisOutput: GOOD})
-    governor = Governor(env["conn"], 0.0001,
+    governor = Governor(env["pool"], 0.0001,
                         purposes=INVESTIGATION_PURPOSES)
     summary, written, _ = await run_synthesis(env, provider,
                                               governor=governor)
@@ -262,8 +259,8 @@ async def test_budget_skip_persists_code_sections_only(env):
     assert provider.calls == []  # no LLM spend at all
 
 
-def test_findings_menu_render(env):
-    menu = synthesize.findings_menu(env["conn"], env["dossier_id"])
+async def test_findings_menu_render(env):
+    menu = await synthesize.findings_menu(env["conn"], env["dossier_id"])
     assert [m["finding_id"] for m in menu] == [1, 2]
     assert menu[0]["quote"] == "The committee objected to the draft."
     assert menu[1]["speculation"] is True
@@ -279,24 +276,23 @@ def test_default_models_unchanged():
         "claude-sonnet")
 
 
-def test_timeline_section_reads_fresh_edges(env):
+async def test_timeline_section_reads_fresh_edges(env):
     conn = env["conn"]
-    with conn:
-        conn.execute("INSERT INTO event (title, occurred_on, created_at)"
-                     " VALUES ('A', '2026-05-01', ?)", (utc_now(),))
-        conn.execute("INSERT INTO event (title, occurred_on, created_at)"
-                     " VALUES ('B', '2026-05-05', ?)", (utc_now(),))
-        conn.execute(
-            "INSERT INTO edge (src_type, src_id, dst_type, dst_id,"
-            " relation, properties, grade, created_at) VALUES"
-            " ('event', 2, 'event', 1, 'reaction_to',"
-            " '{\"speculation\": true}', 2, ?)", (utc_now(),))
+    await conn.execute("INSERT INTO event (title, occurred_on, created_at)"
+                       " VALUES ('A', '2026-05-01', %s)", (utc_now(),))
+    await conn.execute("INSERT INTO event (title, occurred_on, created_at)"
+                       " VALUES ('B', '2026-05-05', %s)", (utc_now(),))
+    await conn.execute(
+        "INSERT INTO edge (src_type, src_id, dst_type, dst_id,"
+        " relation, properties, grade, created_at) VALUES"
+        " ('event', 2, 'event', 1, 'reaction_to',"
+        " '{\"speculation\": true}', 2, %s)", (utc_now(),))
     from connect.investigation.schema import TimelineItem
     pack = env["pack"].model_copy(update={"timeline": [
         TimelineItem(event_id=1, date="2026-05-01", title="A"),
         TimelineItem(event_id=2, date="2026-05-05", title="B"),
     ]})
-    content = synthesize.timeline_section(conn, pack)
+    content = await synthesize.timeline_section(conn, pack)
     by_event = {i["event_id"]: i for i in content["items"]}
     chip_in = by_event[1]["causal"][0]
     chip_out = by_event[2]["causal"][0]

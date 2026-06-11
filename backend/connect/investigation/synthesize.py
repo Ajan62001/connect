@@ -12,11 +12,11 @@ calendar id. Re-runnable from rows alone.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
-import sqlite3
 from typing import Any, Callable
+
+import psycopg
 
 from connect.analysis.budget import AnalysisBudget, AnalysisBudgetExceeded
 from connect.investigation.prompts import SYNTHESIS_SYSTEM
@@ -35,16 +35,16 @@ SYN_MAX_TOKENS = 3000
 
 CITATION_RE = re.compile(r"\[\[f(\d+)\]\]")
 
-SectionWriter = Callable[..., None]   # (dossier_id, stage, content, status=)
+SectionWriter = Callable[..., Any]   # async (dossier_id, stage, content, status=)
 
 
 # -- findings menu -------------------------------------------------------------------
 
 
-def findings_menu(conn: sqlite3.Connection,
-                  dossier_id: int) -> list[dict[str, Any]]:
+async def findings_menu(conn: psycopg.AsyncConnection,
+                        dossier_id: int) -> list[dict[str, Any]]:
     """The closed evidence menu: one row per finding with its first quote."""
-    rows = conn.execute(
+    cur = await conn.execute(
         "SELECT f.id, f.kind, f.text, f.speculation, f.confidence,"
         " f.question_id, f.edge_id,"
         " (SELECT quote FROM finding_evidence fe WHERE fe.finding_id = f.id"
@@ -52,8 +52,9 @@ def findings_menu(conn: sqlite3.Connection,
         " (SELECT document_id FROM finding_evidence fe"
         "  WHERE fe.finding_id = f.id ORDER BY fe.id LIMIT 1)"
         "  AS document_id"
-        " FROM finding f WHERE f.dossier_id = ? ORDER BY f.id",
-        (dossier_id,)).fetchall()
+        " FROM finding f WHERE f.dossier_id = %s ORDER BY f.id",
+        (dossier_id,))
+    rows = await cur.fetchall()
     return [{"finding_id": r["id"], "kind": r["kind"], "text": r["text"],
              "speculation": bool(r["speculation"]),
              "confidence": r["confidence"], "quote": r["quote"],
@@ -98,49 +99,47 @@ def strip_markers(text: str, markers: list[str]) -> str:
 # -- code sections ----------------------------------------------------------------------
 
 
-def timeline_section(conn: sqlite3.Connection,
-                     pack: ScopePack) -> dict[str, Any]:
+async def timeline_section(conn: psycopg.AsyncConnection,
+                           pack: ScopePack) -> dict[str, Any]:
     """Timeline items with causal chips read FRESH from the edge table so
     edges written during the loop appear immediately."""
-    marks = ",".join("?" * len(CAUSAL_RELATIONS))
     items: list[dict[str, Any]] = []
     for item in pack.timeline:
         causal: list[dict[str, Any]] = []
         if item.event_id is not None:
-            rows = conn.execute(
+            cur = await conn.execute(
                 "SELECT id, src_type, src_id, dst_type, dst_id, relation,"
                 " properties FROM edge WHERE status = 'active'"
-                f" AND relation IN ({marks})"
-                " AND ((src_type = 'event' AND src_id = ?)"
-                "  OR (dst_type = 'event' AND dst_id = ?))",
-                (*CAUSAL_RELATIONS, item.event_id, item.event_id),
-            ).fetchall()
+                " AND relation = ANY(%s)"
+                " AND ((src_type = 'event' AND src_id = %s)"
+                "  OR (dst_type = 'event' AND dst_id = %s))",
+                (list(CAUSAL_RELATIONS), item.event_id, item.event_id))
+            rows = await cur.fetchall()
             for row in rows:
                 outgoing = (row["src_type"] == "event"
                             and row["src_id"] == item.event_id)
                 other_type = (row["dst_type"] if outgoing
                               else row["src_type"])
                 other_id = row["dst_id"] if outgoing else row["src_id"]
-                speculation = False
-                try:
-                    speculation = bool(json.loads(
-                        row["properties"] or "{}").get("speculation"))
-                except ValueError:
-                    pass
+                properties = (row["properties"]
+                              if isinstance(row["properties"], dict) else {})
+                speculation = bool(properties.get("speculation"))
                 title_row = None
                 if other_type == "event":
-                    title_row = conn.execute(
-                        "SELECT title FROM event WHERE id = ?",
-                        (other_id,)).fetchone()
+                    tcur = await conn.execute(
+                        "SELECT title AS t FROM event WHERE id = %s",
+                        (other_id,))
+                    title_row = await tcur.fetchone()
                 elif other_type == "entity":
-                    title_row = conn.execute(
-                        "SELECT name FROM entity WHERE id = ?",
-                        (other_id,)).fetchone()
+                    tcur = await conn.execute(
+                        "SELECT name AS t FROM entity WHERE id = %s",
+                        (other_id,))
+                    title_row = await tcur.fetchone()
                 causal.append({
                     "edge_id": row["id"], "relation": row["relation"],
                     "direction": "out" if outgoing else "in",
                     "other_type": other_type, "other_id": other_id,
-                    "other_title": title_row[0] if title_row else None,
+                    "other_title": title_row["t"] if title_row else None,
                     "speculation": speculation})
         items.append({
             "event_id": item.event_id, "document_id": item.document_id,
@@ -150,29 +149,32 @@ def timeline_section(conn: sqlite3.Connection,
     return {"items": items}
 
 
-def alternatives_section(conn: sqlite3.Connection,
-                         dossier_id: int) -> dict[str, Any]:
-    rows = conn.execute(
-        "SELECT id, text FROM finding WHERE dossier_id = ?"
-        " AND kind = 'alternative' ORDER BY id", (dossier_id,)).fetchall()
+async def alternatives_section(conn: psycopg.AsyncConnection,
+                               dossier_id: int) -> dict[str, Any]:
+    cur = await conn.execute(
+        "SELECT id, text FROM finding WHERE dossier_id = %s"
+        " AND kind = 'alternative' ORDER BY id", (dossier_id,))
+    rows = await cur.fetchall()
     items = [{"title": (r["text"][:80] + "…" if len(r["text"]) > 80
                         else r["text"]),
               "description": r["text"], "finding_ids": [r["id"]],
               "by_whom_entity_id": None} for r in rows]
-    unanswered = [r[0] for r in conn.execute(
-        "SELECT id FROM question WHERE dossier_id = ?"
+    cur = await conn.execute(
+        "SELECT id FROM question WHERE dossier_id = %s"
         " AND qtype = 'why_not_alternative' AND status IN ('open',"
-        " 'partial') ORDER BY id", (dossier_id,))]
+        " 'partial') ORDER BY id", (dossier_id,))
+    unanswered = [r["id"] for r in await cur.fetchall()]
     return {"items": items, "unanswered_question_ids": unanswered}
 
 
-def open_questions_section(conn: sqlite3.Connection,
-                           dossier_id: int) -> dict[str, Any]:
-    rows = conn.execute(
+async def open_questions_section(conn: psycopg.AsyncConnection,
+                                 dossier_id: int) -> dict[str, Any]:
+    cur = await conn.execute(
         "SELECT id, qtype, text, status, priority, spawned_dossier_id"
-        " FROM question WHERE dossier_id = ?"
+        " FROM question WHERE dossier_id = %s"
         " ORDER BY CASE status WHEN 'open' THEN 0 WHEN 'partial' THEN 1"
-        " ELSE 2 END, priority DESC, id", (dossier_id,)).fetchall()
+        " ELSE 2 END, priority DESC, id", (dossier_id,))
+    rows = await cur.fetchall()
     return {"items": [
         {"question_id": r["id"], "qtype": r["qtype"], "text": r["text"],
          "status": r["status"], "priority": r["priority"],
@@ -182,8 +184,9 @@ def open_questions_section(conn: sqlite3.Connection,
 # -- the DEEP call + post-hoc grounding ----------------------------------------------------
 
 
-def _synthesis_user(conn: sqlite3.Connection, dossier_id: int,
-                    pack: ScopePack, menu: list[dict[str, Any]]) -> str:
+async def _synthesis_user(conn: psycopg.AsyncConnection, dossier_id: int,
+                          pack: ScopePack,
+                          menu: list[dict[str, Any]]) -> str:
     parts = [f"INVESTIGATION: {pack.input_text}", "", render_menu(menu), ""]
     if pack.timeline:
         parts.append("TIMELINE:")
@@ -200,9 +203,10 @@ def _synthesis_user(conn: sqlite3.Connection, dossier_id: int,
             f"- calendar #{c.calendar_event_id} {c.occurs_on} {c.label}"
             for c in pack.calendar)
         parts.append("")
-    rows = conn.execute(
+    cur = await conn.execute(
         "SELECT id, qtype, text, status FROM question"
-        " WHERE dossier_id = ? ORDER BY id", (dossier_id,)).fetchall()
+        " WHERE dossier_id = %s ORDER BY id", (dossier_id,))
+    rows = await cur.fetchall()
     if rows:
         parts.append("QUESTIONS:")
         parts.extend(f"- question #{r['id']} [{r['qtype']}, {r['status']}]"
@@ -212,8 +216,9 @@ def _synthesis_user(conn: sqlite3.Connection, dossier_id: int,
     return "\n".join(parts)
 
 
-def _resolve_actor_entity(conn: sqlite3.Connection, entity_id: int | None,
-                          name: str) -> int | None:
+async def _resolve_actor_entity(conn: psycopg.AsyncConnection,
+                                entity_id: int | None,
+                                name: str) -> int | None:
     """Untrusted-id repair for the actors section. The DEEP call sees only
     the finding/question menus — never the entity table — so its actor
     entity ids are routinely fabricated. Resolve by name (exact name or
@@ -226,32 +231,36 @@ def _resolve_actor_entity(conn: sqlite3.Connection, entity_id: int | None,
     for candidate in dict.fromkeys((norm, base)):   # ordered, de-duped
         if not candidate:
             continue
-        row = conn.execute(
-            "SELECT id FROM entity WHERE lower(name) = ?",
-            (candidate,)).fetchone()
+        cur = await conn.execute(
+            "SELECT id FROM entity WHERE lower(name) = %s",
+            (candidate,))
+        row = await cur.fetchone()
         if row is None:
-            row = conn.execute(
-                "SELECT e.id FROM entity e, json_each(e.aliases) a"
-                " WHERE lower(a.value) = ? LIMIT 1", (candidate,)).fetchone()
+            cur = await conn.execute(
+                "SELECT e.id FROM entity e,"
+                " jsonb_array_elements_text(e.aliases) a"
+                " WHERE lower(a.value) = %s LIMIT 1", (candidate,))
+            row = await cur.fetchone()
         if row is not None:
-            return int(row[0])
+            return int(row["id"])
     if entity_id is not None:
-        row = conn.execute("SELECT name FROM entity WHERE id = ?",
-                           (entity_id,)).fetchone()
+        cur = await conn.execute("SELECT name FROM entity WHERE id = %s",
+                                 (entity_id,))
+        row = await cur.fetchone()
         if row is not None:
-            existing = row[0].strip().lower()
+            existing = row["name"].strip().lower()
             if existing and (existing in norm
                              or (base and base in existing)):
                 return int(entity_id)
     return None
 
 
-def _ground_output(conn: sqlite3.Connection, dossier_id: int,
-                   pack: ScopePack, output: SynthesisOutput,
-                   menu: list[dict[str, Any]],
-                   stripped: list[str], regenerated: bool,
-                   ) -> tuple[dict[str, Any], dict[str, Any],
-                              dict[str, Any]]:
+async def _ground_output(conn: psycopg.AsyncConnection, dossier_id: int,
+                         pack: ScopePack, output: SynthesisOutput,
+                         menu: list[dict[str, Any]],
+                         stripped: list[str], regenerated: bool,
+                         ) -> tuple[dict[str, Any], dict[str, Any],
+                                    dict[str, Any]]:
     """(causal_narrative, actors, watch_next) section contents after the
     mechanical grounding pass."""
     known = {m["finding_id"] for m in menu}
@@ -283,7 +292,7 @@ def _ground_output(conn: sqlite3.Connection, dossier_id: int,
         finding_ids = [f for f in actor.finding_ids if f in known]
         motive_md = strip_markers(actor.motive_md, stripped)
         actors.append({
-            "entity_id": _resolve_actor_entity(
+            "entity_id": await _resolve_actor_entity(
                 conn, actor.entity_id, actor.name),
             "name": actor.name,
             "role": actor.role, "motive_md": motive_md,
@@ -291,8 +300,9 @@ def _ground_output(conn: sqlite3.Connection, dossier_id: int,
             "speculation": actor.speculation
             or any(f in speculative for f in finding_ids)})
 
-    question_ids = {r[0] for r in conn.execute(
-        "SELECT id FROM question WHERE dossier_id = ?", (dossier_id,))}
+    qcur = await conn.execute(
+        "SELECT id FROM question WHERE dossier_id = %s", (dossier_id,))
+    question_ids = {r["id"] for r in await qcur.fetchall()}
     calendar_ids = {c.calendar_event_id for c in pack.calendar}
     watch_items: list[dict[str, Any]] = []
     dropped_watch = 0
@@ -320,7 +330,7 @@ def _ground_output(conn: sqlite3.Connection, dossier_id: int,
     return causal_narrative, {"actors": actors}, {"items": watch_items}
 
 
-async def run(conn: sqlite3.Connection, provider: LLMProvider, *,
+async def run(conn: psycopg.AsyncConnection, provider: LLMProvider, *,
               dossier_id: int, pack: ScopePack, budget: AnalysisBudget,
               governor: Governor, emit: Callable[..., Any],
               tier_pref: str = "deep", reserve_usd: float = 0.20,
@@ -330,13 +340,14 @@ async def run(conn: sqlite3.Connection, provider: LLMProvider, *,
 
     # code sections first — they exist even if the DEEP call fails
     for stage, content in (
-            ("timeline", timeline_section(conn, pack)),
-            ("alternatives", alternatives_section(conn, dossier_id)),
-            ("open_questions", open_questions_section(conn, dossier_id))):
-        section_writer(dossier_id, stage, content)
-        emit("section_completed", {"section": stage})
+            ("timeline", await timeline_section(conn, pack)),
+            ("alternatives", await alternatives_section(conn, dossier_id)),
+            ("open_questions",
+             await open_questions_section(conn, dossier_id))):
+        await section_writer(dossier_id, stage, content)
+        await emit("section_completed", {"section": stage})
 
-    menu = findings_menu(conn, dossier_id)
+    menu = await findings_menu(conn, dossier_id)
     known = {m["finding_id"] for m in menu}
 
     # tier choice: DEEP unless the run already ate into the synthesis
@@ -354,13 +365,13 @@ async def run(conn: sqlite3.Connection, provider: LLMProvider, *,
     projected = spend.cost_usd(provider.model_for(tier),
                                input_tokens=EST_SYN_IN,
                                output_tokens=EST_SYN_OUT)
-    user = _synthesis_user(conn, dossier_id, pack, menu)
+    user = await _synthesis_user(conn, dossier_id, pack, menu)
 
     output: SynthesisOutput | None = None
     stripped: list[str] = []
     regenerated = False
     try:
-        governor.check(projected)
+        await governor.check(projected)
         output = await _call(conn, provider, budget, user, tier)
         bad = check_citations(output.narrative_md, known)
         for actor in output.actors:
@@ -373,7 +384,7 @@ async def run(conn: sqlite3.Connection, provider: LLMProvider, *,
                 f" finding ids: {', '.join(bad)}. Cite ONLY ids on the"
                 " findings menu.")
             try:
-                governor.check(projected)
+                await governor.check(projected)
                 retry = await _call(conn, provider, budget, retry_user,
                                     tier)
                 retry_bad = check_citations(retry.narrative_md, known)
@@ -391,32 +402,33 @@ async def run(conn: sqlite3.Connection, provider: LLMProvider, *,
     except (BudgetExceeded, AnalysisBudgetExceeded) as e:
         log.warning("synthesis skipped (budget): %s", e)
         for stage in ("causal_narrative", "actors", "watch_next"):
-            section_writer(dossier_id, stage,
-                           {"skipped": f"budget: {e}"}, status="skipped")
+            await section_writer(dossier_id, stage,
+                                 {"skipped": f"budget: {e}"},
+                                 status="skipped")
         return "synthesis skipped (budget); code sections persisted"
 
-    causal_narrative, actors, watch_next = _ground_output(
+    causal_narrative, actors, watch_next = await _ground_output(
         conn, dossier_id, pack, output, menu, stripped, regenerated)
     for stage, content in (("causal_narrative", causal_narrative),
                            ("actors", actors),
                            ("watch_next", watch_next)):
-        section_writer(dossier_id, stage, content)
-        emit("section_completed", {"section": stage})
+        await section_writer(dossier_id, stage, content)
+        await emit("section_completed", {"section": stage})
 
     notes.insert(0, f"{len(menu)} findings synthesized on"
                     f" {tier.value} tier")
     return "; ".join(notes)
 
 
-async def _call(conn: sqlite3.Connection, provider: LLMProvider,
+async def _call(conn: psycopg.AsyncConnection, provider: LLMProvider,
                 budget: AnalysisBudget, user: str,
                 tier: ModelTier) -> SynthesisOutput:
     completion = await provider.complete_structured(
         system=SYNTHESIS_SYSTEM,
         messages=[{"role": "user", "content": user}],
         schema=SynthesisOutput, tier=tier, max_tokens=SYN_MAX_TOKENS)
-    spend.record_call(conn, purpose=PURPOSE_INVESTIGATION_SYNTHESIS,
-                      model=completion.model, usage=completion.usage)
+    await spend.record_call(conn, purpose=PURPOSE_INVESTIGATION_SYNTHESIS,
+                            model=completion.model, usage=completion.usage)
     budget.add(spend.cost_usd(
         completion.model,
         input_tokens=completion.usage.input_tokens,

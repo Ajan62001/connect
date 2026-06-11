@@ -11,6 +11,7 @@ import re
 import time
 
 import pytest
+from dbutil import q1, qv, qvals
 from fastapi.testclient import TestClient
 from kb_factories import insert_doc
 from mock_llm import MockProvider, tool_turn
@@ -37,15 +38,15 @@ def env(settings):
         yield client, app.state.container
 
 
-def wait_for_dossier(conn, dossier_id, timeout=10.0):
+async def wait_for_dossier(conn, dossier_id, timeout=10.0):
     deadline = time.monotonic() + timeout
     row = None
     while time.monotonic() < deadline:
-        row = conn.execute("SELECT status, error FROM dossier WHERE id=?",
-                           (dossier_id,)).fetchone()
+        row = await q1(conn, "SELECT status, error FROM dossier"
+                             " WHERE id=%s", dossier_id)
         if row and row["status"] in ("completed", "failed", "cancelled"):
             return row
-        time.sleep(0.02)
+        await asyncio.sleep(0.02)
     raise AssertionError(
         f"dossier {dossier_id} did not finish: {dict(row) if row else None}")
 
@@ -91,15 +92,15 @@ def make_provider(doc_id: int) -> MockProvider:
     return provider
 
 
-def run_investigation(client, container) -> tuple[int, int]:
-    doc_id = insert_doc(container.db, title="RBI tightens rules",
-                        text=DOC_TEXT)
+async def run_investigation(client, container, db) -> tuple[int, int]:
+    doc_id = await insert_doc(db, title="RBI tightens rules",
+                              text=DOC_TEXT)
     container.investigations.provider = make_provider(doc_id)
     res = client.post("/api/investigations",
                       json={"topic": "rbi payment rules"})
     assert res.status_code == 202
     body = res.json()
-    wait_for_dossier(container.db, body["investigation_id"])
+    await wait_for_dossier(db, body["investigation_id"])
     return body["investigation_id"], body["job_id"]
 
 
@@ -137,14 +138,14 @@ def test_keyless_503(env):
     assert res.status_code == 503
 
 
-def test_governor_429(env):
+async def test_governor_429(env, db):
     client, container = env
     container.investigations.provider = MockProvider()
     from connect.llm import spend
     # exhaust today's investigation envelope (~$10.2 on sonnet input)
-    spend.record_call(container.db, purpose="investigation",
-                      model="claude-sonnet-4-6",
-                      usage=Usage(input_tokens=3_400_000))
+    await spend.record_call(db, purpose="investigation",
+                            model="claude-sonnet-4-6",
+                            usage=Usage(input_tokens=3_400_000))
     res = client.post("/api/investigations", json={"topic": "x"})
     assert res.status_code == 429
     # the GENERAL surface is not gated by investigation spend: an analysis
@@ -157,10 +158,11 @@ def test_governor_429(env):
 # --- happy path: detail snapshot + list counts ---------------------------------------
 
 
-def test_investigation_happy_path(env):
+async def test_investigation_happy_path(env, db):
     client, container = env
-    investigation_id, _job_id = run_investigation(client, container)
-    conn = container.db
+    investigation_id, _job_id = await run_investigation(client, container,
+                                                        db)
+    conn = db
 
     detail = client.get(f"/api/investigations/{investigation_id}").json()
     assert detail["status"] == "completed"
@@ -203,8 +205,8 @@ def test_investigation_happy_path(env):
                                 "questions_answered": 1, "docs_added": 0}
 
     # ledger: loop spend under 'investigation', synthesis under its own
-    purposes = {r[0] for r in conn.execute(
-        "SELECT DISTINCT purpose FROM llm_call")}
+    purposes = set(await qvals(conn,
+                               "SELECT DISTINCT purpose FROM llm_call"))
     assert {"investigation", "investigation_synthesis"} <= purposes
 
     # list endpoint carries counts
@@ -222,11 +224,12 @@ def test_investigation_happy_path(env):
         f"/api/analyses/{investigation_id}").status_code == 404
 
 
-def test_web_investigation_source_seeded(env):
+async def test_web_investigation_source_seeded(env, db):
     _client, container = env
-    row = container.db.execute(
+    row = await q1(
+        db,
         "SELECT type, credibility_tier, enabled FROM source"
-        " WHERE name = 'Web (investigation)'").fetchone()
+        " WHERE name = 'Web (investigation)'")
     assert row is not None
     assert (row["type"], row["credibility_tier"]) == ("search", 4)
 
@@ -248,9 +251,10 @@ def parse_sse(text: str) -> list[tuple[int, str, dict]]:
     return events
 
 
-def test_sse_replay_ordering_and_resume(env):
+async def test_sse_replay_ordering_and_resume(env, db):
     client, container = env
-    investigation_id, _job_id = run_investigation(client, container)
+    investigation_id, _job_id = await run_investigation(client, container,
+                                                        db)
 
     with client.stream(
             "GET",
@@ -301,7 +305,7 @@ class HangingToolsProvider(MockProvider):
         return await super().complete_with_tools(**kwargs)
 
 
-def test_cancel_running_investigation(env):
+async def test_cancel_running_investigation(env, db):
     client, container = env
     container.investigations.provider = HangingToolsProvider(
         respond_by_schema={GeneratedQuestions: GeneratedQuestions(),
@@ -310,21 +314,21 @@ def test_cancel_running_investigation(env):
     res = client.post("/api/investigations", json={"topic": "hang"})
     assert res.status_code == 202
     investigation_id = res.json()["investigation_id"]
-    conn = container.db
+    conn = db
 
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        row = conn.execute("SELECT status FROM dossier WHERE id=?",
-                           (investigation_id,)).fetchone()
+        row = await q1(conn, "SELECT status FROM dossier WHERE id=%s",
+                       investigation_id)
         if row["status"] == "running":
             break
-        time.sleep(0.02)
+        await asyncio.sleep(0.02)
     assert row["status"] == "running"
 
     assert client.post(
         f"/api/investigations/{investigation_id}/cancel"
     ).status_code == 202
-    row = wait_for_dossier(conn, investigation_id)
+    row = await wait_for_dossier(conn, investigation_id)
     assert row["status"] == "cancelled"
     with client.stream(
             "GET",
@@ -341,31 +345,29 @@ def test_cancel_running_investigation(env):
 # --- manual recursion ----------------------------------------------------------------------
 
 
-def test_question_investigate_recursion(env):
+async def test_question_investigate_recursion(env, db):
     client, container = env
-    parent_id, _job_id = run_investigation(client, container)
-    conn = container.db
-    question_id = conn.execute(
-        "SELECT id FROM question WHERE dossier_id = ?",
-        (parent_id,)).fetchone()[0]
+    parent_id, _job_id = await run_investigation(client, container, db)
+    conn = db
+    question_id = await qv(
+        conn, "SELECT id FROM question WHERE dossier_id = %s", parent_id)
 
     res = client.post(f"/api/questions/{question_id}/investigate")
     assert res.status_code == 202
     child_id = res.json()["investigation_id"]
     assert child_id != parent_id
-    wait_for_dossier(conn, child_id)
+    await wait_for_dossier(conn, child_id)
 
     # lineage on both sides: dossier.parent_question_id and
     # question.spawned_dossier_id
-    child = conn.execute("SELECT * FROM dossier WHERE id = ?",
-                         (child_id,)).fetchone()
+    child = await q1(conn, "SELECT * FROM dossier WHERE id = %s",
+                     child_id)
     assert child["kind"] == "investigation"
     assert child["parent_question_id"] == question_id
     assert child["input_type"] == "topic"
     assert child["input_text"] == "What triggered the tightening?"
-    q = conn.execute("SELECT spawned_dossier_id FROM question"
-                     " WHERE id = ?", (question_id,)).fetchone()
-    assert q["spawned_dossier_id"] == child_id
+    assert await qv(conn, "SELECT spawned_dossier_id FROM question"
+                          " WHERE id = %s", question_id) == child_id
 
     # the open_questions section of the parent exposes the spawn
     detail = client.get(f"/api/investigations/{parent_id}").json()

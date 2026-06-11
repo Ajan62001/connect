@@ -150,10 +150,25 @@ PositionShiftKind = Literal["shifted", "reversed"]
 POSITION_SHIFT_STATUSES = ("open", "dismissed")
 PositionShiftStatus = Literal["open", "dismissed"]
 
+# --- tenancy (v0.2: tables ship in the PG baseline schema; auth/tenancy CODE
+# is the next workstream — design v02-tenancy-auth.md §2) ---------------------
+
+VISIBILITIES = ("private", "shared")
+Visibility = Literal["private", "shared"]
+
+ROLES = ("admin", "member")
+Role = Literal["admin", "member"]
+
+DOCUMENT_ORIGINS = ("polled", "link_follow", "investigation_fetch",
+                    "user_url", "user_upload", "user_text")
+DocumentOrigin = Literal["polled", "link_follow", "investigation_fetch",
+                         "user_url", "user_upload", "user_text"]
+
 # --- vector backends (health reporting) -------------------------------------
 
-VECTOR_BACKENDS = ("sqlite-vec", "bruteforce", "disabled")
-VectorBackend = Literal["sqlite-vec", "bruteforce", "disabled"]
+# v0.2: pgvector replaces sqlite-vec/bruteforce (storage is Postgres).
+VECTOR_BACKENDS = ("pgvector", "disabled")
+VectorBackend = Literal["pgvector", "disabled"]
 
 
 def sql_in(values: tuple) -> str:

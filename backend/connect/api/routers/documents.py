@@ -5,7 +5,9 @@ import json
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from connect.api.deps import get_container
+import psycopg
+
+from connect.api.deps import get_container, get_db
 from connect.domain.models import (
     Document,
     DocumentPage,
@@ -36,7 +38,8 @@ def _ingest_response(result: IngestResult) -> JSONResponse:
 
 @router.post("", response_model=Document, status_code=201)
 async def ingest_document(request: Request,
-                          container: Container = Depends(get_container)):
+                          container: Container = Depends(get_container),
+                          db: psycopg.AsyncConnection = Depends(get_db)):
     """Three request forms: multipart file upload (field 'file');
     JSON {url}; JSON {text, title?}."""
     pipeline = container.pipeline
@@ -52,7 +55,7 @@ async def ingest_document(request: Request,
                                     detail="multipart field 'file' is required")
             data = await upload.read()
             result = await pipeline.ingest_file(
-                upload.filename or "upload", data, upload.content_type)
+                db, upload.filename or "upload", data, upload.content_type)
             return _ingest_response(result)
 
         try:
@@ -63,11 +66,11 @@ async def ingest_document(request: Request,
             raise HTTPException(status_code=422, detail="JSON object expected")
 
         if body.get("url"):
-            result = await pipeline.ingest_url(str(body["url"]))
+            result = await pipeline.ingest_url(db, str(body["url"]))
             return _ingest_response(result)
         if body.get("text"):
-            result = pipeline.ingest_text(
-                str(body["text"]), title=body.get("title"))
+            result = await pipeline.ingest_text(
+                db, str(body["text"]), title=body.get("title"))
             return _ingest_response(result)
         raise HTTPException(
             status_code=422,
@@ -86,48 +89,44 @@ async def list_documents(q: str | None = Query(default=None),
                          page: int = Query(default=1, ge=1),
                          page_size: int = Query(default=20, ge=1,
                                                 le=MAX_PAGE_SIZE),
-                         container: Container = Depends(get_container)):
+                         db: psycopg.AsyncConnection = Depends(get_db)):
     if q:
-        items, total = fts_dao.search_documents(
-            container.db, q, page=page, page_size=page_size,
+        items, total = await fts_dao.search_documents(
+            db, q, page=page, page_size=page_size,
             source_id=source_id)
     else:
-        items, total = doc_dao.list_page(
-            container.db, page=page, page_size=page_size, source_id=source_id)
+        items, total = await doc_dao.list_page(
+            db, page=page, page_size=page_size, source_id=source_id)
     return DocumentPage(items=items, total=total, page=page,
                         page_size=page_size)
 
 
 @router.get("/{doc_id}", response_model=Document)
 async def get_document(doc_id: int,
-                       container: Container = Depends(get_container)):
-    document = doc_dao.get(container.db, doc_id)
+                       db: psycopg.AsyncConnection = Depends(get_db)):
+    document = await doc_dao.get(db, doc_id)
     if document is None:
         raise HTTPException(status_code=404, detail="document not found")
     return document.model_copy(update={
-        "links": link_dao.list_for_document(container.db, doc_id),
-        "linked_from": link_dao.linked_from(container.db, doc_id),
-        "enrichment": enrichment_dao.get_for_document(container.db, doc_id),
-        "event": event_dao.event_for_document(container.db, doc_id),
-        "statements": statement_dao.statements_for_document(
-            container.db, doc_id),
+        "links": await link_dao.list_for_document(db, doc_id),
+        "linked_from": await link_dao.linked_from(db, doc_id),
+        "enrichment": await enrichment_dao.get_for_document(db, doc_id),
+        "event": await event_dao.event_for_document(db, doc_id),
+        "statements": await statement_dao.statements_for_document(
+            db, doc_id),
     })
 
 
 @router.post("/{doc_id}/promote", response_model=JobAccepted,
              status_code=202)
 async def promote_document(doc_id: int,
-                           container: Container = Depends(get_container)):
+                           container: Container = Depends(get_container),
+                           db: psycopg.AsyncConnection = Depends(get_db)):
     """Queue a manual T2 promotion (event clustering + story threading;
     runs T1 first when the document hasn't been enriched yet)."""
-    service = container.enrichment
     jobs = container.jobs
-    assert service is not None and jobs is not None
-    if doc_dao.get(container.db, doc_id) is None:
+    assert container.enrichment is not None and jobs is not None
+    if await doc_dao.get(db, doc_id) is None:
         raise HTTPException(status_code=404, detail="document not found")
-
-    async def _run():
-        return await service.promote_document(doc_id)
-
-    job_id = jobs.submit("enrich_t2", {"document_id": doc_id}, _run)
+    job_id = await jobs.enqueue("enrich_t2", {"document_id": doc_id})
     return JobAccepted(job_id=job_id)

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import sqlite3
-from typing import Any
+from typing import Any, Mapping
+
+import psycopg
 
 from connect.domain.models import Document, DocumentListItem
 
@@ -20,7 +21,8 @@ d.author, d.language, d.content_text, d.content_hash
 _FROM = " FROM document d LEFT JOIN source s ON s.id = d.source_id "
 
 
-def _to_list_item(row: sqlite3.Row, snippet: str | None = None) -> DocumentListItem:
+def _to_list_item(row: Mapping[str, Any],
+                  snippet: str | None = None) -> DocumentListItem:
     return DocumentListItem(
         id=row["id"],
         source_id=row["source_id"],
@@ -38,7 +40,7 @@ def _to_list_item(row: sqlite3.Row, snippet: str | None = None) -> DocumentListI
     )
 
 
-def _to_document(row: sqlite3.Row) -> Document:
+def _to_document(row: Mapping[str, Any]) -> Document:
     base = _to_list_item(row).model_dump()
     base.update(
         author=row["author"],
@@ -49,83 +51,99 @@ def _to_document(row: sqlite3.Row) -> Document:
     return Document(**base)
 
 
-def insert(conn: sqlite3.Connection, fields: dict[str, Any]) -> int:
+async def insert(conn: psycopg.AsyncConnection,
+                 fields: dict[str, Any]) -> int:
     """Insert a document row; caller supplies the already-normalized fields.
-    The FTS external-content triggers index it automatically."""
+    The generated search_tsv column indexes it automatically."""
     cols = ", ".join(fields)
-    marks = ", ".join("?" for _ in fields)
-    with conn:
-        cur = conn.execute(
-            f"INSERT INTO document ({cols}) VALUES ({marks})",
+    marks = ", ".join(["%s"] * len(fields))
+    async with conn.transaction():
+        cur = await conn.execute(
+            f"INSERT INTO document ({cols}) VALUES ({marks}) RETURNING id",
             tuple(fields.values()))
-    return int(cur.lastrowid)  # type: ignore[arg-type]
+        row = await cur.fetchone()
+    return int(row["id"])
 
 
-def get(conn: sqlite3.Connection, doc_id: int) -> Document | None:
-    row = conn.execute(
-        "SELECT " + _FULL_COLS + _FROM + " WHERE d.id = ?", (doc_id,)).fetchone()
+async def get(conn: psycopg.AsyncConnection,
+              doc_id: int) -> Document | None:
+    cur = await conn.execute(
+        "SELECT " + _FULL_COLS + _FROM + " WHERE d.id = %s", (doc_id,))
+    row = await cur.fetchone()
     return _to_document(row) if row else None
 
 
-def get_by_hash(conn: sqlite3.Connection, content_hash: str) -> Document | None:
-    row = conn.execute(
-        "SELECT " + _FULL_COLS + _FROM + " WHERE d.content_hash = ?",
-        (content_hash,)).fetchone()
+async def get_by_hash(conn: psycopg.AsyncConnection,
+                      content_hash: str) -> Document | None:
+    cur = await conn.execute(
+        "SELECT " + _FULL_COLS + _FROM + " WHERE d.content_hash = %s",
+        (content_hash,))
+    row = await cur.fetchone()
     return _to_document(row) if row else None
 
 
-def get_by_url(conn: sqlite3.Connection, url: str) -> Document | None:
+async def get_by_url(conn: psycopg.AsyncConnection,
+                     url: str) -> Document | None:
     """Exact match on either the requested or the post-redirect URL."""
-    row = conn.execute(
+    cur = await conn.execute(
         "SELECT " + _FULL_COLS + _FROM +
-        " WHERE d.url = ? OR d.canonical_url = ? LIMIT 1",
-        (url, url)).fetchone()
+        " WHERE d.url = %s OR d.canonical_url = %s LIMIT 1",
+        (url, url))
+    row = await cur.fetchone()
     return _to_document(row) if row else None
 
 
-def url_exists(conn: sqlite3.Connection, url: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM document WHERE url = ? LIMIT 1", (url,)).fetchone()
-    return row is not None
+async def url_exists(conn: psycopg.AsyncConnection, url: str) -> bool:
+    cur = await conn.execute(
+        "SELECT 1 FROM document WHERE url = %s LIMIT 1", (url,))
+    return await cur.fetchone() is not None
 
 
-def set_blob_path(conn: sqlite3.Connection, doc_id: int, path: str) -> None:
-    with conn:
-        conn.execute(
-            "UPDATE document SET raw_blob_path = ? WHERE id = ?", (path, doc_id))
+async def set_blob_path(conn: psycopg.AsyncConnection, doc_id: int,
+                        path: str) -> None:
+    async with conn.transaction():
+        await conn.execute(
+            "UPDATE document SET raw_blob_path = %s WHERE id = %s",
+            (path, doc_id))
 
 
-def set_watch_hit(conn: sqlite3.Connection, doc_id: int) -> None:
-    with conn:
-        conn.execute("UPDATE document SET watch_hit = 1 WHERE id = ?", (doc_id,))
+async def set_watch_hit(conn: psycopg.AsyncConnection, doc_id: int) -> None:
+    async with conn.transaction():
+        await conn.execute(
+            "UPDATE document SET watch_hit = TRUE WHERE id = %s", (doc_id,))
 
 
-def recent_simhashes(conn: sqlite3.Connection,
-                     since_iso: str) -> list[tuple[int, int, int | None]]:
+async def recent_simhashes(
+        conn: psycopg.AsyncConnection,
+        since_iso: str) -> list[tuple[int, int, int | None]]:
     """(id, simhash, canonical_document_id) for the near-dup window scan."""
-    rows = conn.execute(
+    cur = await conn.execute(
         "SELECT id, simhash, canonical_document_id FROM document"
-        " WHERE simhash IS NOT NULL AND fetched_at >= ?", (since_iso,)).fetchall()
-    return [(r[0], r[1], r[2]) for r in rows]
+        " WHERE simhash IS NOT NULL AND fetched_at >= %s", (since_iso,))
+    rows = await cur.fetchall()
+    return [(r["id"], r["simhash"], r["canonical_document_id"])
+            for r in rows]
 
 
-def list_page(conn: sqlite3.Connection, *, page: int, page_size: int,
-              source_id: int | None = None,
-              enrichment_status: str | None = None,
-              ) -> tuple[list[DocumentListItem], int]:
+async def list_page(conn: psycopg.AsyncConnection, *, page: int,
+                    page_size: int, source_id: int | None = None,
+                    enrichment_status: str | None = None,
+                    ) -> tuple[list[DocumentListItem], int]:
     """Newest-first listing (the /feed and unfiltered /documents view)."""
     where, params = [], []
     if source_id is not None:
-        where.append("d.source_id = ?")
+        where.append("d.source_id = %s")
         params.append(source_id)
     if enrichment_status is not None:
-        where.append("d.enrichment_status = ?")
+        where.append("d.enrichment_status = %s")
         params.append(enrichment_status)
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
-    total = conn.execute(
-        "SELECT COUNT(*)" + _FROM + where_sql, params).fetchone()[0]
-    rows = conn.execute(
+    cur = await conn.execute(
+        "SELECT COUNT(*) AS n" + _FROM + where_sql, params)
+    total = (await cur.fetchone())["n"]
+    cur = await conn.execute(
         "SELECT " + _LIST_COLS + _FROM + where_sql +
-        " ORDER BY d.fetched_at DESC, d.id DESC LIMIT ? OFFSET ?",
-        (*params, page_size, (page - 1) * page_size)).fetchall()
+        " ORDER BY d.fetched_at DESC, d.id DESC LIMIT %s OFFSET %s",
+        (*params, page_size, (page - 1) * page_size))
+    rows = await cur.fetchall()
     return [_to_list_item(r) for r in rows], int(total)

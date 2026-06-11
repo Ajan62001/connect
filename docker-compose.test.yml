@@ -1,0 +1,36 @@
+# Test-only Postgres for the v0.2 PG port (design: v02-postgres-port.md §6).
+#
+# Explicit dev step (like installing deps):
+#     docker compose -f docker-compose.test.yml up -d db-test
+# pytest itself stays no-network; Postgres on loopback is blessed local infra.
+# Tests skip with a loud message when CONNECT_TEST_DATABASE_URL is unreachable.
+#
+# - pgvector/pgvector:pg17 ships the vector extension AND contrib (pg_trgm);
+#   schema v1 runs CREATE EXTENSION IF NOT EXISTS for both.
+# - tmpfs data dir + fsync off: throwaway speed, nothing survives `down`.
+# - High port 55432 on loopback only — 5432 is occupied by an unrelated
+#   local Postgres and must never be bound here.
+services:
+  db-test:
+    image: pgvector/pgvector:pg17
+    command:
+      - postgres
+      - -c
+      - fsync=off
+      - -c
+      - full_page_writes=off
+      - -c
+      - synchronous_commit=off
+    environment:
+      POSTGRES_DB: connect_test
+      POSTGRES_USER: connect
+      POSTGRES_PASSWORD: connect
+    tmpfs:
+      - /var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U connect -d connect_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

@@ -16,7 +16,8 @@ from connect.knowledge.calendar import CALENDAR_SEED, seed_calendar_events
 from connect.knowledge.enrichment.t1 import EnrichmentT1, T1Entity
 from connect.knowledge.linking import event_clusterer as ec
 from connect.llm.spend import Governor
-from connect.storage.db import utc_now
+from connect.storage.pg import utc_now
+from dbutil import q1, qv
 
 
 @pytest.fixture()
@@ -26,30 +27,33 @@ def env(settings):
         yield client, app.state.container
 
 
-def wait_for_job(conn, job_id, timeout=5.0):
+async def wait_for_job(conn, job_id, timeout=5.0):
+    import asyncio
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        row = conn.execute("SELECT status, error FROM job WHERE id=?",
-                           (job_id,)).fetchone()
+        row = await q1(conn, "SELECT status, error FROM job WHERE id=%s",
+                       job_id)
         if row and row["status"] in ("done", "failed", "cancelled"):
             return row
-        time.sleep(0.02)
+        await asyncio.sleep(0.02)
     raise AssertionError(f"job {job_id} did not finish")
 
 
-async def cluster_one(conn, **kwargs) -> int:
-    doc = t1_doc(conn, **kwargs)
-    result = await ec.assign_document(conn, None, Governor(conn, 2.0), doc)
+async def cluster_one(container, conn, **kwargs) -> int:
+    doc = await t1_doc(conn, **kwargs)
+    result = await ec.assign_document(conn, None,
+                                      Governor(container.pool, 2.0), doc)
     return result.event_id, doc
 
 
 # --- events / threads --------------------------------------------------------------
 
-async def test_event_detail_endpoint(env):
+async def test_event_detail_endpoint(env, db):
     client, container = env
-    conn = container.db
+    conn = db
     event_id, doc = await cluster_one(
-        conn, title="RBI hikes rates", summary="RBI raised the repo rate.",
+        container, conn, title="RBI hikes rates",
+        summary="RBI raised the repo rate.",
         event_type="rbi_action", entities=("RBI", "Repo Rate"))
     res = client.get(f"/api/events/{event_id}")
     assert res.status_code == 200
@@ -65,19 +69,19 @@ async def test_event_detail_endpoint(env):
     assert client.get("/api/events/9999").status_code == 404
 
 
-async def test_thread_detail_endpoint(env):
+async def test_thread_detail_endpoint(env, db):
     client, container = env
-    conn = container.db
-    a, _ = await cluster_one(conn, title="Bill introduced",
+    conn = db
+    a, _ = await cluster_one(container, conn, title="Bill introduced",
                              event_type="bill_stage",
                              entities=("Bill X", "MeitY"),
                              published_at="2026-06-01T00:00:00Z")
-    b, _ = await cluster_one(conn, title="Different matter",
+    b, _ = await cluster_one(container, conn, title="Different matter",
                              event_type="court_ruling",
                              entities=("Supreme Court",),
                              published_at="2026-06-09T00:00:00Z")
     from connect.knowledge.linking import story_threader as st
-    story_id = st.merge_into_story(conn, b, a)
+    story_id = await st.merge_into_story(conn, b, a)
 
     res = client.get(f"/api/threads/{story_id}")
     assert res.status_code == 200
@@ -107,12 +111,12 @@ def test_cursor_validation(env):
                        ).status_code == 204
 
 
-async def test_entity_delta_math(env):
+async def test_entity_delta_math(env, db):
     client, container = env
-    conn = container.db
-    doc1 = t1_doc(conn, title="Doc 1", entities=("SEBI", "Adani Group"))
-    entity_id = conn.execute("SELECT id FROM entity WHERE name='SEBI'"
-                             ).fetchone()[0]
+    conn = db
+    doc1 = await t1_doc(conn, title="Doc 1",
+                        entities=("SEBI", "Adani Group"))
+    entity_id = await qv(conn, "SELECT id FROM entity WHERE name='SEBI'")
 
     # no cursor yet -> delta is null
     body = client.get(f"/api/entities/{entity_id}").json()
@@ -124,19 +128,19 @@ async def test_entity_delta_math(env):
     assert body["delta"] == {"events": 0, "documents": 0, "claims": 0}
 
     # backdate the cursor, then land new knowledge
-    with conn:
-        conn.execute("UPDATE view_cursor SET last_seen_at="
-                     " '2026-01-01T00:00:00.000Z' WHERE surface='entity'")
-    doc2 = t1_doc(conn, title="Doc 2", entities=("SEBI",))
-    await ec.assign_document(conn, None, Governor(conn, 2.0), doc2)
-    with conn:
-        cur = conn.execute(
-            "INSERT INTO claim (text, first_document_id, created_at)"
-            " VALUES ('c', ?, ?)", (doc2, utc_now()))
-        conn.execute(
-            "INSERT INTO claim_sighting (claim_id, document_id, stance,"
-            " created_at) VALUES (?, ?, 'asserts', ?)",
-            (cur.lastrowid, doc2, utc_now()))
+    await conn.execute("UPDATE view_cursor SET last_seen_at="
+                       " '2026-01-01T00:00:00.000Z' WHERE surface='entity'")
+    doc2 = await t1_doc(conn, title="Doc 2", entities=("SEBI",))
+    await ec.assign_document(conn, None, Governor(container.pool, 2.0),
+                             doc2)
+    cur = await conn.execute(
+        "INSERT INTO claim (text, first_document_id, created_at)"
+        " VALUES ('c', %s, %s) RETURNING id", (doc2, utc_now()))
+    claim_id = (await cur.fetchone())["id"]
+    await conn.execute(
+        "INSERT INTO claim_sighting (claim_id, document_id, stance,"
+        " created_at) VALUES (%s, %s, 'asserts', %s)",
+        (claim_id, doc2, utc_now()))
 
     body = client.get(f"/api/entities/{entity_id}").json()
     # doc1 + doc2 mentions are both newer than the backdated cursor
@@ -148,30 +152,28 @@ async def test_entity_delta_math(env):
 
 # --- calendar ---------------------------------------------------------------------------
 
-def test_calendar_seed_idempotent_and_window(env):
+async def test_calendar_seed_idempotent_and_window(env, db):
     client, container = env
-    conn = container.db
-    count = conn.execute("SELECT COUNT(*) FROM calendar_event").fetchone()[0]
+    conn = db
+    count = await qv(conn, "SELECT COUNT(*) FROM calendar_event")
     assert count == len(CALENDAR_SEED)
-    assert seed_calendar_events(conn) == 0  # second pass adds nothing
-    assert conn.execute("SELECT COUNT(*) FROM calendar_event"
-                        ).fetchone()[0] == count
+    assert await seed_calendar_events(conn) == 0  # second pass adds nothing
+    assert await qv(conn, "SELECT COUNT(*) FROM calendar_event") == count
 
     # synthetic rows pin the window behavior regardless of today's date
-    with conn:
-        conn.execute("INSERT INTO calendar_event (kind, scope, occurs_on,"
-                     " label) SELECT 'other', 'national',"
-                     " date('now', '+10 days'), 'in-window'")
-        conn.execute("INSERT INTO calendar_event (kind, scope, occurs_on,"
-                     " label) SELECT 'other', 'national',"
-                     " date('now', '+200 days'), 'out-of-window'")
-        conn.execute("INSERT INTO calendar_event (kind, scope, occurs_on,"
-                     " ends_on, label) SELECT 'other', 'national',"
-                     " date('now', '-5 days'), date('now', '+2 days'),"
-                     " 'in-progress'")
-        conn.execute("INSERT INTO calendar_event (kind, scope, occurs_on,"
-                     " label) SELECT 'other', 'national',"
-                     " date('now', '-30 days'), 'long-past'")
+    await conn.execute(
+        "INSERT INTO calendar_event (kind, scope, occurs_on, label)"
+        " SELECT 'other', 'national', current_date + 10, 'in-window'")
+    await conn.execute(
+        "INSERT INTO calendar_event (kind, scope, occurs_on, label)"
+        " SELECT 'other', 'national', current_date + 200, 'out-of-window'")
+    await conn.execute(
+        "INSERT INTO calendar_event (kind, scope, occurs_on, ends_on,"
+        " label) SELECT 'other', 'national', current_date - 5,"
+        " current_date + 2, 'in-progress'")
+    await conn.execute(
+        "INSERT INTO calendar_event (kind, scope, occurs_on, label)"
+        " SELECT 'other', 'national', current_date - 30, 'long-past'")
 
     labels = [e["label"] for e in client.get("/api/calendar?days=120").json()]
     assert "in-window" in labels
@@ -195,43 +197,44 @@ def t1_response(user_text: str) -> EnrichmentT1:
         claims=[])
 
 
-def test_promote_endpoint_runs_t1_then_t2(env):
+async def test_promote_endpoint_runs_t1_then_t2(env, db):
     client, container = env
-    conn = container.db
+    conn = db
     container.enrichment.provider = MockProvider(respond=t1_response)
-    doc = container.pipeline.ingest_text(
+    doc = (await container.pipeline.ingest_text(
+        db,
         "The GST Council cut rates on insurance premiums. The Finance "
-        "Ministry said the change applies from July.").document
+        "Ministry said the change applies from July.")).document
     assert client.post("/api/documents/9999/promote").status_code == 404
 
     res = client.post(f"/api/documents/{doc.id}/promote")
     assert res.status_code == 202
     job_id = res.json()["job_id"]
-    job = wait_for_job(conn, job_id)
+    job = await wait_for_job(conn, job_id)
     assert job["status"] == "done", job["error"]
-    kind = conn.execute("SELECT kind FROM job WHERE id=?",
-                        (job_id,)).fetchone()[0]
-    assert kind == "enrich_t2"
+    assert await qv(conn, "SELECT kind FROM job WHERE id=%s",
+                    job_id) == "enrich_t2"
 
     # T1 ran, T2 clustered the doc into a new event, tier flipped to 2
-    row = conn.execute("SELECT enrichment_status, enrichment_tier FROM"
-                       " document WHERE id=?", (doc.id,)).fetchone()
+    row = await q1(conn, "SELECT enrichment_status, enrichment_tier FROM"
+                         " document WHERE id=%s", doc.id)
     assert (row["enrichment_status"], row["enrichment_tier"]) == ("done", 2)
-    assignment = conn.execute(
-        "SELECT event_id, method FROM event_assignment WHERE document_id=?",
-        (doc.id,)).fetchone()
+    assignment = await q1(
+        conn,
+        "SELECT event_id, method FROM event_assignment"
+        " WHERE document_id=%s", doc.id)
     assert assignment["method"] == "new"
 
     # document detail now carries the event ref
     detail = client.get(f"/api/documents/{doc.id}").json()
     assert detail["event"] == {
         "id": assignment["event_id"],
-        "title": conn.execute("SELECT title FROM event WHERE id=?",
-                              (assignment["event_id"],)).fetchone()[0]}
+        "title": await qv(conn, "SELECT title FROM event WHERE id=%s",
+                          assignment["event_id"])}
 
     # promoting again is idempotent (already assigned)
     res2 = client.post(f"/api/documents/{doc.id}/promote")
-    job2 = wait_for_job(conn, res2.json()["job_id"])
+    job2 = await wait_for_job(conn, res2.json()["job_id"])
     assert job2["status"] == "done"
-    assert conn.execute("SELECT COUNT(*) FROM event_assignment WHERE"
-                        " document_id=?", (doc.id,)).fetchone()[0] == 1
+    assert await qv(conn, "SELECT COUNT(*) FROM event_assignment WHERE"
+                          " document_id=%s", doc.id) == 1

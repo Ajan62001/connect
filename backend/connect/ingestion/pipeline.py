@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sqlite3
 from dataclasses import replace
-from typing import Callable, Sequence
+from typing import Awaitable, Callable, Sequence
+
+import psycopg
 
 from connect.domain.models import DiscoveredItem, Document, IngestResult
 from connect.ingestion import dedup, link_follow
@@ -43,7 +44,7 @@ from connect.knowledge.embedder import Embedder
 from connect.knowledge.vector import VectorIndex
 from connect.storage import documents as doc_dao
 from connect.storage import links as link_dao
-from connect.storage.db import utc_now
+from connect.storage.pg import utc_now
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ _EMBED_CHARS = 2000  # title + lede is plenty for a 384-dim doc vector
 
 
 class IngestionPipeline:
-    def __init__(self, conn: sqlite3.Connection, *, fetcher: Fetcher,
+    def __init__(self, *, fetcher: Fetcher,
                  blobs: BlobStore, embedder: Embedder, vectors: VectorIndex,
                  embeddings_enabled: bool = True,
                  dedup_window_days: int = 14, simhash_max_hamming: int = 3,
@@ -59,9 +60,9 @@ class IngestionPipeline:
                  link_follow_max_per_doc: int = 5,
                  link_max_per_doc: int = links_mod.MAX_LINKS_PER_DOC,
                  official_domains: Sequence[str] = (),
-                 enrich_fast_path: Callable[[int, int | None, bool], None]
-                 | None = None):
-        self.conn = conn
+                 enrich_fast_path: Callable[
+                     [psycopg.AsyncConnection, int, int | None, bool],
+                     Awaitable[None]] | None = None):
         self.fetcher = fetcher
         self.blobs = blobs
         self.embedder = embedder
@@ -80,7 +81,8 @@ class IngestionPipeline:
 
     # -- entry points -----------------------------------------------------------
 
-    async def ingest_url(self, url: str, source_id: int | None = None,
+    async def ingest_url(self, conn: psycopg.AsyncConnection, url: str,
+                         source_id: int | None = None,
                          title: str | None = None, *,
                          published_at_hint: str | None = None,
                          is_link_follow: bool = False) -> IngestResult:
@@ -113,16 +115,17 @@ class IngestionPipeline:
             extracted = replace(extracted, title=title)
         if published_at_hint:
             extracted = replace(extracted, published_at=published_at_hint)
-        stored = self._store(
-            extracted, raw=result.content, media_type=media_type,
+        stored = await self._store(
+            conn, extracted, raw=result.content, media_type=media_type,
             url=url, canonical_url=result.final_url, source_id=source_id)
         if stored.created and media_type == "html":
             await self._process_links(
-                stored.document, raw=result.content,
+                conn, stored.document, raw=result.content,
                 base_url=result.final_url, is_link_follow=is_link_follow)
         return stored
 
-    async def ingest_file(self, filename: str, data: bytes,
+    async def ingest_file(self, conn: psycopg.AsyncConnection,
+                          filename: str, data: bytes,
                           content_type: str | None = None) -> IngestResult:
         name = filename.lower()
         ctype = (content_type or "").lower()
@@ -148,14 +151,17 @@ class IngestionPipeline:
             extracted = Extracted(
                 text=extracted.text, title=filename, author=extracted.author,
                 published_at=extracted.published_at, language=extracted.language)
-        stored = self._store(extracted, raw=data, media_type=media_type)
+        stored = await self._store(conn, extracted, raw=data,
+                                   media_type=media_type)
         if stored.created and media_type == "html":
             # No base URL for an upload: only absolute links are extractable.
             await self._process_links(
-                stored.document, raw=data, base_url=None, is_link_follow=False)
+                conn, stored.document, raw=data, base_url=None,
+                is_link_follow=False)
         return stored
 
-    async def ingest_prefetched(self, item: DiscoveredItem, *,
+    async def ingest_prefetched(self, conn: psycopg.AsyncConnection,
+                                item: DiscoveredItem, *,
                                 source_id: int | None = None) -> IngestResult:
         """Adapter-supplied full content (tweets, telegram posts): the item
         URL is never fetched — x.com would block it and the payload already
@@ -170,46 +176,50 @@ class IngestionPipeline:
             text=text, title=item.title or None, author=item.author,
             published_at=item.published_at)
         raw = item.raw if item.raw is not None else text.encode("utf-8")
-        stored = self._store(
-            extracted, raw=raw, media_type=item.media_type or "text",
+        stored = await self._store(
+            conn, extracted, raw=raw, media_type=item.media_type or "text",
             url=item.url, canonical_url=item.url, source_id=source_id)
         if stored.created and item.link_urls:
-            await self._process_link_urls(stored.document, item.link_urls)
+            await self._process_link_urls(conn, stored.document,
+                                          item.link_urls)
         return stored
 
-    def ingest_text(self, text: str, title: str | None = None,
-                    source_id: int | None = None) -> IngestResult:
+    async def ingest_text(self, conn: psycopg.AsyncConnection, text: str,
+                          title: str | None = None,
+                          source_id: int | None = None) -> IngestResult:
         cleaned = text.strip()
         if not cleaned:
             raise ExtractionError("empty text")
         if not title:
             title = cleaned.splitlines()[0][:120]
         extracted = Extracted(text=cleaned, title=title)
-        return self._store(
-            extracted, raw=text.encode("utf-8"), media_type="text",
+        return await self._store(
+            conn, extracted, raw=text.encode("utf-8"), media_type="text",
             source_id=source_id)
 
     # -- the one store path -------------------------------------------------------
 
-    def _store(self, extracted: Extracted, *, raw: bytes, media_type: str,
-               url: str | None = None, canonical_url: str | None = None,
-               source_id: int | None = None) -> IngestResult:
+    async def _store(self, conn: psycopg.AsyncConnection,
+                     extracted: Extracted, *, raw: bytes, media_type: str,
+                     url: str | None = None,
+                     canonical_url: str | None = None,
+                     source_id: int | None = None) -> IngestResult:
         normalized = dedup.normalize_text(extracted.text)
         chash = dedup.content_hash(normalized)
 
-        existing = doc_dao.get_by_hash(self.conn, chash)
+        existing = await doc_dao.get_by_hash(conn, chash)
         if existing is not None:
             return IngestResult(document=existing, created=False)
 
         fingerprint = dedup.simhash64(normalized)
-        canonical_id = dedup.find_near_duplicate(
-            self.conn, fingerprint,
+        canonical_id = await dedup.find_near_duplicate(
+            conn, fingerprint,
             window_days=self.dedup_window_days,
             max_hamming=self.simhash_max_hamming)
         status = "skipped_dup" if canonical_id is not None else "pending"
 
         blob_path = self.blobs.put(raw)
-        doc_id = doc_dao.insert(self.conn, {
+        doc_id = await doc_dao.insert(conn, {
             "source_id": source_id,
             "url": url,
             "canonical_url": canonical_url,
@@ -228,10 +238,10 @@ class IngestionPipeline:
         })
 
         # T0 hooks — never fatal to the ingest.
-        self._embed(doc_id, extracted)
+        await self._embed(conn, doc_id, extracted)
         hits: list[int] = []
         try:
-            hits = watch_matcher.match_document(self.conn, doc_id)
+            hits = await watch_matcher.match_document(conn, doc_id)
         except Exception:  # noqa: BLE001
             log.exception("watch matching failed for document %s", doc_id)
 
@@ -239,18 +249,20 @@ class IngestionPipeline:
         # batch — only for docs still 'pending' (near-dups stay T0-only).
         if self.enrich_fast_path is not None and status == "pending":
             try:
-                self.enrich_fast_path(doc_id, source_id, bool(hits))
+                await self.enrich_fast_path(conn, doc_id, source_id,
+                                            bool(hits))
             except Exception:  # noqa: BLE001
                 log.exception("enrich fast path failed for document %s",
                               doc_id)
 
-        document = doc_dao.get(self.conn, doc_id)
+        document = await doc_dao.get(conn, doc_id)
         assert document is not None
         return IngestResult(document=document, created=True)
 
     # -- Phase 0.5: links -----------------------------------------------------
 
-    async def _process_links(self, document: Document, *, raw: bytes,
+    async def _process_links(self, conn: psycopg.AsyncConnection,
+                             document: Document, *, raw: bytes,
                              base_url: str | None,
                              is_link_follow: bool) -> None:
         """Extract+store in-content links, then (depth 0 only) auto-follow.
@@ -264,7 +276,7 @@ class IngestionPipeline:
                 self_urls=(document.url, base_url),
                 official_domains=self.official_domains,
                 max_links=self.link_max_per_doc)
-            link_dao.insert_links(self.conn, document.id, kept)
+            await link_dao.insert_links(conn, document.id, kept)
         except Exception:  # noqa: BLE001 — link extraction is best-effort
             log.exception("link extraction failed for document %s", document.id)
             return
@@ -272,13 +284,14 @@ class IngestionPipeline:
             return
         try:
             await link_follow.auto_follow(
-                self.conn, self, parent_id=document.id,
+                conn, self, parent_id=document.id,
                 parent_url=base_url or document.url,
                 max_per_doc=self.link_follow_max_per_doc)
         except Exception:  # noqa: BLE001 — follow failures stay on link rows
             log.exception("link auto-follow failed for document %s", document.id)
 
-    async def _process_link_urls(self, document: Document,
+    async def _process_link_urls(self, conn: psycopg.AsyncConnection,
+                                 document: Document,
                                  urls: Sequence[str]) -> None:
         """document_link rows from adapter-supplied URL lists + auto-follow
         (the prefetched twin of _process_links). Never fatal."""
@@ -287,7 +300,7 @@ class IngestionPipeline:
                 urls, self_urls=(document.url,),
                 official_domains=self.official_domains,
                 max_links=self.link_max_per_doc)
-            link_dao.insert_links(self.conn, document.id, kept)
+            await link_dao.insert_links(conn, document.id, kept)
         except Exception:  # noqa: BLE001 — link storage is best-effort
             log.exception("link storage failed for document %s", document.id)
             return
@@ -295,19 +308,21 @@ class IngestionPipeline:
             return
         try:
             await link_follow.auto_follow(
-                self.conn, self, parent_id=document.id,
+                conn, self, parent_id=document.id,
                 parent_url=document.url,
                 max_per_doc=self.link_follow_max_per_doc)
         except Exception:  # noqa: BLE001 — follow failures stay on link rows
             log.exception("link auto-follow failed for document %s", document.id)
 
-    def _embed(self, doc_id: int, extracted: Extracted) -> None:
+    async def _embed(self, conn: psycopg.AsyncConnection, doc_id: int,
+                     extracted: Extracted) -> None:
         if not self.embeddings_enabled:
             return
         try:
             text = f"{extracted.title or ''}\n{extracted.text[:_EMBED_CHARS]}"
             vectors = self.embedder.embed([text])
             if vectors:
-                self.vectors.add(doc_id, vectors[0], self.embedder.model_name)
+                await self.vectors.add(conn, doc_id, vectors[0],
+                                       self.embedder.model_name)
         except Exception:  # noqa: BLE001
             log.exception("embedding failed for document %s", doc_id)

@@ -1,0 +1,10 @@
+# keep the build context tiny: venv, live SQLite data + blobs, caches
+.venv/
+data/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+connect.egg-info/
+tests/
+.env

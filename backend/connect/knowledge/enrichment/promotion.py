@@ -16,32 +16,29 @@ Triggers (design doc result.pipeline):
 
 from __future__ import annotations
 
-import json
-import sqlite3
+import psycopg
 
 PROMOTE_MIN_CHECK_WORTHINESS = 0.7
 CLUSTER_HEAT_MIN_DOCS = 5
 CLUSTER_HEAT_WINDOW_HOURS = 48
 
 
-def is_fact_checker_source(conn: sqlite3.Connection,
-                           source_id: int | None) -> bool:
+async def is_fact_checker_source(conn: psycopg.AsyncConnection,
+                                 source_id: int | None) -> bool:
     """Fact-checker sources fast-path to T1 and always promote to T2 (their
     items carry verdicts). Marked by config {"fact_checker": true} or a
     'fact-check' note (the seeded Alt News / BOOM / PIB Fact Check rows
     match the latter)."""
     if source_id is None:
         return False
-    row = conn.execute(
-        "SELECT config, notes FROM source WHERE id = ?", (source_id,)
-    ).fetchone()
+    cur = await conn.execute(
+        "SELECT config, notes FROM source WHERE id = %s", (source_id,))
+    row = await cur.fetchone()
     if row is None:
         return False
-    try:
-        if json.loads(row["config"] or "{}").get("fact_checker"):
-            return True
-    except (ValueError, TypeError):
-        pass
+    config = row["config"] if isinstance(row["config"], dict) else {}
+    if config.get("fact_checker"):
+        return True
     notes = (row["notes"] or "").lower()
     return "fact-check" in notes or "fact check" in notes
 
@@ -70,40 +67,44 @@ def promotion_triggers(*, watch_hit: bool = False,
     return fired
 
 
-def evaluate(conn: sqlite3.Connection, document_id: int, *,
-             manual: bool = False) -> list[str]:
+async def evaluate(conn: psycopg.AsyncConnection, document_id: int, *,
+                   manual: bool = False) -> list[str]:
     """Gather inputs for one document and run the rules. Empty list = stay
     at T1. Safe to call for unknown ids (no triggers)."""
-    doc = conn.execute(
+    cur = await conn.execute(
         "SELECT d.watch_hit, d.source_id, s.credibility_tier"
         " FROM document d LEFT JOIN source s ON s.id = d.source_id"
-        " WHERE d.id = ?", (document_id,)).fetchone()
+        " WHERE d.id = %s", (document_id,))
+    doc = await cur.fetchone()
     if doc is None:
         return []
-    max_worthiness_row = conn.execute(
-        "SELECT MAX(c.check_worthiness) FROM claim_sighting cs"
-        " JOIN claim c ON c.id = cs.claim_id WHERE cs.document_id = ?",
-        (document_id,)).fetchone()
+    cur = await conn.execute(
+        "SELECT MAX(c.check_worthiness) AS w FROM claim_sighting cs"
+        " JOIN claim c ON c.id = cs.claim_id WHERE cs.document_id = %s",
+        (document_id,))
+    max_worthiness = (await cur.fetchone())["w"]
     return promotion_triggers(
         watch_hit=bool(doc["watch_hit"]),
-        fact_checker=is_fact_checker_source(conn, doc["source_id"]),
+        fact_checker=await is_fact_checker_source(conn, doc["source_id"]),
         official_tier1=doc["credibility_tier"] == 1,
-        max_check_worthiness=max_worthiness_row[0],
-        cluster_docs_48h=cluster_heat(conn, document_id),
+        max_check_worthiness=max_worthiness,
+        cluster_docs_48h=await cluster_heat(conn, document_id),
         manual=manual)
 
 
-def cluster_heat(conn: sqlite3.Connection, document_id: int) -> int:
+async def cluster_heat(conn: psycopg.AsyncConnection,
+                       document_id: int) -> int:
     """Docs assigned to the same event as this doc within the last 48h
     ("story heating up"); 0 when the doc has no event assignment yet."""
-    row = conn.execute(
+    cur = await conn.execute(
         "SELECT event_id FROM event_assignment"
-        " WHERE document_id = ? AND event_id IS NOT NULL"
-        " ORDER BY id DESC LIMIT 1", (document_id,)).fetchone()
+        " WHERE document_id = %s AND event_id IS NOT NULL"
+        " ORDER BY id DESC LIMIT 1", (document_id,))
+    row = await cur.fetchone()
     if row is None:
         return 0
-    count = conn.execute(
-        "SELECT COUNT(DISTINCT document_id) FROM event_assignment"
-        " WHERE event_id = ? AND created_at >= datetime('now', ?)",
-        (row[0], f"-{CLUSTER_HEAT_WINDOW_HOURS} hours")).fetchone()[0]
-    return int(count)
+    cur = await conn.execute(
+        "SELECT COUNT(DISTINCT document_id) AS n FROM event_assignment"
+        " WHERE event_id = %s AND created_at >= now() - %s::interval",
+        (row["event_id"], f"{CLUSTER_HEAT_WINDOW_HOURS} hours"))
+    return int((await cur.fetchone())["n"])

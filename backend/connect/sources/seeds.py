@@ -10,7 +10,7 @@ metadata-only in Phase 1 unless watch-hit).
 
 from __future__ import annotations
 
-import sqlite3
+import psycopg
 
 from connect.storage import sources as source_dao
 
@@ -162,13 +162,13 @@ SEED_SOURCES: tuple[dict, ...] = (
 WEB_INVESTIGATION_SOURCE = "Web (investigation)"
 
 
-def seed_sources(conn: sqlite3.Connection) -> int:
+async def seed_sources(conn: psycopg.AsyncConnection) -> int:
     """Insert missing seed rows (matched by name); returns how many added."""
     added = 0
     for seed in SEED_SOURCES:
-        if source_dao.get_by_name(conn, seed["name"]) is not None:
+        if await source_dao.get_by_name(conn, seed["name"]) is not None:
             continue
-        source_dao.insert(
+        await source_dao.insert(
             conn,
             name=seed["name"],
             type_=seed["type"],

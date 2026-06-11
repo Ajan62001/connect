@@ -17,20 +17,22 @@ PDF_TWIN_URL = "https://www.rbi.org.in/rdocs/notification/PDFs/CIRC12690.PDF"
 GAZETTE_URL = "https://egazette.gov.in/WriteReadData/2026/9001.pdf"
 
 
-def _links(conn, doc_id) -> list[DocumentLink]:
-    return link_dao.list_for_document(conn, doc_id)
+async def _links(conn, doc_id) -> list[DocumentLink]:
+    return await link_dao.list_for_document(conn, doc_id)
 
 
-def _edges(conn) -> list[tuple]:
-    return [tuple(r) for r in conn.execute(
+async def _edges(conn) -> list[tuple]:
+    from dbutil import qtuples
+    return await qtuples(
+        conn,
         "SELECT src_type, src_id, dst_type, dst_id, provenance_document_id,"
-        " grade FROM edge WHERE relation = 'links_to' ORDER BY id").fetchall()]
+        " grade FROM edge WHERE relation = 'links_to' ORDER BY id")
 
 
 # --- the flagship case: RBI circular page -> PDF twin ----------------------------
 
 
-async def test_rbi_pdf_twin_followed_and_edge_written(container):
+async def test_rbi_pdf_twin_followed_and_edge_written(container, db):
     fetcher = FakeFetcher({
         PARENT_URL: html_page(
             "Review of Risk Weights",
@@ -41,22 +43,22 @@ async def test_rbi_pdf_twin_followed_and_edge_written(container):
     })
     container.pipeline.fetcher = fetcher
 
-    result = await container.pipeline.ingest_url(PARENT_URL)
+    result = await container.pipeline.ingest_url(db, PARENT_URL)
     parent = result.document
 
-    links = _links(container.db, parent.id)
+    links = await _links(db, parent.id)
     assert len(links) == 1
     link = links[0]
     assert link.is_file and link.is_official
     assert link.status == "fetched"
     assert link.resolved_document_id is not None
 
-    child = doc_dao.get(container.db, link.resolved_document_id)
+    child = await doc_dao.get(db, link.resolved_document_id)
     assert child is not None
     assert child.media_type == "pdf"
     assert child.source_id is None  # lineage lives in the edge + link row
 
-    edges = _edges(container.db)
+    edges = await _edges(db)
     assert edges == [("document", parent.id, "document", child.id,
                       parent.id, 1)]
 
@@ -96,7 +98,7 @@ def test_select_candidates_official_first_then_same_domain_files():
     assert [l.id for l in picked] == [2, 3]
 
 
-async def test_per_doc_follow_cap_leaves_rest_not_followed(container):
+async def test_per_doc_follow_cap_leaves_rest_not_followed(container, db):
     o1 = "https://pib.gov.in/PressReleasePage.aspx?PRID=1"
     o2 = "https://egazette.gov.in/WriteReadData/2026/2.pdf"
     fetcher = FakeFetcher({
@@ -114,8 +116,8 @@ async def test_per_doc_follow_cap_leaves_rest_not_followed(container):
     container.pipeline.fetcher = fetcher
     container.pipeline.link_follow_max_per_doc = 2
 
-    result = await container.pipeline.ingest_url(PARENT_URL)
-    statuses = {l.url: l.status for l in _links(container.db,
+    result = await container.pipeline.ingest_url(db, PARENT_URL)
+    statuses = {l.url: l.status for l in await _links(db,
                                                 result.document.id)}
     # candidate order: o1, o2 (cross-domain officials), then the same-domain
     # PDF twin; cap=2 follows the first two, the rest stays manually fetchable
@@ -128,7 +130,7 @@ async def test_per_doc_follow_cap_leaves_rest_not_followed(container):
 # --- depth 1: no recursion ---------------------------------------------------------
 
 
-async def test_followed_documents_are_never_auto_followed_from(container):
+async def test_followed_documents_are_never_auto_followed_from(container, db):
     child_url = "https://pib.gov.in/PressReleasePage.aspx?PRID=77"
     grandchild_url = "https://egazette.gov.in/WriteReadData/2026/777.pdf"
     fetcher = FakeFetcher({
@@ -143,24 +145,24 @@ async def test_followed_documents_are_never_auto_followed_from(container):
     })
     container.pipeline.fetcher = fetcher
 
-    result = await container.pipeline.ingest_url(PARENT_URL)
+    result = await container.pipeline.ingest_url(db, PARENT_URL)
 
     assert grandchild_url not in fetcher.calls  # depth 1: never recursed
-    parent_links = _links(container.db, result.document.id)
+    parent_links = await _links(db, result.document.id)
     child_id = parent_links[0].resolved_document_id
     assert child_id is not None
     # the child still got ITS links extracted and stored…
-    child_links = _links(container.db, child_id)
+    child_links = await _links(db, child_id)
     assert [l.url for l in child_links] == [grandchild_url]
     # …but they were not followed
     assert child_links[0].status == "not_followed"
-    assert len(_edges(container.db)) == 1
+    assert len(await _edges(db)) == 1
 
 
 # --- dedup & idempotence ------------------------------------------------------------
 
 
-async def test_dedup_hit_resolves_to_existing_doc_and_writes_edge(container):
+async def test_dedup_hit_resolves_to_existing_doc_and_writes_edge(container, db):
     url_a = "https://pib.gov.in/PressReleasePage.aspx?PRID=500"
     url_b = "https://pib.gov.in/newsite/erelease.aspx?relid=500"  # same content
     page = html_page("Press release 500",
@@ -175,22 +177,22 @@ async def test_dedup_hit_resolves_to_existing_doc_and_writes_edge(container):
     })
     container.pipeline.fetcher = fetcher
 
-    first = await container.pipeline.ingest_url(url_a)
+    first = await container.pipeline.ingest_url(db, url_a)
     assert first.created
 
-    result = await container.pipeline.ingest_url(PARENT_URL)
-    link = _links(container.db, result.document.id)[0]
+    result = await container.pipeline.ingest_url(db, PARENT_URL)
+    link = (await _links(db, result.document.id))[0]
     # url_b was fetched, its content hash matched the existing document:
     # the link resolves to the EXISTING doc and the edge is still written
     assert url_b in fetcher.calls
     assert link.status == "fetched"
     assert link.resolved_document_id == first.document.id
-    assert _edges(container.db) == [
+    assert await _edges(db) == [
         ("document", result.document.id, "document", first.document.id,
          result.document.id, 1)]
 
 
-async def test_known_url_is_not_refetched(container):
+async def test_known_url_is_not_refetched(container, db):
     child_url = "https://egazette.gov.in/WriteReadData/2026/42.pdf"
     fetcher = FakeFetcher({
         child_url: pdf_page("Gazette notification number forty-two text."),
@@ -201,11 +203,11 @@ async def test_known_url_is_not_refetched(container):
     })
     container.pipeline.fetcher = fetcher
 
-    existing = await container.pipeline.ingest_url(child_url)
-    result = await container.pipeline.ingest_url(PARENT_URL)
+    existing = await container.pipeline.ingest_url(db, child_url)
+    result = await container.pipeline.ingest_url(db, PARENT_URL)
 
     assert fetcher.calls.count(child_url) == 1  # resolved by URL, no re-fetch
-    link = _links(container.db, result.document.id)[0]
+    link = (await _links(db, result.document.id))[0]
     assert link.status == "fetched"
     assert link.resolved_document_id == existing.document.id
 
@@ -213,7 +215,7 @@ async def test_known_url_is_not_refetched(container):
 # --- failure isolation ---------------------------------------------------------------
 
 
-async def test_follow_failure_recorded_never_raises(container):
+async def test_follow_failure_recorded_never_raises(container, db):
     dead_url = "https://egazette.gov.in/WriteReadData/2026/404.pdf"
     fetcher = FakeFetcher({
         PARENT_URL: html_page(
@@ -224,20 +226,20 @@ async def test_follow_failure_recorded_never_raises(container):
     })
     container.pipeline.fetcher = fetcher
 
-    result = await container.pipeline.ingest_url(PARENT_URL)  # must not raise
+    result = await container.pipeline.ingest_url(db, PARENT_URL)  # must not raise
     assert result.created
 
-    link = _links(container.db, result.document.id)[0]
+    link = (await _links(db, result.document.id))[0]
     assert link.status == "failed"
     assert "404" in (link.error or "")
     assert link.resolved_document_id is None
-    assert _edges(container.db) == []
+    assert await _edges(db) == []
 
 
 # --- published_at hint ----------------------------------------------------------------
 
 
-async def test_published_at_hint_wins_over_extracted_metadata(container):
+async def test_published_at_hint_wins_over_extracted_metadata(container, db):
     url = "https://pib.gov.in/PressReleasePage.aspx?PRID=2026001"
     ctype, body = html_page(
         "Scheme launch", "<p>The minister launched the scheme today with "
@@ -249,11 +251,13 @@ async def test_published_at_hint_wins_over_extracted_metadata(container):
     container.pipeline.fetcher = FakeFetcher({url: (ctype, body)})
 
     hint = "2026-06-10T07:30:00Z"
-    result = await container.pipeline.ingest_url(url, published_at_hint=hint)
-    assert result.document.published_at == hint
+    result = await container.pipeline.ingest_url(db, url,
+        published_at_hint=hint)
+    # timestamptz reads come back in the canonical millisecond ISO shape
+    assert result.document.published_at == "2026-06-10T07:30:00.000Z"
 
 
-async def test_extracted_date_remains_the_fallback(container):
+async def test_extracted_date_remains_the_fallback(container, db):
     url = "https://pib.gov.in/PressReleasePage.aspx?PRID=2026002"
     ctype, body = html_page(
         "Another scheme launch", "<p>A different ministry launched another "
@@ -264,11 +268,11 @@ async def test_extracted_date_remains_the_fallback(container):
         b'content="2025-11-30T10:00:00+05:30">')
     container.pipeline.fetcher = FakeFetcher({url: (ctype, body)})
 
-    result = await container.pipeline.ingest_url(url)  # no hint
+    result = await container.pipeline.ingest_url(db, url)  # no hint
     assert (result.document.published_at or "").startswith("2025-11-30")
 
 
-async def test_rss_poller_passes_pubdate_hint(container):
+async def test_rss_poller_passes_pubdate_hint(container, db):
     url = "https://pib.gov.in/PressReleasePage.aspx?PRID=2026003"
     ctype, body = html_page(
         "Feed item page", "<p>Yet another release whose embedded metadata "
@@ -279,8 +283,8 @@ async def test_rss_poller_passes_pubdate_hint(container):
         b'content="2025-11-30T10:00:00+05:30">')
     container.pipeline.fetcher = FakeFetcher({url: (ctype, body)})
 
-    source = source_dao.insert(
-        container.db, name="PIB test feed", type_="rss",
+    source = await source_dao.insert(
+        db, name="PIB test feed", type_="rss",
         config={"feed_url": "https://pib.gov.in/rss.aspx"},
         credibility_tier=1)
 
@@ -289,12 +293,12 @@ async def test_rss_poller_passes_pubdate_hint(container):
             return [DiscoveredItem(title="Scheme launched", url=url,
                                    published_at="2026-06-11T04:00:00Z")]
 
-    poller = RssPoller(container.db, pipeline=container.pipeline,
+    poller = RssPoller(container.pool, pipeline=container.pipeline,
                        adapter=StubAdapter())
-    status = await poller.poll_source(source)
+    status = await poller.poll_source(db, source)
     assert status.startswith("ok: 1 new")
 
-    document = doc_dao.get_by_url(container.db, url)
+    document = await doc_dao.get_by_url(db, url)
     assert document is not None
-    assert document.published_at == "2026-06-11T04:00:00Z"
+    assert document.published_at == "2026-06-11T04:00:00.000Z"
     assert document.title == "Scheme launched"

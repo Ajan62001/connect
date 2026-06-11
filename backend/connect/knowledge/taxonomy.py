@@ -7,7 +7,7 @@ story threading. India-domain pass on the names is a flagged open item.
 
 from __future__ import annotations
 
-import sqlite3
+import psycopg
 
 EVENT_TYPES: tuple[tuple[str, str | None, int], ...] = (
     ("cabinet_decision", "executive", 7),
@@ -32,13 +32,14 @@ EVENT_TYPES: tuple[tuple[str, str | None, int], ...] = (
 EVENT_TYPE_NAMES: tuple[str, ...] = tuple(name for name, _, _ in EVENT_TYPES)
 
 
-def seed_event_types(conn: sqlite3.Connection) -> int:
+async def seed_event_types(conn: psycopg.AsyncConnection) -> int:
     """Insert missing taxonomy rows; returns how many were added."""
     added = 0
-    with conn:
+    async with conn.transaction():
         for name, group, window in EVENT_TYPES:
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO event_type (name, lifecycle_group,"
-                " window_days) VALUES (?,?,?)", (name, group, window))
+            cur = await conn.execute(
+                "INSERT INTO event_type (name, lifecycle_group, window_days)"
+                " VALUES (%s,%s,%s) ON CONFLICT (name) DO NOTHING",
+                (name, group, window))
             added += cur.rowcount
     return added

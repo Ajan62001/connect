@@ -27,9 +27,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sqlite3
 from dataclasses import dataclass
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable, Mapping
+
+import psycopg
 
 from connect.analysis import grounding, writeback
 from connect.analysis.budget import AnalysisBudgetExceeded
@@ -56,6 +57,8 @@ from connect.llm.tiers import ModelTier
 from connect.storage import fts as fts_dao
 
 log = logging.getLogger(__name__)
+
+_Row = Mapping[str, Any]
 
 # -- weighting constants (engine design §3 2c — table-driven in tests) ---------------
 
@@ -155,23 +158,27 @@ def doc_domain(url: str | None, source_name: str | None,
 # -- evidence gathering ------------------------------------------------------------------
 
 
-def _doc_row(conn: sqlite3.Connection, doc_id: int) -> sqlite3.Row | None:
-    return conn.execute(
+async def _doc_row(conn: psycopg.AsyncConnection,
+                   doc_id: int) -> _Row | None:
+    cur = await conn.execute(
         "SELECT d.id, d.title, d.url, d.content_text, s.name AS source_name,"
         " s.credibility_tier FROM document d"
-        " LEFT JOIN source s ON s.id = d.source_id WHERE d.id = ?",
-        (doc_id,)).fetchone()
+        " LEFT JOIN source s ON s.id = d.source_id WHERE d.id = %s",
+        (doc_id,))
+    return await cur.fetchone()
 
 
-def _url_in_corpus(conn: sqlite3.Connection, url: str) -> int | None:
-    row = conn.execute(
-        "SELECT id FROM document WHERE url = ? OR canonical_url = ?"
-        " LIMIT 1", (url, url)).fetchone()
-    return int(row[0]) if row else None
+async def _url_in_corpus(conn: psycopg.AsyncConnection,
+                         url: str) -> int | None:
+    cur = await conn.execute(
+        "SELECT id FROM document WHERE url = %s OR canonical_url = %s"
+        " LIMIT 1", (url, url))
+    row = await cur.fetchone()
+    return int(row["id"]) if row else None
 
 
 async def gather_evidence(ctx: AnalysisContext, claim: DecomposedClaim,
-                          k: int) -> list[sqlite3.Row]:
+                          k: int) -> list[_Row]:
     """Up to ``k`` candidate docs: corpus FTS, then corpus vectors, then
     NEW web docs fetched through the ingestion pipeline. Dedup by doc id;
     fetch failures are skipped, never fatal."""
@@ -184,26 +191,29 @@ async def gather_evidence(ctx: AnalysisContext, claim: DecomposedClaim,
             ordered.append(doc_id)
 
     try:
-        items, _ = fts_dao.search_documents(
-            ctx.conn, claim.text, page=1, page_size=CORPUS_POOL_LIMIT)
-        for item in items:
-            _take(item.id)
-    except sqlite3.Error:
+        # ranking only — ids; the snippet/ts_headline pass never runs here
+        for doc_id in await fts_dao.rank_documents(
+                ctx.conn, claim.text, limit=CORPUS_POOL_LIMIT):
+            _take(doc_id)
+    except psycopg.Error:
         log.exception("corpus FTS failed for claim %s", claim.id)
 
     if ctx.vectors is not None and len(ordered) < k:
         vecs = ctx.embedder.embed([claim.text])
         if vecs:
-            for doc_id, _sim in ctx.vectors.search(vecs[0],
-                                                   k=CORPUS_POOL_LIMIT):
+            for doc_id, _sim in await ctx.vectors.search(
+                    ctx.conn, vecs[0], k=CORPUS_POOL_LIMIT):
                 _take(doc_id)
 
     if len(ordered) < k:
         await _gather_web(ctx, claim, k, _take, len(ordered))
 
-    return [row for doc_id in ordered[:k]
-            if (row := _doc_row(ctx.conn, doc_id)) is not None
-            and (row["content_text"] or "").strip()]
+    out = []
+    for doc_id in ordered[:k]:
+        row = await _doc_row(ctx.conn, doc_id)
+        if row is not None and (row["content_text"] or "").strip():
+            out.append(row)
+    return out
 
 
 async def _gather_web(ctx: AnalysisContext, claim: DecomposedClaim, k: int,
@@ -217,7 +227,7 @@ async def _gather_web(ctx: AnalysisContext, claim: DecomposedClaim, k: int,
     for hit in hits:
         if budget <= 0:
             break
-        existing = _url_in_corpus(ctx.conn, hit.url)
+        existing = await _url_in_corpus(ctx.conn, hit.url)
         if existing is not None:
             take(existing)
             budget -= 1
@@ -225,7 +235,7 @@ async def _gather_web(ctx: AnalysisContext, claim: DecomposedClaim, k: int,
         if ctx.ingest is None:
             continue
         try:
-            result = await ctx.ingest.ingest_url(hit.url)
+            result = await ctx.ingest.ingest_url(ctx.conn, hit.url)
         except Exception as e:  # noqa: BLE001 — one bad URL never aborts
             log.warning("evidence fetch failed (%s): %s", hit.url, e)
             continue
@@ -236,7 +246,7 @@ async def _gather_web(ctx: AnalysisContext, claim: DecomposedClaim, k: int,
 # -- stance classification -----------------------------------------------------------------
 
 
-def _stance_user(claim_text: str, doc: sqlite3.Row) -> str:
+def _stance_user(claim_text: str, doc: _Row) -> str:
     words = (doc["content_text"] or "").split()
     body = " ".join(words[:STANCE_MAX_CONTENT_WORDS])
     truncated = " [truncated]" if len(words) > STANCE_MAX_CONTENT_WORDS \
@@ -247,7 +257,7 @@ def _stance_user(claim_text: str, doc: sqlite3.Row) -> str:
 
 
 async def stance_one(ctx: AnalysisContext, claim_text: str,
-                     doc: sqlite3.Row) -> StanceJudgment | None:
+                     doc: _Row) -> StanceJudgment | None:
     """One claim x doc judgment, span-verified; one retry with the failure
     shown, then discarded. Returns None for discards and 'unrelated'."""
     user = _stance_user(claim_text, doc)
@@ -379,7 +389,7 @@ async def run(ctx: AnalysisContext, normalized: NormalizedInput,
             kind=claim.kind, checkable=claim.checkable,
             note=None if claim.checkable else "not checkable",
         ))
-        ctx.emit("stage_progress",
+        await ctx.emit("stage_progress",
                  {"stage": "verify",
                   "message": f"claim {claim.id} -> #{claim_id} ({method})"})
     if save is not None:
@@ -403,14 +413,14 @@ async def run(ctx: AnalysisContext, normalized: NormalizedInput,
             aborted = True
             results[index] = results[index].model_copy(update={
                 "note": "skipped: analysis budget exhausted"})
-            ctx.emit("stage_progress",
+            await ctx.emit("stage_progress",
                      {"stage": "verify",
                       "message": f"budget exhausted before {claim.id};"
                                  f" aborting with partial result"})
             continue
         if degraded:
             degraded_any += 1
-            ctx.emit("stage_progress",
+            await ctx.emit("stage_progress",
                      {"stage": "verify",
                       "message": f"budget low: K degraded to {k_claim}"
                                  f" for {claim.id}"})
@@ -418,14 +428,15 @@ async def run(ctx: AnalysisContext, normalized: NormalizedInput,
         results[index] = await _verify_claim(
             ctx, claim, results[index], k_claim, degraded=degraded)
         verified += 1
-        ctx.emit("claim_verified", {"claim_id": results[index].claim_id,
-                                    "verdict": results[index].verdict})
+        await ctx.emit("claim_verified",
+                       {"claim_id": results[index].claim_id,
+                        "verdict": results[index].verdict})
         if save is not None:
             _maybe_await = save(list(results), None)
             if asyncio.iscoroutine(_maybe_await):
                 await _maybe_await
 
-    new_contradictions = contradictions.scan(conn)
+    new_contradictions = await contradictions.scan(conn)
 
     notes = [f"verified {verified} of {len(checkable)} checkable claims"]
     if ctx.search.name == "null":
@@ -444,14 +455,14 @@ async def _verify_claim(ctx: AnalysisContext, claim: DecomposedClaim,
                         base: ClaimResult, k: int, *,
                         degraded: bool) -> ClaimResult:
     docs = await gather_evidence(ctx, claim, k)
-    ctx.emit("stage_progress",
-             {"stage": "verify",
-              "message": f"{claim.id}: {len(docs)} evidence docs"})
+    await ctx.emit("stage_progress",
+                   {"stage": "verify",
+                    "message": f"{claim.id}: {len(docs)} evidence docs"})
 
     judgments_raw = await asyncio.gather(
         *(stance_one(ctx, claim.text, doc) for doc in docs),
         return_exceptions=True)
-    accepted: list[tuple[sqlite3.Row, StanceJudgment]] = []
+    accepted: list[tuple[_Row, StanceJudgment]] = []
     budget_hit = False
     for doc, judgment in zip(docs, judgments_raw):
         if isinstance(judgment, (BudgetExceeded, AnalysisBudgetExceeded)):
@@ -481,7 +492,7 @@ async def _verify_claim(ctx: AnalysisContext, claim: DecomposedClaim,
     menu = grounding.EvidenceMenu()
     evidence: list[EvidenceRef] = []
     for (doc, judgment), weight in zip(accepted, weights):
-        evidence_id = writeback.write_evidence(
+        evidence_id = await writeback.write_evidence(
             ctx.conn, claim_id=base.claim_id, document_id=doc["id"],
             stance=judgment.stance, relevance=judgment.relevance,
             quote=judgment.quoted_span, note=judgment.note,
@@ -500,7 +511,7 @@ async def _verify_claim(ctx: AnalysisContext, claim: DecomposedClaim,
         ctx, claim_text=claim.text, verdict=verdict, menu=menu,
         fallback=fallback)
 
-    writeback.update_verdict(
+    await writeback.update_verdict(
         ctx.conn, claim_id=base.claim_id, verdict=verdict,
         confidence=confidence, dossier_id=ctx.dossier_id,
         evidence=evidence)

@@ -5,9 +5,8 @@ evidence rows, grade-2 edge writes, question open -> partial)."""
 
 from __future__ import annotations
 
-import json
-
 import pytest
+from dbutil import q1, qv
 from kb_factories import insert_doc
 
 from connect.investigation.schema import ReactionCandidate, ScopePack
@@ -15,9 +14,8 @@ from connect.investigation.writeback import (
     FindingValidationError,
     record_finding,
 )
-from connect.storage import db as db_mod
 from connect.storage import edges as edge_dao
-from connect.storage.db import utc_now
+from connect.storage.pg import utc_now
 
 DOC_TEXT = ("The ministry withdrew the draft rules in the wake of "
             "objections from the parliamentary standing committee. "
@@ -27,32 +25,25 @@ QUOTE = ("The ministry withdrew the draft rules in the wake of objections "
 
 
 @pytest.fixture()
-def conn(tmp_path):
-    c = db_mod.connect(tmp_path / "t.db")
-    db_mod.init_db(c)
-    yield c
-    c.close()
-
-
-@pytest.fixture()
-def env(conn):
+async def env(db):
     """One dossier, one doc, two events, one open question, an RC menu."""
-    doc_id = insert_doc(conn, title="Withdrawal report", text=DOC_TEXT)
-    with conn:
-        conn.execute(
-            "INSERT INTO dossier (kind, input_text, status, created_at)"
-            " VALUES ('investigation', 'draft rules', 'running', ?)",
-            (utc_now(),))
-        conn.execute("INSERT INTO event (title, occurred_on, created_at)"
-                     " VALUES ('Committee objections', '2026-05-20', ?)",
-                     (utc_now(),))
-        conn.execute("INSERT INTO event (title, occurred_on, created_at)"
-                     " VALUES ('Rules withdrawn', '2026-05-28', ?)",
-                     (utc_now(),))
-        conn.execute(
-            "INSERT INTO question (dossier_id, qtype, text, status,"
-            " created_at) VALUES (1, 'what_triggered',"
-            " 'What triggered the withdrawal?', 'open', ?)", (utc_now(),))
+    conn = db
+    doc_id = await insert_doc(conn, title="Withdrawal report",
+                              text=DOC_TEXT)
+    await conn.execute(
+        "INSERT INTO dossier (kind, input_text, status, created_at)"
+        " VALUES ('investigation', 'draft rules', 'running', %s)",
+        (utc_now(),))
+    await conn.execute("INSERT INTO event (title, occurred_on, created_at)"
+                       " VALUES ('Committee objections', '2026-05-20', %s)",
+                       (utc_now(),))
+    await conn.execute("INSERT INTO event (title, occurred_on, created_at)"
+                       " VALUES ('Rules withdrawn', '2026-05-28', %s)",
+                       (utc_now(),))
+    await conn.execute(
+        "INSERT INTO question (dossier_id, qtype, text, status,"
+        " created_at) VALUES (1, 'what_triggered',"
+        " 'What triggered the withdrawal?', 'open', %s)", (utc_now(),))
     pack = ScopePack(
         input_text="draft rules", input_type="topic",
         reaction_candidates=[ReactionCandidate(
@@ -63,12 +54,12 @@ def env(conn):
             "question_id": 1}
 
 
-def attempt(env, **overrides):
+async def attempt(env, **overrides):
     args = {"kind": "context", "text": "a finding",
             "evidence": [{"document_id": env["doc_id"], "quote": QUOTE}],
             **overrides}
-    return record_finding(env["conn"], dossier_id=env["dossier_id"],
-                          scope_pack=env["pack"], args=args)
+    return await record_finding(env["conn"], dossier_id=env["dossier_id"],
+                                scope_pack=env["pack"], args=args)
 
 
 # --- rejection table -------------------------------------------------------------
@@ -134,27 +125,26 @@ REJECTIONS = [
 
 @pytest.mark.parametrize("name,overrides,reason",
                          REJECTIONS, ids=[r[0] for r in REJECTIONS])
-def test_rejections(env, name, overrides, reason):
+async def test_rejections(env, name, overrides, reason):
     # patch real doc id into evidence overrides built before the fixture
     if "evidence" in overrides:
         for item in overrides["evidence"]:
             if isinstance(item, dict) and item.get("document_id") is None:
                 item["document_id"] = env["doc_id"]
     with pytest.raises(FindingValidationError, match=reason):
-        attempt(env, **overrides)
+        await attempt(env, **overrides)
     # nothing persisted on rejection
-    assert env["conn"].execute(
-        "SELECT COUNT(*) FROM finding").fetchone()[0] == 0
-    assert env["conn"].execute(
-        "SELECT COUNT(*) FROM finding_evidence").fetchone()[0] == 0
+    assert await qv(env["conn"], "SELECT COUNT(*) FROM finding") == 0
+    assert await qv(env["conn"],
+                    "SELECT COUNT(*) FROM finding_evidence") == 0
 
 
 # --- success paths ----------------------------------------------------------------
 
 
-def test_grounded_finding_with_link_and_question(env):
+async def test_grounded_finding_with_link_and_question(env):
     conn = env["conn"]
-    result = attempt(
+    result = await attempt(
         env, kind="reaction", question_id=env["question_id"],
         confidence=0.9,
         link={"src_type": "event", "src_id": 2, "relation": "reaction_to",
@@ -163,83 +153,82 @@ def test_grounded_finding_with_link_and_question(env):
     assert result["edge_id"] is not None
     assert result["speculation"] is False
 
-    finding = conn.execute("SELECT * FROM finding WHERE id=1").fetchone()
+    finding = await q1(conn, "SELECT * FROM finding WHERE id=1")
     assert (finding["kind"], finding["speculation"],
-            finding["question_id"]) == ("reaction", 0, env["question_id"])
+            finding["question_id"]) == ("reaction", False,
+                                        env["question_id"])
     assert finding["edge_id"] == result["edge_id"]
 
-    ev = conn.execute("SELECT * FROM finding_evidence"
-                      " WHERE finding_id=1").fetchone()
+    ev = await q1(conn, "SELECT * FROM finding_evidence"
+                        " WHERE finding_id=1")
     assert ev["document_id"] == env["doc_id"]
     assert ev["quote"] == QUOTE
     assert ev["quote_start"] is not None and ev["quote_end"] is not None
     assert DOC_TEXT[ev["quote_start"]:ev["quote_end"]] == QUOTE
 
-    edge = conn.execute("SELECT * FROM edge WHERE id = ?",
-                        (result["edge_id"],)).fetchone()
+    edge = await q1(conn, "SELECT * FROM edge WHERE id = %s",
+                    result["edge_id"])
     assert (edge["src_type"], edge["src_id"], edge["relation"],
             edge["dst_type"], edge["dst_id"]) == (
                 "event", 2, "reaction_to", "event", 1)
     assert edge["grade"] == 2
     assert edge["provenance_dossier_id"] == 1
     assert edge["provenance_document_id"] == env["doc_id"]
-    props = json.loads(edge["properties"])
+    props = edge["properties"]
     assert props["quote"] == QUOTE
     assert props["speculation"] is False
     assert props["finding_id"] == 1
 
     # question flipped open -> partial and accumulated the finding id
-    q = conn.execute("SELECT status, answer_finding_ids FROM question"
-                     " WHERE id = ?", (env["question_id"],)).fetchone()
+    q = await q1(conn, "SELECT status, answer_finding_ids FROM question"
+                       " WHERE id = %s", env["question_id"])
     assert q["status"] == "partial"
-    assert json.loads(q["answer_finding_ids"]) == [1]
+    assert q["answer_finding_ids"] == [1]
 
 
-def test_speculative_candidate_finding_derives_styled_edge(env):
+async def test_speculative_candidate_finding_derives_styled_edge(env):
     conn = env["conn"]
-    result = attempt(env, kind="reaction", evidence=[], speculation=True,
-                     candidate_id="RC1", confidence=0.4)
+    result = await attempt(env, kind="reaction", evidence=[],
+                           speculation=True,
+                           candidate_id="RC1", confidence=0.4)
     assert result["speculation"] is True
-    edge = conn.execute("SELECT * FROM edge WHERE id = ?",
-                        (result["edge_id"],)).fetchone()
+    edge = await q1(conn, "SELECT * FROM edge WHERE id = %s",
+                    result["edge_id"])
     # derived from the candidate pair: B(2) -[reaction_to]-> A(1)
     assert (edge["src_id"], edge["relation"], edge["dst_id"]) == (
         2, "reaction_to", 1)
-    props = json.loads(edge["properties"])
+    props = edge["properties"]
     assert props["speculation"] is True
     assert props["score_components"] == {
         "days_apart": 8.0, "entity_jaccard": 0.5, "cosine": 0.7}
-    finding = conn.execute("SELECT payload FROM finding"
-                           " WHERE id=1").fetchone()
-    payload = json.loads(finding["payload"])
+    payload = await qv(conn, "SELECT payload FROM finding WHERE id=1")
     assert payload["candidate_id"] == "RC1"
 
 
-def test_edge_insert_is_idempotent(env):
-    first = attempt(env, kind="reaction",
-                    link={"src_type": "event", "src_id": 2,
-                          "relation": "reaction_to", "dst_type": "event",
-                          "dst_id": 1})
-    second = attempt(env, kind="reaction",
-                     link={"src_type": "event", "src_id": 2,
-                           "relation": "reaction_to", "dst_type": "event",
-                           "dst_id": 1})
+async def test_edge_insert_is_idempotent(env):
+    first = await attempt(env, kind="reaction",
+                          link={"src_type": "event", "src_id": 2,
+                                "relation": "reaction_to",
+                                "dst_type": "event", "dst_id": 1})
+    second = await attempt(env, kind="reaction",
+                           link={"src_type": "event", "src_id": 2,
+                                 "relation": "reaction_to",
+                                 "dst_type": "event", "dst_id": 1})
     assert first["edge_id"] == second["edge_id"]
-    assert env["conn"].execute(
-        "SELECT COUNT(*) FROM edge WHERE relation='reaction_to'"
-        " AND status='active'").fetchone()[0] == 1
+    assert await qv(env["conn"],
+                    "SELECT COUNT(*) FROM edge WHERE relation='reaction_to'"
+                    " AND status='active'") == 1
     # but both findings persisted
-    assert env["conn"].execute(
-        "SELECT COUNT(*) FROM finding").fetchone()[0] == 2
+    assert await qv(env["conn"], "SELECT COUNT(*) FROM finding") == 2
 
 
-def test_insert_causal_validates_directly(env):
+async def test_insert_causal_validates_directly(env):
     conn = env["conn"]
     with pytest.raises(ValueError, match="unknown causal relation"):
-        edge_dao.insert_causal(conn, src_type="event", src_id=2,
-                               dst_type="event", dst_id=1,
-                               relation="follows")
+        await edge_dao.insert_causal(conn, src_type="event", src_id=2,
+                                     dst_type="event", dst_id=1,
+                                     relation="follows")
     with pytest.raises(ValueError, match="does not accept"):
-        edge_dao.insert_causal(conn, src_type="document", src_id=1,
-                               dst_type="event", dst_id=1,
-                               relation="enables")
+        await edge_dao.insert_causal(conn, src_type="document", src_id=1,
+                                     dst_type="event", dst_id=1,
+                                     relation="enables")

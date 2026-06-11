@@ -8,7 +8,7 @@ entity_mention rows — no separate event-entity table to drift.
 
 from __future__ import annotations
 
-import sqlite3
+import psycopg
 
 from connect.domain.models import (
     DocumentEventRef,
@@ -26,11 +26,13 @@ from connect.storage.documents import _LIST_COLS, _to_list_item
 MAX_EVENT_ENTITIES = 15
 
 
-def get_event(conn: sqlite3.Connection, event_id: int) -> EventInfo | None:
-    row = conn.execute(
+async def get_event(conn: psycopg.AsyncConnection,
+                    event_id: int) -> EventInfo | None:
+    cur = await conn.execute(
         "SELECT id, title, description, event_type, occurred_on, doc_count,"
-        " story_id, geo_scope FROM event WHERE id = ?",
-        (event_id,)).fetchone()
+        " story_id, geo_scope FROM event WHERE id = %s",
+        (event_id,))
+    row = await cur.fetchone()
     if row is None:
         return None
     return EventInfo(
@@ -40,60 +42,65 @@ def get_event(conn: sqlite3.Connection, event_id: int) -> EventInfo | None:
         geo_scope=row["geo_scope"])
 
 
-def get_event_detail(conn: sqlite3.Connection,
-                     event_id: int) -> EventDetail | None:
-    event = get_event(conn, event_id)
+async def get_event_detail(conn: psycopg.AsyncConnection,
+                           event_id: int) -> EventDetail | None:
+    event = await get_event(conn, event_id)
     if event is None:
         return None
     return EventDetail(
         event=event,
-        documents=documents_for_event(conn, event_id),
-        entities=entities_for_events(conn, [event_id]))
+        documents=await documents_for_event(conn, event_id),
+        entities=await entities_for_events(conn, [event_id]))
 
 
-def documents_for_event(conn: sqlite3.Connection,
-                        event_id: int) -> list[DocumentListItem]:
-    rows = conn.execute(
+async def documents_for_event(conn: psycopg.AsyncConnection,
+                              event_id: int) -> list[DocumentListItem]:
+    cur = await conn.execute(
         f"SELECT {_LIST_COLS}"
         f" FROM document d LEFT JOIN source s ON s.id = d.source_id"
         f" WHERE d.id IN (SELECT document_id FROM event_assignment"
-        f"                WHERE event_id = ?)"
+        f"                WHERE event_id = %s)"
         f" ORDER BY COALESCE(d.published_at, d.fetched_at) DESC, d.id DESC",
-        (event_id,)).fetchall()
-    return [_to_list_item(r) for r in rows]
+        (event_id,))
+    return [_to_list_item(r) for r in await cur.fetchall()]
 
 
-def entities_for_events(conn: sqlite3.Connection, event_ids: list[int],
-                        limit: int = MAX_EVENT_ENTITIES,
-                        ) -> list[EnrichmentEntityRef]:
+async def entities_for_events(conn: psycopg.AsyncConnection,
+                              event_ids: list[int],
+                              limit: int = MAX_EVENT_ENTITIES,
+                              ) -> list[EnrichmentEntityRef]:
     """Entities mentioned across the events' member documents, most-mentioned
     first (ties by name)."""
     if not event_ids:
         return []
-    marks = ",".join("?" * len(event_ids))
-    rows = conn.execute(
-        f"SELECT e.id, e.name, e.entity_type, COUNT(*) AS n"
-        f" FROM entity_mention m JOIN entity e ON e.id = m.entity_id"
-        f" WHERE m.document_id IN (SELECT document_id FROM event_assignment"
-        f"                         WHERE event_id IN ({marks}))"
-        f" GROUP BY e.id ORDER BY n DESC, e.name ASC LIMIT ?",
-        (*event_ids, limit)).fetchall()
+    cur = await conn.execute(
+        "SELECT e.id, e.name, e.entity_type, COUNT(*) AS n"
+        " FROM entity_mention m JOIN entity e ON e.id = m.entity_id"
+        " WHERE m.document_id IN (SELECT document_id FROM event_assignment"
+        "                         WHERE event_id = ANY(%s))"
+        " GROUP BY e.id, e.name, e.entity_type"
+        " ORDER BY n DESC, e.name ASC LIMIT %s",
+        (list(event_ids), limit))
     return [EnrichmentEntityRef(id=r["id"], name=r["name"],
-                                entity_type=r["entity_type"]) for r in rows]
+                                entity_type=r["entity_type"])
+            for r in await cur.fetchall()]
 
 
-def get_thread_detail(conn: sqlite3.Connection,
-                      story_id: int) -> ThreadDetail | None:
-    row = conn.execute(
+async def get_thread_detail(conn: psycopg.AsyncConnection,
+                            story_id: int) -> ThreadDetail | None:
+    cur = await conn.execute(
         "SELECT id, title, status, doc_count, summary_text, updated_at"
-        " FROM story WHERE id = ?", (story_id,)).fetchone()
+        " FROM story WHERE id = %s", (story_id,))
+    row = await cur.fetchone()
     if row is None:
         return None
-    event_rows = conn.execute(
+    cur = await conn.execute(
         "SELECT id, title, event_type, occurred_on, doc_count, created_at"
-        " FROM event WHERE story_id = ?"
-        " ORDER BY COALESCE(occurred_on, substr(created_at, 1, 10)) ASC,"
-        " id ASC", (story_id,)).fetchall()
+        " FROM event WHERE story_id = %s"
+        " ORDER BY COALESCE(occurred_on,"
+        "   (created_at AT TIME ZONE 'utc')::date) ASC, id ASC",
+        (story_id,))
+    event_rows = await cur.fetchall()
     events = [
         ThreadEventRef(id=r["id"], title=r["title"],
                        event_type=r["event_type"],
@@ -106,33 +113,35 @@ def get_thread_detail(conn: sqlite3.Connection,
                         doc_count=row["doc_count"] or 0,
                         updated_at=row["updated_at"]),
         events=events,
-        entities=entities_for_events(conn, [e.id for e in events]),
+        entities=await entities_for_events(conn, [e.id for e in events]),
         summary=row["summary_text"])
 
 
-def events_for_entity(conn: sqlite3.Connection, entity_id: int,
-                      limit: int = 10) -> list[EntityEventRef]:
+async def events_for_entity(conn: psycopg.AsyncConnection, entity_id: int,
+                            limit: int = 10) -> list[EntityEventRef]:
     """Most recent events whose member documents mention the entity."""
-    rows = conn.execute(
+    cur = await conn.execute(
         "SELECT DISTINCT ev.id, ev.title, ev.event_type, ev.occurred_on,"
-        " ev.created_at"
+        " COALESCE(ev.occurred_on,"
+        "   (ev.created_at AT TIME ZONE 'utc')::date) AS day"
         " FROM event ev JOIN event_assignment ea ON ea.event_id = ev.id"
         " WHERE ea.document_id IN"
-        "   (SELECT document_id FROM entity_mention WHERE entity_id = ?)"
-        " ORDER BY COALESCE(ev.occurred_on, substr(ev.created_at, 1, 10))"
-        " DESC, ev.id DESC LIMIT ?",
-        (entity_id, limit)).fetchall()
+        "   (SELECT document_id FROM entity_mention WHERE entity_id = %s)"
+        " ORDER BY day DESC, ev.id DESC LIMIT %s",
+        (entity_id, limit))
     return [EntityEventRef(id=r["id"], title=r["title"],
                            event_type=r["event_type"],
-                           occurred_on=r["occurred_on"]) for r in rows]
+                           occurred_on=r["occurred_on"])
+            for r in await cur.fetchall()]
 
 
-def event_for_document(conn: sqlite3.Connection,
-                       document_id: int) -> DocumentEventRef | None:
+async def event_for_document(conn: psycopg.AsyncConnection,
+                             document_id: int) -> DocumentEventRef | None:
     """The event this document was clustered into (latest assignment wins)."""
-    row = conn.execute(
+    cur = await conn.execute(
         "SELECT e.id, e.title FROM event_assignment ea"
         " JOIN event e ON e.id = ea.event_id"
-        " WHERE ea.document_id = ? AND ea.event_id IS NOT NULL"
-        " ORDER BY ea.id DESC LIMIT 1", (document_id,)).fetchone()
+        " WHERE ea.document_id = %s AND ea.event_id IS NOT NULL"
+        " ORDER BY ea.id DESC LIMIT 1", (document_id,))
+    row = await cur.fetchone()
     return DocumentEventRef(id=row["id"], title=row["title"]) if row else None

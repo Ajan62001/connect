@@ -66,7 +66,7 @@ async def test_discover_filters_by_since_cursor():
     assert fetcher.calls == [PREVIEW_URL, PREVIEW_URL]
 
 
-async def test_poll_telegram_source_end_to_end(container):
+async def test_poll_telegram_source_end_to_end(container, db):
     pages = {
         PREVIEW_URL: ("text/html", FIXTURE.read_bytes()),
         PIB_CLARIFICATION_URL: html_page(
@@ -78,40 +78,40 @@ async def test_poll_telegram_source_end_to_end(container):
     container.pipeline.fetcher = fetcher
     adapter = TelegramAdapter(fetcher)
 
-    source = source_dao.insert(
-        container.db, name="PIB Fact Check tg", type_="telegram",
+    source = await source_dao.insert(
+        db, name="PIB Fact Check tg", type_="telegram",
         config={"channel": CHANNEL}, credibility_tier=1)
-    poller = SourcePoller(container.db, pipeline=container.pipeline,
+    poller = SourcePoller(container.pool, pipeline=container.pipeline,
                           adapters={"telegram": adapter})
 
-    status = await poller.poll_source(source)
+    status = await poller.poll_source(db, source)
     assert status == "ok: 2 new, 0 dup, 0 error"
 
-    doc = doc_dao.get_by_url(container.db, f"https://t.me/{CHANNEL}/4501")
+    doc = await doc_dao.get_by_url(db, f"https://t.me/{CHANNEL}/4501")
     assert doc is not None
     assert doc.media_type == "telegram"
     assert doc.author == CHANNEL
     assert doc.source_id == source.id
-    assert doc.published_at == "2026-06-10T08:00:00Z"
+    assert doc.published_at == "2026-06-10T08:00:00.000Z"
     assert doc.title.startswith(
         f"{CHANNEL}: A viral message circulating on WhatsApp")
     assert len(doc.title) == len(f"{CHANNEL}: ") + 80  # first 80 chars
 
     # the in-post official link became a document_link row and was followed
-    links = link_dao.list_for_document(container.db, doc.id)
+    links = await link_dao.list_for_document(db, doc.id)
     assert [l.url for l in links] == [PIB_CLARIFICATION_URL]
     assert links[0].is_official
     assert links[0].status == "fetched"
 
     # the roundup post's t.me self-link is stored but never auto-followed
-    roundup = doc_dao.get_by_url(
-        container.db, f"https://t.me/{CHANNEL}/4503")
+    roundup = await doc_dao.get_by_url(
+        db, f"https://t.me/{CHANNEL}/4503")
     assert roundup is not None
-    tg_links = link_dao.list_for_document(container.db, roundup.id)
+    tg_links = await link_dao.list_for_document(db, roundup.id)
     assert [l.url for l in tg_links] == [f"https://t.me/{CHANNEL}"]
     assert tg_links[0].status == "not_followed"
 
     # second poll: cursor (last_polled_at) filters everything out
-    polled = source_dao.get(container.db, source.id)
-    status = await poller.poll_source(polled)
+    polled = await source_dao.get(db, source.id)
+    status = await poller.poll_source(db, polled)
     assert status == "ok: 0 new, 0 dup, 0 error"

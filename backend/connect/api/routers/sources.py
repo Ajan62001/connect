@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 
-from connect.api.deps import get_container
+import psycopg
+
+from connect.api.deps import get_container, get_db
 from connect.domain.models import (
     JobAccepted,
     SampleItem,
@@ -28,19 +30,19 @@ def _validate_config(type_: str, config: dict) -> None:
 
 
 @router.get("", response_model=list[Source])
-async def list_sources(container: Container = Depends(get_container)):
-    return source_dao.list_all(container.db)
+async def list_sources(db: psycopg.AsyncConnection = Depends(get_db)):
+    return await source_dao.list_all(db)
 
 
 @router.post("", response_model=Source, status_code=201)
 async def create_source(body: SourceCreate,
-                        container: Container = Depends(get_container)):
+                        db: psycopg.AsyncConnection = Depends(get_db)):
     _validate_config(body.type, body.config)
-    if source_dao.get_by_name(container.db, body.name) is not None:
+    if await source_dao.get_by_name(db, body.name) is not None:
         raise HTTPException(status_code=409,
                             detail=f"source named {body.name!r} already exists")
-    return source_dao.insert(
-        container.db, name=body.name, type_=body.type, config=body.config,
+    return await source_dao.insert(
+        db, name=body.name, type_=body.type, config=body.config,
         credibility_tier=body.credibility_tier, notes=body.notes,
         enabled=body.enabled, t1_exempt=body.t1_exempt)
 
@@ -71,8 +73,8 @@ async def test_source(body: SourceTestRequest,
 
 @router.get("/{source_id}", response_model=Source)
 async def get_source(source_id: int,
-                     container: Container = Depends(get_container)):
-    source = source_dao.get(container.db, source_id)
+                     db: psycopg.AsyncConnection = Depends(get_db)):
+    source = await source_dao.get(db, source_id)
     if source is None:
         raise HTTPException(status_code=404, detail="source not found")
     return source
@@ -80,40 +82,36 @@ async def get_source(source_id: int,
 
 @router.patch("/{source_id}", response_model=Source)
 async def patch_source(source_id: int, body: SourceUpdate,
-                       container: Container = Depends(get_container)):
-    existing = source_dao.get(container.db, source_id)
+                       db: psycopg.AsyncConnection = Depends(get_db)):
+    existing = await source_dao.get(db, source_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="source not found")
     fields = body.model_dump(exclude_unset=True)
     if "config" in fields and fields["config"] is not None:
         _validate_config(existing.type, fields["config"])
-    return source_dao.update(container.db, source_id, fields)
+    return await source_dao.update(db, source_id, fields)
 
 
 @router.delete("/{source_id}", status_code=204, response_class=Response)
 async def delete_source(source_id: int,
-                        container: Container = Depends(get_container)):
-    if not source_dao.delete(container.db, source_id):
+                        db: psycopg.AsyncConnection = Depends(get_db)):
+    if not await source_dao.delete(db, source_id):
         raise HTTPException(status_code=404, detail="source not found")
     return Response(status_code=204)
 
 
 @router.post("/{source_id}/poll", response_model=JobAccepted, status_code=202)
 async def poll_source(source_id: int,
-                      container: Container = Depends(get_container)):
-    source = source_dao.get(container.db, source_id)
+                      container: Container = Depends(get_container),
+                      db: psycopg.AsyncConnection = Depends(get_db)):
+    source = await source_dao.get(db, source_id)
     if source is None:
         raise HTTPException(status_code=404, detail="source not found")
     if source.type not in POLLABLE_TYPES:
         raise HTTPException(
             status_code=400,
             detail=f"source type {source.type!r} is not pollable")
-    poller = container.poller
     jobs = container.jobs
-    assert poller is not None and jobs is not None
-
-    async def _run():
-        return await poller.poll_source(source)
-
-    job_id = jobs.submit("poll_source", {"source_id": source_id}, _run)
+    assert container.poller is not None and jobs is not None
+    job_id = await jobs.enqueue("poll_source", {"source_id": source_id})
     return JobAccepted(job_id=job_id)

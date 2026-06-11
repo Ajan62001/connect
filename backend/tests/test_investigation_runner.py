@@ -7,8 +7,8 @@ cancel mid-loop, and per-turn 'investigation' ledger rows."""
 from __future__ import annotations
 
 import asyncio
-import json
 
+from dbutil import q1, qall, qv
 from kb_factories import insert_doc
 from mock_llm import MockProvider, tool_turn
 
@@ -46,26 +46,32 @@ def make_provider(turns, *, usage=None) -> MockProvider:
 
 def make_service(container, provider, *, daily_budget=10.0,
                  reserve=0.0) -> InvestigationService:
-    return InvestigationService(
-        container.db, jobs=container.jobs, provider=provider,
-        governor=Governor(container.db, daily_budget,
+    service = InvestigationService(
+        container.pool, jobs=container.jobs, provider=provider,
+        governor=Governor(container.pool, daily_budget,
                           purposes=INVESTIGATION_PURPOSES),
         search=container.search_client, ingest=container.pipeline,
         embedder=container.embedder, vectors=container.vectors,
         synthesis_reserve_usd=reserve, synthesis_tier="balanced")
+    # the registered 'investigation' handler dispatches through the
+    # composition root — point it at THIS service (the closure used to
+    # capture it; the registry resolves it from services instead)
+    container.investigations = service
+    return service
 
 
 async def run_to_completion(container, service, seed, options):
-    dossier_id, job_id = service.start(seed, options)
+    dossier_id, job_id = await service.start(seed, options)
     await asyncio.gather(*list(container.jobs._tasks),
                          return_exceptions=True)
     return dossier_id, job_id
 
 
-def events_of(conn, job_id):
-    return [(r["type"], json.loads(r["data"] or "{}")) for r in conn.execute(
-        "SELECT type, data FROM job_event WHERE job_id = ? ORDER BY seq",
-        (job_id,))]
+async def events_of(conn, job_id):
+    return [(r["type"], r["data"] or {}) for r in await qall(
+        conn,
+        "SELECT type, data FROM job_event WHERE job_id = %s ORDER BY seq",
+        job_id)]
 
 
 def tools_calls(provider):
@@ -75,9 +81,11 @@ def tools_calls(provider):
 # --- happy path: findings + question lifecycle ------------------------------------
 
 
-async def test_loop_records_findings_and_resolves_questions(container):
-    conn = container.db
-    doc_id = insert_doc(conn, title="RBI tightens rules", text=DOC_TEXT)
+async def test_loop_records_findings_and_resolves_questions(container,
+                                                             db):
+    conn = db
+    doc_id = await insert_doc(conn, title="RBI tightens rules",
+                              text=DOC_TEXT)
     turns = [
         tool_turn(("search_corpus", {"query": "rbi rules"})),
         tool_turn(("record_finding", {
@@ -98,59 +106,62 @@ async def test_loop_records_findings_and_resolves_questions(container):
         container, service, InvestigationSeed(topic="rbi rules"),
         InvestigationOptions(budget_usd=1.0, max_iterations=10))
 
-    row = conn.execute("SELECT * FROM dossier WHERE id = ?",
-                       (dossier_id,)).fetchone()
+    row = await q1(conn, "SELECT * FROM dossier WHERE id = %s",
+                   dossier_id)
     assert row["status"] == "completed"
     assert row["kind"] == "investigation"
     assert row["input_type"] == "topic"
 
     # question lifecycle: open (generated) -> partial (finding) -> answered
-    q = conn.execute("SELECT * FROM question WHERE id = 1").fetchone()
+    q = await q1(conn, "SELECT * FROM question WHERE id = 1")
     assert q["status"] == "answered"
     assert q["answer_summary"] == "the fraud wave"
-    assert json.loads(q["answer_finding_ids"]) == [1]
+    assert q["answer_finding_ids"] == [1]
 
-    finding = conn.execute("SELECT * FROM finding WHERE id = 1").fetchone()
+    finding = await q1(conn, "SELECT * FROM finding WHERE id = 1")
     assert finding["kind"] == "trigger"
-    assert conn.execute("SELECT quote FROM finding_evidence WHERE"
-                        " finding_id = 1").fetchone()[0] == QUOTE
+    assert await qv(conn, "SELECT quote FROM finding_evidence WHERE"
+                          " finding_id = 1") == QUOTE
 
     # SSE rows: question_raised -> iteration* -> finding_recorded ->
     # question_resolved -> section_completed* -> done
-    names = [t for t, _ in events_of(conn, job_id)]
+    events = await events_of(conn, job_id)
+    names = [t for t, _ in events]
     for expected in ("question_raised", "iteration", "finding_recorded",
                      "question_resolved", "section_completed", "done"):
         assert expected in names
     assert names.index("question_raised") < names.index("finding_recorded")
     assert names.index("finding_recorded") < names.index(
         "question_resolved")
-    iter_events = [d for t, d in events_of(conn, job_id)
-                   if t == "iteration"]
+    iter_events = [d for t, d in events if t == "iteration"]
     assert [e["n"] for e in iter_events] == [1, 2, 3]
     assert iter_events[0]["tools"] == ["search_corpus"]
     assert iter_events[-1]["cost_so_far"] > 0
 
     # every loop turn ledgered under the investigation purpose
-    assert conn.execute(
+    assert await qv(
+        conn,
         "SELECT COUNT(*) FROM llm_call WHERE purpose = 'investigation'",
-    ).fetchone()[0] == 4  # 1 question-gen + 3 loop turns
-    assert conn.execute(
-        "SELECT COUNT(*) FROM llm_call WHERE purpose ="
-        " 'investigation_synthesis'").fetchone()[0] == 1
+    ) == 4  # 1 question-gen + 3 loop turns
+    assert await qv(
+        conn, "SELECT COUNT(*) FROM llm_call WHERE purpose ="
+              " 'investigation_synthesis'") == 1
 
     # all sections persisted
-    stages = {r["stage"]: r["status"] for r in conn.execute(
-        "SELECT stage, status FROM dossier_section WHERE dossier_id = ?",
-        (dossier_id,))}
+    stages = {r["stage"]: r["status"] for r in await qall(
+        conn,
+        "SELECT stage, status FROM dossier_section WHERE dossier_id = %s",
+        dossier_id)}
     for stage in ("scope", "investigate", "synthesize", "timeline",
                   "causal_narrative", "actors", "alternatives",
                   "open_questions", "watch_next"):
         assert stages[stage] == "completed", stage
 
     # invalid quote rejection counter stays zero on the happy path
-    investigate = json.loads(conn.execute(
-        "SELECT content FROM dossier_section WHERE dossier_id = ?"
-        " AND stage = 'investigate'", (dossier_id,)).fetchone()[0])
+    investigate = await qv(
+        conn,
+        "SELECT content FROM dossier_section WHERE dossier_id = %s"
+        " AND stage = 'investigate'", dossier_id)
     assert investigate["concluded"] is True
     assert investigate["rejected_findings"] == 0
 
@@ -158,9 +169,10 @@ async def test_loop_records_findings_and_resolves_questions(container):
 # --- degrade ladder ------------------------------------------------------------------
 
 
-async def test_degrade_ladder_corpus_only_then_forced_conclude(container):
-    conn = container.db
-    insert_doc(conn, title="doc", text=DOC_TEXT)
+async def test_degrade_ladder_corpus_only_then_forced_conclude(container,
+                                                                db):
+    conn = db
+    await insert_doc(conn, title="doc", text=DOC_TEXT)
     # expensive turns: ~$0.15 each on sonnet (40k in / 2k out)
     usage = Usage(input_tokens=40_000, output_tokens=2_000)
 
@@ -181,9 +193,9 @@ async def test_degrade_ladder_corpus_only_then_forced_conclude(container):
         container, service, InvestigationSeed(topic="budget drill"),
         InvestigationOptions(budget_usd=0.50, max_iterations=10))
 
-    assert conn.execute("SELECT status FROM dossier WHERE id = ?",
-                        (dossier_id,)).fetchone()[0] == "completed"
-    iter_events = [d for t, d in events_of(conn, job_id)
+    assert await qv(conn, "SELECT status FROM dossier WHERE id = %s",
+                    dossier_id) == "completed"
+    iter_events = [d for t, d in await events_of(conn, job_id)
                    if t == "iteration"]
     # qgen ($0.15, 30%) + turn1 -> 60% flips corpus_only before turn 2,
     # 85% forces conclude on turn 3
@@ -201,8 +213,8 @@ async def test_degrade_ladder_corpus_only_then_forced_conclude(container):
     assert "corpus-only" in block["content"]
 
 
-async def test_forced_conclude_on_max_iterations(container):
-    conn = container.db
+async def test_forced_conclude_on_max_iterations(container, db):
+    conn = db
 
     def scripted(record):
         if record["tool_choice"] == "conclude":
@@ -220,19 +232,20 @@ async def test_forced_conclude_on_max_iterations(container):
     calls = tools_calls(provider)
     assert len(calls) == 3
     assert [c["tool_choice"] for c in calls] == [None, None, "conclude"]
-    assert conn.execute("SELECT status FROM dossier WHERE id = ?",
-                        (dossier_id,)).fetchone()[0] == "completed"
-    investigate = json.loads(conn.execute(
-        "SELECT content FROM dossier_section WHERE dossier_id = ?"
-        " AND stage = 'investigate'", (dossier_id,)).fetchone()[0])
+    assert await qv(conn, "SELECT status FROM dossier WHERE id = %s",
+                    dossier_id) == "completed"
+    investigate = await qv(
+        conn,
+        "SELECT content FROM dossier_section WHERE dossier_id = %s"
+        " AND stage = 'investigate'", dossier_id)
     assert investigate["concluded"] is True
     assert investigate["iterations"] == 3
 
 
-async def test_daily_governor_exhaustion_forces_conclude(container):
+async def test_daily_governor_exhaustion_forces_conclude(container, db):
     """The SEPARATE daily governor trips mid-run -> one last forced
     conclude instead of a crash."""
-    conn = container.db
+    conn = db
 
     def scripted(record):
         if record["tool_choice"] == "conclude":
@@ -250,12 +263,13 @@ async def test_daily_governor_exhaustion_forces_conclude(container):
 
     calls = tools_calls(provider)
     assert calls[0]["tool_choice"] == "conclude"  # forced from turn 1
-    assert conn.execute("SELECT status FROM dossier WHERE id = ?",
-                        (dossier_id,)).fetchone()[0] == "completed"
+    assert await qv(conn, "SELECT status FROM dossier WHERE id = %s",
+                    dossier_id) == "completed"
 
 
-async def test_end_turn_without_tools_forces_conclude_next(container):
-    conn = container.db
+async def test_end_turn_without_tools_forces_conclude_next(container,
+                                                            db):
+    conn = db
 
     def scripted(record):
         if record["tool_choice"] == "conclude":
@@ -275,8 +289,8 @@ async def test_end_turn_without_tools_forces_conclude_next(container):
     # the nudge message is in the forced turn's transcript
     nudge = calls[1]["messages"][-1]["content"]
     assert "conclude" in nudge
-    assert conn.execute("SELECT status FROM dossier WHERE id = ?",
-                        (dossier_id,)).fetchone()[0] == "completed"
+    assert await qv(conn, "SELECT status FROM dossier WHERE id = %s",
+                    dossier_id) == "completed"
 
 
 # --- cancel mid-loop ------------------------------------------------------------------
@@ -288,41 +302,41 @@ class HangingToolsProvider(MockProvider):
         return await super().complete_with_tools(**kwargs)
 
 
-async def test_cancel_mid_loop(container):
-    conn = container.db
+async def test_cancel_mid_loop(container, db):
+    conn = db
     provider = HangingToolsProvider(
         respond_by_schema={GeneratedQuestions: QGEN,
                            SynthesisOutput: SYNTH})
     service = make_service(container, provider)
-    dossier_id, job_id = service.start(
+    dossier_id, job_id = await service.start(
         InvestigationSeed(topic="cancel drill"),
         InvestigationOptions(budget_usd=1.0))
 
     for _ in range(200):  # let the job start and hang on the first turn
         await asyncio.sleep(0.01)
-        row = conn.execute("SELECT status FROM dossier WHERE id = ?",
-                           (dossier_id,)).fetchone()
+        row = await q1(conn, "SELECT status FROM dossier WHERE id = %s",
+                       dossier_id)
         if row["status"] == "running" and provider.calls:
             break
     assert row["status"] == "running"
 
-    assert service.cancel(dossier_id) is True
+    assert await service.cancel(dossier_id) is True
     await asyncio.gather(*list(container.jobs._tasks),
                          return_exceptions=True)
-    assert conn.execute("SELECT status FROM dossier WHERE id = ?",
-                        (dossier_id,)).fetchone()[0] == "cancelled"
-    assert conn.execute("SELECT status FROM job WHERE id = ?",
-                        (job_id,)).fetchone()[0] == "cancelled"
+    assert await qv(conn, "SELECT status FROM dossier WHERE id = %s",
+                    dossier_id) == "cancelled"
+    assert await qv(conn, "SELECT status FROM job WHERE id = %s",
+                    job_id) == "cancelled"
     # cancelling a terminal run is a no-op
-    assert service.cancel(dossier_id) is False
+    assert await service.cancel(dossier_id) is False
 
 
 # --- rejected finding surfaces as is_error and is counted ------------------------------
 
 
-async def test_invalid_quote_round_trips_as_is_error(container):
-    conn = container.db
-    doc_id = insert_doc(conn, title="doc", text=DOC_TEXT)
+async def test_invalid_quote_round_trips_as_is_error(container, db):
+    conn = db
+    doc_id = await insert_doc(conn, title="doc", text=DOC_TEXT)
 
     def scripted(record):
         if record["tool_choice"] == "conclude":
@@ -351,10 +365,11 @@ async def test_invalid_quote_round_trips_as_is_error(container):
     assert rejection["is_error"] is True
     assert "not a verbatim substring" in rejection["content"]
     # the retry (turn 2) landed; only ONE finding row exists
-    assert conn.execute("SELECT COUNT(*) FROM finding").fetchone()[0] == 1
-    investigate = json.loads(conn.execute(
-        "SELECT content FROM dossier_section WHERE dossier_id = ?"
-        " AND stage = 'investigate'", (dossier_id,)).fetchone()[0])
+    assert await qv(conn, "SELECT COUNT(*) FROM finding") == 1
+    investigate = await qv(
+        conn,
+        "SELECT content FROM dossier_section WHERE dossier_id = %s"
+        " AND stage = 'investigate'", dossier_id)
     assert investigate["rejected_findings"] == 1
     assert investigate["findings_recorded"] == 1
 

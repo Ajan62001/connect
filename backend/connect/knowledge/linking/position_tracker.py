@@ -24,12 +24,12 @@ stale=True, never an error.
 
 from __future__ import annotations
 
-import json
+
 import logging
 import re
-import sqlite3
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
+import psycopg
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from connect.domain.models import EvolutionSummary
@@ -37,7 +37,9 @@ from connect.llm import spend
 from connect.llm.provider import LLMError, LLMProvider
 from connect.llm.spend import BudgetExceeded, Governor
 from connect.llm.tiers import ModelTier
-from connect.storage.db import utc_now
+from connect.storage.pg import Jsonb, utc_now
+
+_Row = Mapping[str, Any]
 
 log = logging.getLogger(__name__)
 
@@ -114,34 +116,34 @@ class EvolutionSummaryOut(BaseModel):
 # -- shift detection ------------------------------------------------------------------
 
 
-def _topics_of(row: sqlite3.Row) -> list[str]:
-    try:
-        topics = json.loads(row["topics"] or "[]")
-    except (ValueError, TypeError):
+def _topics_of(row: _Row) -> list[str]:
+    topics = row["topics"]
+    if not isinstance(topics, list):
         return []
     return [t for t in topics if isinstance(t, str)]
 
 
-def _prior_statements(conn: sqlite3.Connection, *, entity_id: int,
-                      topic: str, before: sqlite3.Row,
-                      limit: int = MAX_PRIOR_STATEMENTS) -> list[sqlite3.Row]:
+async def _prior_statements(conn: psycopg.AsyncConnection, *,
+                            entity_id: int, topic: str, before: _Row,
+                            limit: int = MAX_PRIOR_STATEMENTS) -> list[_Row]:
     """Up to ``limit`` prior statements by the speaker on the topic, from
     OTHER documents, chronological (oldest first)."""
-    rows = conn.execute(
+    cur = await conn.execute(
         "SELECT s.id, s.quote, s.position_summary, s.stated_at"
         " FROM statement s"
-        " WHERE s.entity_id = ? AND s.document_id != ?"
-        " AND EXISTS (SELECT 1 FROM json_each(s.topics) je"
-        "             WHERE je.value = ?)"
-        " AND (s.stated_at < ? OR (s.stated_at = ? AND s.id < ?))"
-        " ORDER BY s.stated_at DESC, s.id DESC LIMIT ?",
+        " WHERE s.entity_id = %s AND s.document_id != %s"
+        " AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(s.topics) je"
+        "             WHERE je.value = %s)"
+        " AND (s.stated_at < %s OR (s.stated_at = %s AND s.id < %s))"
+        " ORDER BY s.stated_at DESC, s.id DESC LIMIT %s",
         (entity_id, before["document_id"], topic, before["stated_at"],
-         before["stated_at"], before["id"], limit)).fetchall()
+         before["stated_at"], before["id"], limit))
+    rows = await cur.fetchall()
     return list(reversed(rows))
 
 
-def _shift_message(speaker: str, topic: str, new: sqlite3.Row,
-                   priors: list[sqlite3.Row]) -> str:
+def _shift_message(speaker: str, topic: str, new: _Row,
+                   priors: list[_Row]) -> str:
     lines = [f"SPEAKER: {speaker}", f"TOPIC: {topic}", "",
              "PRIOR STATEMENTS (chronological; cite by id):"]
     for p in priors:
@@ -157,15 +159,17 @@ def _shift_message(speaker: str, topic: str, new: sqlite3.Row,
     return "\n".join(lines)
 
 
-def _open_shift_exists(conn: sqlite3.Connection, a: int, b: int) -> bool:
-    return conn.execute(
+async def _open_shift_exists(conn: psycopg.AsyncConnection, a: int,
+                             b: int) -> bool:
+    cur = await conn.execute(
         "SELECT 1 FROM position_shift WHERE status = 'open'"
-        " AND ((from_statement_id = ? AND to_statement_id = ?)"
-        "   OR (from_statement_id = ? AND to_statement_id = ?))",
-        (a, b, b, a)).fetchone() is not None
+        " AND ((from_statement_id = %s AND to_statement_id = %s)"
+        "   OR (from_statement_id = %s AND to_statement_id = %s))",
+        (a, b, b, a))
+    return await cur.fetchone() is not None
 
 
-async def detect_shifts(conn: sqlite3.Connection,
+async def detect_shifts(conn: psycopg.AsyncConnection,
                         provider: LLMProvider | None, governor: Governor,
                         document_id: int) -> dict[str, Any]:
     """Run shift detection for every (speaker, topic) pair that gained a
@@ -176,26 +180,27 @@ async def detect_shifts(conn: sqlite3.Connection,
                              "halted_budget": False}
     if provider is None:
         return stats
-    new_rows = conn.execute(
+    cur = await conn.execute(
         "SELECT s.id, s.document_id, s.entity_id, s.quote,"
         " s.position_summary, s.stated_at, s.topics, e.name AS speaker"
         " FROM statement s JOIN entity e ON e.id = s.entity_id"
-        " WHERE s.document_id = ? ORDER BY s.id", (document_id,)).fetchall()
+        " WHERE s.document_id = %s ORDER BY s.id", (document_id,))
+    new_rows = await cur.fetchall()
     # one probe per (speaker, topic): the doc's newest statement for the pair
-    probes: dict[tuple[int, str], sqlite3.Row] = {}
+    probes: dict[tuple[int, str], _Row] = {}
     for row in new_rows:
         for topic in _topics_of(row):
             probes[(row["entity_id"], topic)] = row
 
     model = provider.model_for(ModelTier.FAST)
     for (entity_id, topic), new in probes.items():
-        priors = _prior_statements(conn, entity_id=entity_id, topic=topic,
-                                   before=new)
+        priors = await _prior_statements(conn, entity_id=entity_id,
+                                         topic=topic, before=new)
         if not priors:
             continue
         stats["pairs"] += 1
         try:
-            governor.check(spend.cost_usd(
+            await governor.check(spend.cost_usd(
                 model, input_tokens=EST_SHIFT_INPUT_TOKENS,
                 output_tokens=EST_SHIFT_OUTPUT_TOKENS))
         except BudgetExceeded as e:
@@ -214,8 +219,9 @@ async def detect_shifts(conn: sqlite3.Connection,
             log.warning("shift judgment failed (entity %s, topic %s): %s",
                         entity_id, topic, e)
             continue
-        spend.record_call(conn, purpose=PURPOSE_POSITION,
-                          model=completion.model, usage=completion.usage)
+        await spend.record_call(conn, purpose=PURPOSE_POSITION,
+                                model=completion.model,
+                                usage=completion.usage)
         stats["calls"] += 1
         verdict = completion.output
         if verdict.relation not in ("shifted", "reversed"):
@@ -226,14 +232,15 @@ async def detect_shifts(conn: sqlite3.Connection,
                         verdict.versus_statement_id, entity_id, topic)
             stats["rejected_versus"] += 1
             continue
-        if _open_shift_exists(conn, verdict.versus_statement_id, new["id"]):
+        if await _open_shift_exists(conn, verdict.versus_statement_id,
+                                    new["id"]):
             stats["skipped_duplicate"] += 1
             continue
-        with conn:
-            conn.execute(
+        async with conn.transaction():
+            await conn.execute(
                 "INSERT INTO position_shift (entity_id, topic,"
                 " from_statement_id, to_statement_id, kind, note,"
-                " detected_at, status) VALUES (?,?,?,?,?,?,?, 'open')",
+                " detected_at, status) VALUES (%s,%s,%s,%s,%s,%s,%s, 'open')",
                 (entity_id, topic, verdict.versus_statement_id, new["id"],
                  verdict.relation, verdict.note or None, utc_now()))
         stats["shifts"] += 1
@@ -243,71 +250,73 @@ async def detect_shifts(conn: sqlite3.Connection,
 # -- evolution summaries ----------------------------------------------------------------
 
 
-def statement_count(conn: sqlite3.Connection, entity_id: int,
-                    topic: str) -> int:
-    return int(conn.execute(
-        "SELECT COUNT(*) FROM statement s WHERE s.entity_id = ?"
-        " AND EXISTS (SELECT 1 FROM json_each(s.topics) je"
-        "             WHERE je.value = ?)", (entity_id, topic)).fetchone()[0])
+async def statement_count(conn: psycopg.AsyncConnection, entity_id: int,
+                          topic: str) -> int:
+    cur = await conn.execute(
+        "SELECT COUNT(*) AS n FROM statement s WHERE s.entity_id = %s"
+        " AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(s.topics) je"
+        "             WHERE je.value = %s)", (entity_id, topic))
+    return int((await cur.fetchone())["n"])
 
 
-def _summary_row(conn: sqlite3.Connection, entity_id: int,
-                 topic: str) -> sqlite3.Row | None:
-    return conn.execute(
+async def _summary_row(conn: psycopg.AsyncConnection, entity_id: int,
+                       topic: str) -> _Row | None:
+    cur = await conn.execute(
         "SELECT text, citations, statement_count_at_gen, generated_at"
-        " FROM view_summary WHERE entity_id = ? AND topic = ?",
-        (entity_id, topic)).fetchone()
+        " FROM view_summary WHERE entity_id = %s AND topic = %s",
+        (entity_id, topic))
+    return await cur.fetchone()
 
 
-def is_stale(conn: sqlite3.Connection, entity_id: int, topic: str, *,
-             count: int | None = None) -> bool:
+async def is_stale(conn: psycopg.AsyncConnection, entity_id: int,
+                   topic: str, *, count: int | None = None) -> bool:
     """Staleness: no cached summary, the statement count grew by
     >= STALE_STATEMENT_GROWTH since generation, or a shift was detected
     after generated_at."""
-    row = _summary_row(conn, entity_id, topic)
+    row = await _summary_row(conn, entity_id, topic)
     if row is None or not row["generated_at"]:
         return True
     if count is None:
-        count = statement_count(conn, entity_id, topic)
+        count = await statement_count(conn, entity_id, topic)
     if count >= (row["statement_count_at_gen"] or 0) + STALE_STATEMENT_GROWTH:
         return True
-    return conn.execute(
-        "SELECT 1 FROM position_shift WHERE entity_id = ? AND topic = ?"
-        " AND detected_at > ? LIMIT 1",
-        (entity_id, topic, row["generated_at"])).fetchone() is not None
+    cur = await conn.execute(
+        "SELECT 1 FROM position_shift WHERE entity_id = %s AND topic = %s"
+        " AND detected_at > %s LIMIT 1",
+        (entity_id, topic, row["generated_at"]))
+    return await cur.fetchone() is not None
 
 
-def _to_summary(row: sqlite3.Row, *, stale: bool) -> EvolutionSummary | None:
+def _to_summary(row: _Row, *, stale: bool) -> EvolutionSummary | None:
     if row is None or not row["generated_at"]:
         return None
-    try:
-        citations = [int(c) for c in json.loads(row["citations"] or "[]")]
-    except (ValueError, TypeError):
-        citations = []
+    raw = row["citations"]
+    citations = ([int(c) for c in raw] if isinstance(raw, list) else [])
     return EvolutionSummary(text=row["text"] or "", citations=citations,
                             generated_at=row["generated_at"], stale=stale)
 
 
-def _summary_menu(conn: sqlite3.Connection, entity_id: int,
-                  topic: str) -> list[sqlite3.Row]:
+async def _summary_menu(conn: psycopg.AsyncConnection, entity_id: int,
+                        topic: str) -> list[_Row]:
     """The closed statement menu: most recent MAX_SUMMARY_STATEMENTS for the
     (entity, topic) pair, chronological (oldest first)."""
-    rows = conn.execute(
+    cur = await conn.execute(
         "SELECT s.id, s.quote, s.position_summary, s.stated_at,"
         " src.name AS source_name"
         " FROM statement s"
         " JOIN document d ON d.id = s.document_id"
         " LEFT JOIN source src ON src.id = d.source_id"
-        " WHERE s.entity_id = ?"
-        " AND EXISTS (SELECT 1 FROM json_each(s.topics) je"
-        "             WHERE je.value = ?)"
-        " ORDER BY s.stated_at DESC, s.id DESC LIMIT ?",
-        (entity_id, topic, MAX_SUMMARY_STATEMENTS)).fetchall()
+        " WHERE s.entity_id = %s"
+        " AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(s.topics) je"
+        "             WHERE je.value = %s)"
+        " ORDER BY s.stated_at DESC, s.id DESC LIMIT %s",
+        (entity_id, topic, MAX_SUMMARY_STATEMENTS))
+    rows = await cur.fetchall()
     return list(reversed(rows))
 
 
 def _summary_message(speaker: str, topic: str,
-                     menu: list[sqlite3.Row]) -> str:
+                     menu: list[_Row]) -> str:
     lines = [f"SPEAKER: {speaker}", f"TOPIC: {topic}", "",
              "STATEMENTS (chronological; cite as [[s<id>]]):"]
     for m in menu:
@@ -352,23 +361,23 @@ def validate_markers(text: str, allowed_ids: set[int],
     return cleaned, citations, invalid
 
 
-async def get_view_summary(conn: sqlite3.Connection,
+async def get_view_summary(conn: psycopg.AsyncConnection,
                            provider: LLMProvider | None, governor: Governor,
                            entity_id: int, topic: str,
                            ) -> EvolutionSummary | None:
     """The (entity, topic) evolution summary — cached; regenerated lazily
     when stale. Returns None when there are no statements and no cache; a
     governor block / missing provider serves the stale cache (stale=True)."""
-    count = statement_count(conn, entity_id, topic)
-    cached = _summary_row(conn, entity_id, topic)
-    if not is_stale(conn, entity_id, topic, count=count):
+    count = await statement_count(conn, entity_id, topic)
+    cached = await _summary_row(conn, entity_id, topic)
+    if not await is_stale(conn, entity_id, topic, count=count):
         return _to_summary(cached, stale=False)
     if count == 0 or provider is None:
         return _to_summary(cached, stale=True)
 
     model = provider.model_for(ModelTier.FAST)
     try:
-        governor.check(spend.cost_usd(
+        await governor.check(spend.cost_usd(
             model, input_tokens=EST_SUMMARY_INPUT_TOKENS,
             output_tokens=EST_SUMMARY_OUTPUT_TOKENS))
     except BudgetExceeded as e:
@@ -376,11 +385,12 @@ async def get_view_summary(conn: sqlite3.Connection,
                     " (entity %s, topic %s): %s", entity_id, topic, e)
         return _to_summary(cached, stale=True)
 
-    speaker = conn.execute("SELECT name FROM entity WHERE id = ?",
-                           (entity_id,)).fetchone()
+    cur = await conn.execute("SELECT name FROM entity WHERE id = %s",
+                             (entity_id,))
+    speaker = await cur.fetchone()
     if speaker is None:
         return None
-    menu = _summary_menu(conn, entity_id, topic)
+    menu = await _summary_menu(conn, entity_id, topic)
     try:
         completion = await provider.complete_structured(
             system=SUMMARY_SYSTEM,
@@ -392,8 +402,8 @@ async def get_view_summary(conn: sqlite3.Connection,
         log.warning("view summary generation failed (entity %s, topic %s):"
                     " %s", entity_id, topic, e)
         return _to_summary(cached, stale=True)
-    spend.record_call(conn, purpose=PURPOSE_POSITION,
-                      model=completion.model, usage=completion.usage)
+    await spend.record_call(conn, purpose=PURPOSE_POSITION,
+                            model=completion.model, usage=completion.usage)
 
     text, citations, invalid = validate_markers(
         completion.output.text, {m["id"] for m in menu})
@@ -402,12 +412,16 @@ async def get_view_summary(conn: sqlite3.Connection,
                     " (entity %s, topic %s) — markers stripped",
                     invalid, entity_id, topic)
     generated_at = utc_now()
-    with conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO view_summary (entity_id, topic, text,"
+    async with conn.transaction():
+        await conn.execute(
+            "INSERT INTO view_summary (entity_id, topic, text,"
             " citations, statement_count_at_gen, generated_at)"
-            " VALUES (?,?,?,?,?,?)",
-            (entity_id, topic, text, json.dumps(citations), count,
+            " VALUES (%s,%s,%s,%s,%s,%s)"
+            " ON CONFLICT (entity_id, topic) DO UPDATE SET"
+            " text = EXCLUDED.text, citations = EXCLUDED.citations,"
+            " statement_count_at_gen = EXCLUDED.statement_count_at_gen,"
+            " generated_at = EXCLUDED.generated_at",
+            (entity_id, topic, text, Jsonb(citations), count,
              generated_at))
     return EvolutionSummary(text=text, citations=citations,
                             generated_at=generated_at, stale=False)

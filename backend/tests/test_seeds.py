@@ -21,25 +21,25 @@ def test_all_seed_configs_validate():
         parse_source_config(seed["type"], seed["config"])  # must not raise
 
 
-def test_seeding_is_idempotent(container):
+async def test_seeding_is_idempotent(container, db):
     # container.startup() already seeded once
-    before = {s.name: s.id for s in source_dao.list_all(container.db)}
+    before = {s.name: s.id for s in await source_dao.list_all(db)}
     assert NEW_SEED_NAMES <= set(before)
 
-    assert seed_sources(container.db) == 0  # nothing added on re-seed
-    after = {s.name: s.id for s in source_dao.list_all(container.db)}
+    assert await seed_sources(db) == 0  # nothing added on re-seed
+    after = {s.name: s.id for s in await source_dao.list_all(db)}
     assert after == before
 
     # a user edit survives re-seeding (match is by name, not overwrite)
-    gov = source_dao.get_by_name(container.db, "X — Government institutional")
-    source_dao.update(container.db, gov.id, {"credibility_tier": 2})
-    assert seed_sources(container.db) == 0
-    assert source_dao.get(container.db, gov.id).credibility_tier == 2
+    gov = await source_dao.get_by_name(db, "X — Government institutional")
+    await source_dao.update(db, gov.id, {"credibility_tier": 2})
+    assert await seed_sources(db) == 0
+    assert (await source_dao.get(db, gov.id)).credibility_tier == 2
 
 
-def test_twitter_seed_rows(container):
-    gov = source_dao.get_by_name(
-        container.db, "X — Government institutional")
+async def test_twitter_seed_rows(container, db):
+    gov = await source_dao.get_by_name(
+        db, "X — Government institutional")
     assert gov.type == "twitter"
     assert gov.credibility_tier == 1
     assert gov.enabled is True  # relies on the graceful key-missing no-op
@@ -49,22 +49,45 @@ def test_twitter_seed_rows(container):
             "IncomeTaxIndia", "CimGOI"} <= set(handles)
     assert gov.config["poll_interval_minutes"] == 30
 
-    ministers = source_dao.get_by_name(
-        container.db, "X — Ministers personal")
+    ministers = await source_dao.get_by_name(
+        db, "X — Ministers personal")
     assert ministers.type == "twitter"
     assert ministers.credibility_tier == 2
     assert ministers.config["handles"] == [
         "narendramodi", "nsitharaman", "mppchaudhary"]
 
 
-def test_telegram_seed_rows(container):
+async def test_app_setting_budget_seeds(container, db):
+    """Locked budgets land in app_setting at startup (member $0.50/$2,
+    global backstop $10) — and an admin edit survives re-seeding."""
+    from connect.storage import app_settings as app_settings_dao
+
+    assert await app_settings_dao.get(
+        db, "member_daily_budget_usd") == "0.5"
+    assert await app_settings_dao.get(
+        db, "member_investigation_daily_budget_usd") == "2.0"
+    assert await app_settings_dao.get(
+        db, "global_daily_budget_usd") == "10.0"
+
+    # admin edit (the admin UI is the only writer) survives a restart's
+    # re-seed: ON CONFLICT DO NOTHING
+    await db.execute(
+        "UPDATE app_setting SET value = '25.0'"
+        " WHERE key = 'global_daily_budget_usd'")
+    assert await app_settings_dao.seed_defaults(
+        db, container.settings) == 0
+    assert await app_settings_dao.get(
+        db, "global_daily_budget_usd") == "25.0"
+
+
+async def test_telegram_seed_rows(container, db):
     expected = {
         "PIB Backgrounders (Telegram)": "PIB_Backgrounders",
         "PIB Fact Check (Telegram)": "PIB_FactCheck",
         "MIB India (Telegram)": "MIB_India",
     }
     for name, channel in expected.items():
-        seed = source_dao.get_by_name(container.db, name)
+        seed = await source_dao.get_by_name(db, name)
         assert seed.type == "telegram"
         assert seed.credibility_tier == 1
         assert seed.enabled is True

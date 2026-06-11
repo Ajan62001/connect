@@ -10,7 +10,7 @@ from kb_factories import insert_doc, insert_source, t1_doc
 
 from connect.api.main import create_app
 from connect.llm.spend import today_utc
-from connect.storage.db import utc_now
+from connect.storage.pg import utc_now
 
 ALL_SECTIONS = ("watch_dev", "thread_move", "contradiction",
                 "trending_claim", "suggestion", "position_shift")
@@ -23,41 +23,39 @@ def env(settings):
         yield client, app.state.container
 
 
-def add_watch(conn, label, query, *, last_seen_at=None):
-    with conn:
-        cur = conn.execute(
-            "INSERT INTO watch (kind, label, query_fts, last_seen_at,"
-            " created_at) VALUES ('topic', ?, ?, ?, ?)",
-            (label, query, last_seen_at, utc_now()))
-    return int(cur.lastrowid)
+async def add_watch(conn, label, query, *, last_seen_at=None):
+    cur = await conn.execute(
+        "INSERT INTO watch (kind, label, query_fts, last_seen_at,"
+        " created_at) VALUES ('topic', %s, %s, %s, %s) RETURNING id",
+        (label, query, last_seen_at, utc_now()))
+    return int((await cur.fetchone())["id"])
 
 
-def add_hit(conn, watch_id, doc_id, *, created_at=None):
-    with conn:
-        conn.execute(
-            "INSERT INTO watch_hit (watch_id, object_type, object_id,"
-            " created_at) VALUES (?, 'document', ?, ?)",
-            (watch_id, doc_id, created_at or utc_now()))
+async def add_hit(conn, watch_id, doc_id, *, created_at=None):
+    await conn.execute(
+        "INSERT INTO watch_hit (watch_id, object_type, object_id,"
+        " created_at) VALUES (%s, 'document', %s, %s)",
+        (watch_id, doc_id, created_at or utc_now()))
 
 
-def make_story_with_new_event(conn, *, title="Bill story", tier=1):
-    src = insert_source(conn, f"src-{title}", tier=tier)
-    doc = t1_doc(conn, title="Bill passed", source_id=src,
-                 event_type="bill_stage")
+async def make_story_with_new_event(conn, *, title="Bill story", tier=1):
+    src = await insert_source(conn, f"src-{title}", tier=tier)
+    doc = await t1_doc(conn, title="Bill passed", source_id=src,
+                       event_type="bill_stage")
     now = utc_now()
-    with conn:
-        cur = conn.execute(
-            "INSERT INTO story (title, status, doc_count, created_at,"
-            " updated_at) VALUES (?, 'active', 1, ?, ?)", (title, now, now))
-        story_id = int(cur.lastrowid)
-        cur = conn.execute(
-            "INSERT INTO event (title, event_type, story_id, occurred_on,"
-            " doc_count, created_at) VALUES ('Bill passed', 'bill_stage',"
-            " ?, ?, 1, ?)", (story_id, now[:10], now))
-        event_id = int(cur.lastrowid)
-        conn.execute(
-            "INSERT INTO event_assignment (document_id, event_id, method,"
-            " created_at) VALUES (?, ?, 'new', ?)", (doc, event_id, now))
+    cur = await conn.execute(
+        "INSERT INTO story (title, status, doc_count, created_at,"
+        " updated_at) VALUES (%s, 'active', 1, %s, %s) RETURNING id",
+        (title, now, now))
+    story_id = int((await cur.fetchone())["id"])
+    cur = await conn.execute(
+        "INSERT INTO event (title, event_type, story_id, occurred_on,"
+        " doc_count, created_at) VALUES ('Bill passed', 'bill_stage',"
+        " %s, %s, 1, %s) RETURNING id", (story_id, now[:10], now))
+    event_id = int((await cur.fetchone())["id"])
+    await conn.execute(
+        "INSERT INTO event_assignment (document_id, event_id, method,"
+        " created_at) VALUES (%s, %s, 'new', %s)", (doc, event_id, now))
     return story_id
 
 
@@ -73,12 +71,12 @@ def test_empty_brief_has_all_five_sections(env):
     assert all(body["sections"][s] == [] for s in ALL_SECTIONS)
 
 
-def test_brief_is_generated_once_and_stable(env):
+async def test_brief_is_generated_once_and_stable(env, db):
     client, container = env
     first = client.get("/api/brief/today").json()
     # data arriving AFTER generation does not change today's brief
-    w = add_watch(container.db, "SEBI", "sebi")
-    add_hit(container.db, w, insert_doc(container.db, title="late doc"))
+    w = await add_watch(db, "SEBI", "sebi")
+    await add_hit(db, w, await insert_doc(db, title="late doc"))
     second = client.get("/api/brief/today").json()
     assert second["brief"]["id"] == first["brief"]["id"]
     assert second["brief"]["generated_at"] == first["brief"]["generated_at"]
@@ -96,22 +94,22 @@ def test_past_date_returns_404_not_a_backfill(env):
 
 # --- watch_dev -------------------------------------------------------------------------
 
-def test_watch_dev_items(env):
+async def test_watch_dev_items(env, db):
     client, container = env
-    conn = container.db
-    src = insert_source(conn, "ET Markets", tier=2)
-    w = add_watch(conn, "SEBI", "sebi")
-    d1 = insert_doc(conn, title="SEBI tightens norms", source_id=src,
-                    published_at="2026-06-10T05:00:00Z")
-    d2 = insert_doc(conn, title="SEBI order on brokers", source_id=src)
-    add_hit(conn, w, d1)
-    add_hit(conn, w, d2)
+    conn = db
+    src = await insert_source(conn, "ET Markets", tier=2)
+    w = await add_watch(conn, "SEBI", "sebi")
+    d1 = await insert_doc(conn, title="SEBI tightens norms", source_id=src,
+                          published_at="2026-06-10T05:00:00Z")
+    d2 = await insert_doc(conn, title="SEBI order on brokers",
+                          source_id=src)
+    await add_hit(conn, w, d1)
+    await add_hit(conn, w, d2)
     # a muted watch's hits never reach the brief
-    muted = add_watch(conn, "Muted", "muted")
-    muted_doc = insert_doc(conn, title="muted hit")
-    add_hit(conn, muted, muted_doc)
-    with conn:
-        conn.execute("UPDATE watch SET muted=1 WHERE id=?", (muted,))
+    muted = await add_watch(conn, "Muted", "muted")
+    muted_doc = await insert_doc(conn, title="muted hit")
+    await add_hit(conn, muted, muted_doc)
+    await conn.execute("UPDATE watch SET muted=TRUE WHERE id=%s", (muted,))
     body = client.get("/api/brief/today").json()
     items = body["sections"]["watch_dev"]
     assert len(items) == 2
@@ -128,22 +126,23 @@ def test_watch_dev_items(env):
     assert muted_doc not in by_id
 
 
-def test_watch_dev_respects_read_cursor(env):
+async def test_watch_dev_respects_read_cursor(env, db):
     client, container = env
-    conn = container.db
-    w = add_watch(conn, "GST", "gst", last_seen_at=utc_now())
-    old_doc = insert_doc(conn, title="old hit")
-    add_hit(conn, w, old_doc, created_at="2026-01-01T00:00:00.000Z")
+    conn = db
+    w = await add_watch(conn, "GST", "gst", last_seen_at=utc_now())
+    old_doc = await insert_doc(conn, title="old hit")
+    await add_hit(conn, w, old_doc, created_at="2026-01-01T00:00:00.000Z")
     body = client.get("/api/brief/today").json()
     assert body["sections"]["watch_dev"] == []
 
 
 # --- thread_move -----------------------------------------------------------------------
 
-def test_thread_move_items_with_heat(env):
+async def test_thread_move_items_with_heat(env, db):
     client, container = env
-    conn = container.db
-    story_id = make_story_with_new_event(conn, title="Bill story", tier=1)
+    conn = db
+    story_id = await make_story_with_new_event(conn, title="Bill story",
+                                               tier=1)
     body = client.get("/api/brief/today").json()
     items = body["sections"]["thread_move"]
     assert len(items) == 1
@@ -156,24 +155,24 @@ def test_thread_move_items_with_heat(env):
     assert item["payload"]["new_events"] == 1
 
 
-def test_thread_move_ignores_old_events(env):
+async def test_thread_move_ignores_old_events(env, db):
     client, container = env
-    conn = container.db
-    story_id = make_story_with_new_event(conn)
-    with conn:
-        conn.execute("UPDATE event SET created_at='2026-01-01T00:00:00.000Z'"
-                     " WHERE story_id=?", (story_id,))
+    conn = db
+    story_id = await make_story_with_new_event(conn)
+    await conn.execute(
+        "UPDATE event SET created_at='2026-01-01T00:00:00.000Z'"
+        " WHERE story_id=%s", (story_id,))
     body = client.get("/api/brief/today").json()
     assert body["sections"]["thread_move"] == []
 
 
 # --- seen flag -------------------------------------------------------------------------
 
-def test_mark_item_seen(env):
+async def test_mark_item_seen(env, db):
     client, container = env
-    conn = container.db
-    w = add_watch(conn, "SEBI", "sebi")
-    add_hit(conn, w, insert_doc(conn, title="SEBI doc"))
+    conn = db
+    w = await add_watch(conn, "SEBI", "sebi")
+    await add_hit(conn, w, await insert_doc(conn, title="SEBI doc"))
     body = client.get("/api/brief/today").json()
     item_id = body["sections"]["watch_dev"][0]["id"]
 

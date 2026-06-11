@@ -1,7 +1,14 @@
 """Polite async HTTP fetcher.
 
-- per-domain token bucket: 1 request / 2 s (configurable)
-- robots.txt cache with TTL; robots failures => allow (NIC sites 403 bots)
+- per-domain politeness: 1 request / 2 s (configurable). v0.2: when a pool
+  is bound (``bind_pool``), the slot is an atomic PG reservation in
+  fetch_domain — exact politeness across every api/worker process (runtime
+  design §4); unbound (standalone tools/tests) it falls back to the v0.1
+  in-process bucket.
+- robots.txt cache with TTL; robots failures => allow (NIC sites 403 bots).
+  v0.2: the body cache is the shared robots_cache table (1h TTL) behind a
+  small in-process cache (5 min) so hot domains don't query per fetch;
+  parsing stays local.
 - browser User-Agent — NIC .gov.in properties 403 non-browser UAs (verified)
 - 30 s timeout, 10 MB cap (streamed), 2 retries with backoff on transport
   errors / 5xx
@@ -19,6 +26,9 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from psycopg_pool import AsyncConnectionPool
+
+from connect.storage import fetchstate
 
 log = logging.getLogger(__name__)
 
@@ -27,7 +37,8 @@ BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
-_ROBOTS_TTL = 3600.0  # seconds
+_ROBOTS_TTL = 3600.0        # shared robots_cache row TTL (seconds)
+_ROBOTS_LOCAL_TTL = 300.0   # in-process parser cache on top of the row
 
 
 class FetchError(Exception):
@@ -65,9 +76,16 @@ class Fetcher:
         self.retries = retries
         self.respect_robots = respect_robots
         self._client: httpx.AsyncClient | None = None
+        self._pool: AsyncConnectionPool | None = None
         self._domain_locks: dict[str, asyncio.Lock] = {}
         self._domain_next: dict[str, float] = {}
         self._robots: dict[str, tuple[urllib.robotparser.RobotFileParser | None, float]] = {}
+
+    def bind_pool(self, pool: AsyncConnectionPool) -> None:
+        """Switch politeness state to the shared PG backing (called by the
+        composition root once the pool is open). The Fetcher API is
+        unchanged — same seam, new backing."""
+        self._pool = pool
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -93,6 +111,16 @@ class Fetcher:
     # -- politeness ------------------------------------------------------------
 
     async def _throttle(self, domain: str) -> None:
+        if self._pool is not None:
+            # one cheap autocommit upsert reserves this process's slot;
+            # the connection is returned BEFORE the local sleep (a
+            # reservation must never sit in a transaction or pin the pool)
+            async with self._pool.connection() as conn:
+                wait_s = await fetchstate.reserve_slot(
+                    conn, domain, self.per_domain_interval)
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+            return
         lock = self._domain_locks.setdefault(domain, asyncio.Lock())
         async with lock:
             now = time.monotonic()
@@ -100,6 +128,26 @@ class Fetcher:
             if next_at > now:
                 await asyncio.sleep(next_at - now)
             self._domain_next[domain] = time.monotonic() + self.per_domain_interval
+
+    async def _fetch_robots_body(self, base: str) -> str | None:
+        """GET robots.txt; None = unreachable/non-200 (=> allow)."""
+        try:
+            resp = await self._client_or_create().get(
+                base + "/robots.txt", timeout=10.0)
+            if resp.status_code == 200:
+                return resp.text
+        except httpx.HTTPError:
+            pass
+        return None
+
+    @staticmethod
+    def _parse_robots(
+            body: str | None) -> urllib.robotparser.RobotFileParser | None:
+        if body is None:
+            return None
+        parser = urllib.robotparser.RobotFileParser()
+        parser.parse(body.splitlines())
+        return parser
 
     async def _robots_allowed(self, url: str) -> bool:
         if not self.respect_robots:
@@ -109,16 +157,25 @@ class Fetcher:
         cached = self._robots.get(base)
         now = time.monotonic()
         if cached is None or cached[1] < now:
-            parser: urllib.robotparser.RobotFileParser | None = None
-            try:
-                resp = await self._client_or_create().get(
-                    base + "/robots.txt", timeout=10.0)
-                if resp.status_code == 200:
-                    parser = urllib.robotparser.RobotFileParser()
-                    parser.parse(resp.text.splitlines())
-            except httpx.HTTPError:
-                parser = None  # unreachable robots => assume allowed
-            self._robots[base] = (parser, now + _ROBOTS_TTL)
+            if self._pool is not None:
+                # read-through the SHARED cache: row fresh -> parse its
+                # body locally; stale/missing -> fetch once, upsert for
+                # every other process
+                async with self._pool.connection() as conn:
+                    row = await fetchstate.get_robots(conn, base,
+                                                      ttl_s=_ROBOTS_TTL)
+                if row is not None and row["fresh"]:
+                    body = row["body"]
+                else:
+                    body = await self._fetch_robots_body(base)
+                    async with self._pool.connection() as conn:
+                        await fetchstate.upsert_robots(conn, base, body)
+                parser = self._parse_robots(body)
+                self._robots[base] = (parser, now + _ROBOTS_LOCAL_TTL)
+            else:
+                parser = self._parse_robots(
+                    await self._fetch_robots_body(base))
+                self._robots[base] = (parser, now + _ROBOTS_TTL)
             cached = self._robots[base]
         parser = cached[0]
         if parser is None:

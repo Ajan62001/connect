@@ -7,8 +7,9 @@ pointer and enrichment_status='skipped_dup' — the syndication killer.
 
 from __future__ import annotations
 
-import sqlite3
 from datetime import datetime, timedelta, timezone
+
+import psycopg
 
 from connect.knowledge.enrichment.t0 import (
     content_hash,
@@ -26,14 +27,16 @@ __all__ = [
 ]
 
 
-def find_near_duplicate(conn: sqlite3.Connection, fingerprint: int, *,
-                        window_days: int = 14,
-                        max_hamming: int = 3) -> int | None:
+async def find_near_duplicate(conn: psycopg.AsyncConnection,
+                              fingerprint: int, *,
+                              window_days: int = 14,
+                              max_hamming: int = 3) -> int | None:
     """Return the canonical document id of a near-duplicate within the
     window, or None. ``fingerprint`` is the unsigned 64-bit simhash."""
     since = (datetime.now(timezone.utc) - timedelta(days=window_days)
              ).strftime("%Y-%m-%dT%H:%M:%S")
-    for doc_id, stored, canonical_id in doc_dao.recent_simhashes(conn, since):
+    for doc_id, stored, canonical_id in await doc_dao.recent_simhashes(
+            conn, since):
         if hamming(from_signed64(stored), fingerprint) <= max_hamming:
             return canonical_id or doc_id
     return None

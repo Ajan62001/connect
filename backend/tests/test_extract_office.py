@@ -266,10 +266,10 @@ def test_extract_office_zip_sibling_fallback(tmp_path):
 # --- pipeline end-to-end (no network: upload + canned fetcher) -------------------
 
 
-async def test_ingest_file_xlsx_end_to_end(tmp_path, container):
+async def test_ingest_file_xlsx_end_to_end(tmp_path, container, db):
     data = _budget_xlsx(tmp_path)
     result = await container.pipeline.ingest_file(
-        "rbi-annex.xlsx", data, XLSX_CTYPE)
+        db, "rbi-annex.xlsx", data, XLSX_CTYPE)
 
     assert result.created is True
     doc = result.document
@@ -278,51 +278,53 @@ async def test_ingest_file_xlsx_end_to_end(tmp_path, container):
     assert "Maharashtra\t182000\t0.18" in doc.content_text
 
     # raw bytes are blob-stored and the row is FTS-searchable
-    row = container.db.execute(
-        "SELECT raw_blob_path FROM document WHERE id=?", (doc.id,)).fetchone()
-    assert container.blobs.get(row["raw_blob_path"]) == data
-    items, total = fts_dao.search_documents(container.db, "Maharashtra")
+    from dbutil import qv
+    blob_path = await qv(db, "SELECT raw_blob_path FROM document"
+                             " WHERE id=%s", doc.id)
+    assert container.blobs.get(blob_path) == data
+    items, total = await fts_dao.search_documents(db, "Maharashtra")
     assert total == 1 and items[0].id == doc.id
     assert items[0].media_type == "xlsx"
 
 
-async def test_ingest_file_xls_and_docx(tmp_path, container):
+async def test_ingest_file_xls_and_docx(tmp_path, container, db):
     xls = await container.pipeline.ingest_file(
-        "annex.xls", XLS_FIXTURE.read_bytes(), XLS_CTYPE)
+        db, "annex.xls", XLS_FIXTURE.read_bytes(), XLS_CTYPE)
     assert xls.document.media_type == "xlsx"  # one spreadsheet bucket
     assert "Karnataka\t95000.5" in xls.document.content_text
 
     docx = await container.pipeline.ingest_file(
-        "report.docx",
+        db, "report.docx",
         _docx_bytes(tmp_path, ["A standalone committee report draft."]),
         DOCX_CTYPE)
     assert docx.document.media_type == "docx"
-    items, total = fts_dao.search_documents(container.db, "standalone")
+    items, total = await fts_dao.search_documents(db, "standalone")
     assert total == 1 and items[0].id == docx.document.id
 
 
-async def test_ingest_file_bad_office_takes_failure_path(container):
+async def test_ingest_file_bad_office_takes_failure_path(container, db):
     """A corrupt spreadsheet fails exactly like a bad PDF: ExtractionError,
     no document row created."""
+    from dbutil import qv
     with pytest.raises(ExtractionError):
         await container.pipeline.ingest_file(
-            "broken.xlsx", b"PK\x03\x04 not really a workbook", XLSX_CTYPE)
-    assert container.db.execute(
-        "SELECT COUNT(*) FROM document").fetchone()[0] == 0
+            db, "broken.xlsx", b"PK\x03\x04 not really a workbook",
+            XLSX_CTYPE)
+    assert await qv(db, "SELECT COUNT(*) FROM document") == 0
 
 
-async def test_ingest_url_xlsx_by_content_type(tmp_path, container):
+async def test_ingest_url_xlsx_by_content_type(tmp_path, container, db):
     url = "https://www.rbi.org.in/Scripts/AnnexDownload.aspx?ID=42"
     container.pipeline.fetcher = FakeFetcher(
         {url: (XLSX_CTYPE, _budget_xlsx(tmp_path))})
 
-    result = await container.pipeline.ingest_url(url, title="Annex I")
+    result = await container.pipeline.ingest_url(db, url, title="Annex I")
     assert result.document.media_type == "xlsx"
     assert result.document.title == "Annex I"
     assert "Karnataka\t95000\t1.85" in result.document.content_text
 
 
-async def test_link_follow_fetches_xlsx_annex(tmp_path, container):
+async def test_link_follow_fetches_xlsx_annex(tmp_path, container, db):
     """The motivating case: an RBI page links its .xlsx annex (served with a
     lying legacy content-type); the follower ingests it as a document."""
     parent = "https://www.rbi.org.in/Scripts/NotificationUser.aspx?Id=12999"
@@ -334,17 +336,17 @@ async def test_link_follow_fetches_xlsx_annex(tmp_path, container):
         annex: (XLS_CTYPE, _budget_xlsx(tmp_path)),  # PK magic wins -> xlsx
     })
 
-    result = await container.pipeline.ingest_url(parent)
-    links = link_dao.list_for_document(container.db, result.document.id)
+    result = await container.pipeline.ingest_url(db, parent)
+    links = await link_dao.list_for_document(db, result.document.id)
     assert len(links) == 1 and links[0].status == "fetched"
 
-    child = doc_dao.get(container.db, links[0].resolved_document_id)
+    child = await doc_dao.get(db, links[0].resolved_document_id)
     assert child is not None
     assert child.media_type == "xlsx"
     assert "Maharashtra\t182000\t0.18" in child.content_text
 
 
-async def test_link_follow_bad_xlsx_marks_link_failed(container):
+async def test_link_follow_bad_xlsx_marks_link_failed(container, db):
     parent = "https://www.rbi.org.in/Scripts/NotificationUser.aspx?Id=13000"
     annex = "https://www.rbi.org.in/rdocs/content/xls/Broken.xlsx"
     container.pipeline.fetcher = FakeFetcher({
@@ -354,7 +356,7 @@ async def test_link_follow_bad_xlsx_marks_link_failed(container):
         annex: (XLSX_CTYPE, b"PK\x03\x04 broken workbook bytes"),
     })
 
-    result = await container.pipeline.ingest_url(parent)  # must not raise
-    link = link_dao.list_for_document(container.db, result.document.id)[0]
+    result = await container.pipeline.ingest_url(db, parent)  # no raise
+    link = (await link_dao.list_for_document(db, result.document.id))[0]
     assert link.status == "failed"
     assert link.resolved_document_id is None

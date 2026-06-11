@@ -1,8 +1,9 @@
 """Settings — pydantic-settings, env prefix CONNECT_.
 
 Examples:
-    CONNECT_DB_PATH=/tmp/x.db CONNECT_POLLER_ENABLED=false \
-    CONNECT_EMBEDDINGS_ENABLED=false uvicorn --factory connect.api.main:create_app
+    CONNECT_DATABASE_URL=postgresql://connect:connect@127.0.0.1:5432/connect \
+    CONNECT_POLLER_ENABLED=false CONNECT_EMBEDDINGS_ENABLED=false \
+    uvicorn --factory connect.api.main:create_app
 """
 
 from __future__ import annotations
@@ -56,16 +57,46 @@ class Settings(BaseSettings):
             "TWITTERAPI_IO_API_KEY", "CONNECT_TWITTERAPI_IO_API_KEY"),
     )
 
-    # storage
-    db_path: Path = BACKEND_DIR / "data" / "connect.db"
+    # storage — PostgreSQL DSN (v0.2; CONNECT_DATABASE_URL)
+    database_url: str = "postgresql://connect:connect@127.0.0.1:5432/connect"
     blob_dir: Path = BACKEND_DIR / "data" / "blobs"
+    # pool sizing (design v02-postgres-port.md §2): API replica min=2/max=10;
+    # worker max = job_concurrency + 3
+    pool_min_size: int = 2
+    pool_max_size: int = 10
 
     # background machinery
+    # poller_enabled gates the BEAT's due-source scheduling (the v0.1
+    # lifespan poll loop is gone — beat enqueues poll_source jobs)
     poller_enabled: bool = True
-    poll_tick_seconds: float = 60.0
     max_items_per_poll: int = 25
     max_items_per_day: int = 200
+    # embedded (api-flavor) queue concurrency — Phase A semantics kept for
+    # dev/tests; worker processes use worker_concurrency below
     job_concurrency: int = 2
+
+    # worker runtime (v0.2 runtime design §2/§4)
+    # local total + per-kind claim slots; kinds absent from the map get the
+    # default cap. Cluster-wide caps use advisory-lock slots (expensive
+    # kinds only).
+    worker_concurrency: int = 6
+    worker_kind_caps: dict[str, int] = Field(
+        default_factory=lambda: {"investigation": 1, "analysis": 2,
+                                 "enrich_t1_batch": 1, "poll_source": 4})
+    worker_kind_cap_default: int = 4
+    worker_cluster_caps: dict[str, int] = Field(
+        default_factory=lambda: {"investigation": 3})
+    heartbeat_seconds: float = 15.0
+    # a running job whose heartbeat is older than this is orphaned (beat
+    # sweep: requeue while attempts < max_attempts, else failed)
+    job_stale_seconds: float = 90.0
+    beat_tick_seconds: float = 60.0
+    beat_retry_seconds: float = 30.0
+    # nightly enrich_t1_batch + brief pre-gen fire at this UTC hour
+    nightly_sweep_utc_hour: int = 21
+    # SSE: live pings come via LISTEN/NOTIFY; this bounds staleness when
+    # the bus is down (fallback re-query cadence)
+    sse_fallback_seconds: float = 5.0
 
     # T0 enrichment
     embeddings_enabled: bool = True
@@ -78,6 +109,23 @@ class Settings(BaseSettings):
     model_balanced: str = "claude-sonnet-4-6"
     model_deep: str = "claude-opus-4-8"
     daily_llm_budget_usd: float = 2.0
+    # deployment-wide daily backstop across ALL users + system jobs (locked
+    # decision: $10/day). Seeded into app_setting at startup; the layered
+    # TenantGovernor (auth workstream, Phase D) enforces it on the queue
+    # path — app_setting wins over env once an admin edits it.
+    global_daily_budget_usd: float = 10.0
+    # member per-user defaults (locked: $0.50 general / $2.00 investigation;
+    # admins keep the $2/$10 env defaults above). Seeded into app_setting;
+    # per-user override columns on app_user trump both.
+    member_daily_budget_usd: float = 0.50
+    member_investigation_daily_budget_usd: float = 2.0
+    # worker-flavor cap on concurrent Anthropic calls (runtime design §5;
+    # wired in the safety/ops phase alongside the governors)
+    llm_max_concurrent: int = 4
+    # backpressure → 429 on POST /analyses|/investigations (runtime design
+    # §5; enforced with auth, when requests carry a user)
+    user_max_interactive: int = 2
+    interactive_queue_limit: int = 20
     # sync fast-path: enrich watch-hit / fact-checker docs right after ingest
     enrich_fast_path_enabled: bool = True
     # how often an enrich_t1_batch job polls the Message Batch status

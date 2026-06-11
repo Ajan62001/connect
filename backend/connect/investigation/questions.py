@@ -7,8 +7,9 @@ agent raises its own questions mid-loop) and never fails the run.
 from __future__ import annotations
 
 import logging
-import sqlite3
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
+
+import psycopg
 
 from connect.analysis.budget import AnalysisBudget
 from connect.investigation.prompts import QUESTION_GEN_SYSTEM
@@ -21,7 +22,7 @@ from connect.llm import spend
 from connect.llm.provider import LLMError, LLMProvider
 from connect.llm.spend import Governor
 from connect.llm.tiers import ModelTier
-from connect.storage.db import utc_now
+from connect.storage.pg import utc_now
 
 log = logging.getLogger(__name__)
 
@@ -31,17 +32,18 @@ QGEN_MAX_TOKENS = 1500
 
 
 async def generate_questions(
-        conn: sqlite3.Connection, provider: LLMProvider, *,
+        conn: psycopg.AsyncConnection, provider: LLMProvider, *,
         dossier_id: int, pack: ScopePack, governor: Governor,
         budget: AnalysisBudget,
-        emit: Callable[[str, dict[str, Any]], Any]) -> list[int]:
+        emit: Callable[[str, dict[str, Any]], Awaitable[Any]],
+        ) -> list[int]:
     """Generate <=10 typed questions bound to pack items; returns the new
     question row ids (empty on any failure — never fatal)."""
     model = provider.model_for(ModelTier.BALANCED)
     projected = spend.cost_usd(model, input_tokens=EST_QGEN_IN,
                                output_tokens=EST_QGEN_OUT)
     try:
-        governor.check(projected)
+        await governor.check(projected)
         budget.check(projected)
     except RuntimeError as e:
         log.warning("question generation skipped (budget): %s", e)
@@ -58,8 +60,8 @@ async def generate_questions(
     except LLMError as e:
         log.warning("question generation failed: %s", e)
         return []
-    spend.record_call(conn, purpose=PURPOSE_INVESTIGATION,
-                      model=completion.model, usage=completion.usage)
+    await spend.record_call(conn, purpose=PURPOSE_INVESTIGATION,
+                            model=completion.model, usage=completion.usage)
     budget.add(spend.cost_usd(
         completion.model,
         input_tokens=completion.usage.input_tokens,
@@ -75,26 +77,28 @@ async def generate_questions(
         about_type, about_id = q.about_type, q.about_id
         if about_type is None or about_id is None:
             about_type = about_id = None
-        with conn:
-            cur = conn.execute(
+        async with conn.transaction():
+            cur = await conn.execute(
                 "INSERT INTO question (dossier_id, qtype, text, about_type,"
                 " about_id, status, priority, created_at)"
-                " VALUES (?,?,?,?,?, 'open', ?, ?)",
+                " VALUES (%s,%s,%s,%s,%s, 'open', %s, %s) RETURNING id",
                 (dossier_id, q.qtype, text, about_type, about_id,
                  q.priority, now))
-        question_id = int(cur.lastrowid)  # type: ignore[arg-type]
+            question_id = int((await cur.fetchone())["id"])
         ids.append(question_id)
-        emit("question_raised", {"question_id": question_id,
-                                 "qtype": q.qtype, "text": text})
+        await emit("question_raised", {"question_id": question_id,
+                                       "qtype": q.qtype, "text": text})
     return ids
 
 
-def render_questions(conn: sqlite3.Connection, dossier_id: int) -> str:
+async def render_questions(conn: psycopg.AsyncConnection,
+                           dossier_id: int) -> str:
     """The open-question block appended to the loop's first user message."""
-    rows = conn.execute(
+    cur = await conn.execute(
         "SELECT id, qtype, text, status, priority FROM question"
-        " WHERE dossier_id = ? ORDER BY priority DESC, id",
-        (dossier_id,)).fetchall()
+        " WHERE dossier_id = %s ORDER BY priority DESC, id",
+        (dossier_id,))
+    rows = await cur.fetchall()
     if not rows:
         return ("\nOPEN QUESTIONS: none generated — raise your own with"
                 " raise_question as you investigate.\n")

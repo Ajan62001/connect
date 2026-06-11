@@ -27,9 +27,10 @@ thousand crore rupees across sectors including textiles and pharma.
 """
 
 
-def test_ingest_text_end_to_end(container):
+async def test_ingest_text_end_to_end(container, db):
     pipeline = container.pipeline
-    result = pipeline.ingest_text(TEXT, title="GST collections rise")
+    result = await pipeline.ingest_text(db, TEXT,
+                                        title="GST collections rise")
 
     assert result.created is True
     doc = result.document
@@ -40,9 +41,10 @@ def test_ingest_text_end_to_end(container):
     assert doc.content_hash
 
     # row is queryable
-    row = container.db.execute(
-        "SELECT simhash, raw_blob_path FROM document WHERE id=?",
-        (doc.id,)).fetchone()
+    cur = await db.execute(
+        "SELECT simhash, raw_blob_path FROM document WHERE id=%s",
+        (doc.id,))
+    row = await cur.fetchone()
     assert row["simhash"] is not None
 
     # blob landed under data/blobs/<2-char>/<sha>
@@ -50,55 +52,64 @@ def test_ingest_text_end_to_end(container):
     assert container.blobs.get(row["raw_blob_path"]).decode("utf-8") == TEXT
 
     # FTS-searchable
-    items, total = fts_dao.search_documents(container.db, "GST")
+    items, total = await fts_dao.search_documents(db, "GST")
     assert total == 1
     assert items[0].id == doc.id
     assert items[0].snippet and "mark" in items[0].snippet
 
 
-def test_snippet_html_escaped(container):
+async def test_snippet_html_escaped(container, db):
     """Snippets are rendered as HTML on the client (highlight marks) — any
     markup inside the document text itself must arrive escaped."""
-    container.pipeline.ingest_text(
+    await container.pipeline.ingest_text(
+        db,
         "A report on zanzibar trade routes. <script>alert(1)</script> "
         "Spice exports & tariffs rose sharply this quarter.",
         title="xss probe")
 
-    items, total = fts_dao.search_documents(container.db, "zanzibar")
+    items, total = await fts_dao.search_documents(db, "zanzibar")
     assert total == 1
     snip = items[0].snippet
     assert snip is not None
     assert "<mark>zanzibar</mark>" in snip
+    # raw document markup never reaches the client: ts_headline drops
+    # HTML-tag tokens outright (v0.1's FTS5 passed them through escaped),
+    # and everything else passes through html.escape — note the &amp;.
     assert "<script>" not in snip
-    assert "&lt;script&gt;" in snip
+    assert "&amp;" in snip
 
 
-def test_exact_dedup_returns_existing(container):
+async def test_exact_dedup_returns_existing(container, db):
     pipeline = container.pipeline
-    first = pipeline.ingest_text(TEXT, title="GST collections rise")
-    again = pipeline.ingest_text(TEXT, title="different title, same body")
+    first = await pipeline.ingest_text(db, TEXT,
+                                       title="GST collections rise")
+    again = await pipeline.ingest_text(
+        db, TEXT, title="different title, same body")
 
     assert again.created is False
     assert again.document.id == first.document.id
-    count = container.db.execute("SELECT COUNT(*) FROM document").fetchone()[0]
-    assert count == 1
+    cur = await db.execute("SELECT COUNT(*) AS n FROM document")
+    assert (await cur.fetchone())["n"] == 1
 
 
-def test_near_duplicate_gets_canonical_pointer(container):
+async def test_near_duplicate_gets_canonical_pointer(container, db):
     pipeline = container.pipeline
-    first = pipeline.ingest_text(TEXT, title="GST collections rise")
+    first = await pipeline.ingest_text(db, TEXT,
+                                       title="GST collections rise")
 
     # syndicated copy: a couple of word-level edits on the same wire text
     edited = TEXT.replace("eleven percent", "twelve percent").replace(
         "Officials attributed", "Officials credited")
-    second = pipeline.ingest_text(edited, title="GST mop-up grows")
+    second = await pipeline.ingest_text(db, edited,
+                                        title="GST mop-up grows")
 
     assert second.created is True  # stored — immutable snapshot discipline
     assert second.document.canonical_document_id == first.document.id
     assert second.document.enrichment_status == "skipped_dup"
 
 
-def test_malformed_fts_query_does_not_crash(container):
-    container.pipeline.ingest_text(TEXT, title="GST collections rise")
-    items, total = fts_dao.search_documents(container.db, 'AND NOT "')
+async def test_malformed_fts_query_does_not_crash(container, db):
+    await container.pipeline.ingest_text(db, TEXT,
+                                         title="GST collections rise")
+    items, total = await fts_dao.search_documents(db, 'AND NOT "')
     assert total == 0 and items == []

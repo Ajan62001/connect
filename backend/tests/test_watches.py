@@ -6,7 +6,7 @@ import json
 
 from connect.knowledge import watches as watch_logic
 from connect.storage import watches as watch_dao
-from connect.storage.db import utc_now
+from connect.storage.pg import utc_now
 
 DOC = """
 The Securities and Exchange Board of India tightened disclosure norms for
@@ -22,70 +22,73 @@ covering four districts, with a budget outlay of three thousand crore.
 """
 
 
-def _ingest(container, text, title):
-    return container.pipeline.ingest_text(text, title=title).document
+async def _ingest(container, db, text, title):
+    return (await container.pipeline.ingest_text(db, text,
+                                                 title=title)).document
 
 
-def test_topic_watch_sets_watch_hit(container):
-    watch = watch_dao.insert(
-        container.db, kind="topic", label="FPI disclosure",
+async def test_topic_watch_sets_watch_hit(container, db):
+    watch = await watch_dao.insert(
+        db, kind="topic", label="FPI disclosure",
         query_fts='"portfolio investors"')
-    doc = _ingest(container, DOC, "SEBI tightens FPI norms")
+    doc = await _ingest(container, db, DOC, "SEBI tightens FPI norms")
 
-    hits = container.db.execute(
-        "SELECT watch_id, object_type, object_id FROM watch_hit").fetchall()
-    assert (watch.id, "document", doc.id) in [tuple(r) for r in hits]
-    flag = container.db.execute(
-        "SELECT watch_hit FROM document WHERE id=?", (doc.id,)).fetchone()[0]
-    assert flag == 1
+    cur = await db.execute(
+        "SELECT watch_id, object_type, object_id FROM watch_hit")
+    hits = [(r["watch_id"], r["object_type"], r["object_id"])
+            for r in await cur.fetchall()]
+    assert (watch.id, "document", doc.id) in hits
+    cur = await db.execute(
+        "SELECT watch_hit FROM document WHERE id=%s", (doc.id,))
+    assert (await cur.fetchone())["watch_hit"] is True
 
 
-def test_entity_alias_watch_matches_word_boundary(container):
-    container.db.execute(
+async def test_entity_alias_watch_matches_word_boundary(container, db):
+    await db.execute(
         "INSERT INTO entity (name, entity_type, aliases, created_at)"
-        " VALUES (?,?,?,?)",
+        " VALUES (%s,%s,%s,%s)",
         ("Securities and Exchange Board of India", "organization",
          json.dumps(["SEBI"]), utc_now()))
-    container.db.commit()
-    entity_id = container.db.execute(
-        "SELECT id FROM entity").fetchone()[0]
-    watch = watch_dao.insert(
-        container.db, kind="entity", label="SEBI", entity_id=entity_id)
+    cur = await db.execute("SELECT id FROM entity")
+    entity_id = (await cur.fetchone())["id"]
+    watch = await watch_dao.insert(
+        db, kind="entity", label="SEBI", entity_id=entity_id)
 
-    doc = _ingest(container, DOC, "SEBI tightens FPI norms")
-    other = _ingest(container, OTHER, "Irrigation project approved")
+    doc = await _ingest(container, db, DOC, "SEBI tightens FPI norms")
+    other = await _ingest(container, db, OTHER,
+                          "Irrigation project approved")
 
-    hit_ids = {r[0] for r in container.db.execute(
-        "SELECT object_id FROM watch_hit WHERE watch_id=?", (watch.id,))}
+    cur = await db.execute(
+        "SELECT object_id FROM watch_hit WHERE watch_id=%s", (watch.id,))
+    hit_ids = {r["object_id"] for r in await cur.fetchall()}
     assert doc.id in hit_ids
     assert other.id not in hit_ids
     assert other.watch_hit is False
 
 
-def test_non_matching_doc_gets_no_hits(container):
-    watch_dao.insert(container.db, kind="topic", label="crypto",
-                     query_fts="cryptocurrency")
-    doc = _ingest(container, OTHER, "Irrigation project approved")
-    count = container.db.execute(
-        "SELECT COUNT(*) FROM watch_hit").fetchone()[0]
-    assert count == 0
+async def test_non_matching_doc_gets_no_hits(container, db):
+    await watch_dao.insert(db, kind="topic", label="crypto",
+                           query_fts="cryptocurrency")
+    doc = await _ingest(container, db, OTHER,
+                        "Irrigation project approved")
+    cur = await db.execute("SELECT COUNT(*) AS n FROM watch_hit")
+    assert (await cur.fetchone())["n"] == 0
     assert doc.watch_hit is False
 
 
-def test_muted_watch_does_not_match(container):
-    watch_dao.insert(container.db, kind="topic", label="muted",
-                     query_fts="irrigation", muted=True)
-    _ingest(container, OTHER, "Irrigation project approved")
-    count = container.db.execute(
-        "SELECT COUNT(*) FROM watch_hit").fetchone()[0]
-    assert count == 0
+async def test_muted_watch_does_not_match(container, db):
+    await watch_dao.insert(db, kind="topic", label="muted",
+                           query_fts="irrigation", muted=True)
+    await _ingest(container, db, OTHER, "Irrigation project approved")
+    cur = await db.execute("SELECT COUNT(*) AS n FROM watch_hit")
+    assert (await cur.fetchone())["n"] == 0
 
 
-def test_badges_and_seen_cursor(container):
-    watch = watch_dao.insert(
-        container.db, kind="topic", label="FPI", query_fts='"portfolio investors"')
-    _ingest(container, DOC, "SEBI tightens FPI norms")
+async def test_badges_and_seen_cursor(container, db):
+    watch = await watch_dao.insert(
+        db, kind="topic", label="FPI", query_fts='"portfolio investors"')
+    await _ingest(container, db, DOC, "SEBI tightens FPI norms")
 
-    assert watch_logic.badges(container.db) == {watch.id: 1}
-    watch_logic.mark_seen(container.db, watch.id)
-    assert watch_logic.badges(container.db) == {watch.id: 0}
+    assert await watch_logic.badges(db) == {watch.id: 1}
+    await watch_logic.mark_seen(db, watch.id)
+    assert await watch_logic.badges(db) == {watch.id: 0}

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from connect.api.deps import get_container
+import psycopg
+
+from connect.api.deps import get_container, get_db
 from connect.domain.models import (
     DocumentPage,
     EnrichmentEntityRef,
@@ -21,11 +23,12 @@ router = APIRouter(prefix="/entities", tags=["entities"])
 MAX_PAGE_SIZE = 100
 
 
-def _entity_ref(container: Container,
-                entity_id: int) -> EnrichmentEntityRef:
-    row = container.db.execute(
-        "SELECT id, name, entity_type FROM entity WHERE id = ?",
-        (entity_id,)).fetchone()
+async def _entity_ref(db: psycopg.AsyncConnection,
+                      entity_id: int) -> EnrichmentEntityRef:
+    cur = await db.execute(
+        "SELECT id, name, entity_type FROM entity WHERE id = %s",
+        (entity_id,))
+    row = await cur.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="entity not found")
     return EnrichmentEntityRef(id=row["id"], name=row["name"],
@@ -37,17 +40,17 @@ async def list_entities(q: str | None = Query(default=None),
                         page: int = Query(default=1, ge=1),
                         page_size: int = Query(default=20, ge=1,
                                                le=MAX_PAGE_SIZE),
-                        container: Container = Depends(get_container)):
-    items, total = entity_dao.list_page(
-        container.db, q=q, page=page, page_size=page_size)
+                        db: psycopg.AsyncConnection = Depends(get_db)):
+    items, total = await entity_dao.list_page(
+        db, q=q, page=page, page_size=page_size)
     return EntityPage(items=items, total=total, page=page,
                       page_size=page_size)
 
 
 @router.get("/{entity_id}", response_model=EntityDetail)
 async def get_entity(entity_id: int,
-                     container: Container = Depends(get_container)):
-    detail = entity_dao.get_detail(container.db, entity_id)
+                     db: psycopg.AsyncConnection = Depends(get_db)):
+    detail = await entity_dao.get_detail(db, entity_id)
     if detail is None:
         raise HTTPException(status_code=404, detail="entity not found")
     return detail
@@ -55,33 +58,34 @@ async def get_entity(entity_id: int,
 
 @router.get("/{entity_id}/views", response_model=EntityViews)
 async def entity_views(entity_id: int,
-                       container: Container = Depends(get_container)):
+                       db: psycopg.AsyncConnection = Depends(get_db)):
     """The views index: topics the entity has spoken on, with statement /
     shift aggregates (statement_count desc)."""
-    ref = _entity_ref(container, entity_id)
+    ref = await _entity_ref(db, entity_id)
     return EntityViews(
         entity=ref,
-        topics=statement_dao.views_for_entity(container.db, entity_id))
+        topics=await statement_dao.views_for_entity(db, entity_id))
 
 
 @router.get("/{entity_id}/views/{topic}", response_model=TopicViews)
 async def entity_topic_views(entity_id: int, topic: str,
-                             container: Container = Depends(get_container)):
+                             container: Container = Depends(get_container),
+                             db: psycopg.AsyncConnection = Depends(get_db)):
     """The per-topic view: cached evolution summary (lazily regenerated
     here when stale — governed; a governor block serves the stale text with
     stale=true), the statement timeline (newest first) and open shifts."""
-    _entity_ref(container, entity_id)
+    await _entity_ref(db, entity_id)
     governor = container.governor
     assert governor is not None
     summary = await position_tracker.get_view_summary(
-        container.db, container.llm, governor, entity_id, topic)
+        db, container.llm, governor, entity_id, topic)
     return TopicViews(
         topic=topic,
         evolution_summary=summary,
-        statements=statement_dao.statements_for_topic(
-            container.db, entity_id, topic),
-        shifts=statement_dao.shifts_for_topic(
-            container.db, entity_id, topic))
+        statements=await statement_dao.statements_for_topic(
+            db, entity_id, topic),
+        shifts=await statement_dao.shifts_for_topic(
+            db, entity_id, topic))
 
 
 @router.get("/{entity_id}/documents", response_model=DocumentPage)
@@ -89,10 +93,10 @@ async def entity_documents(entity_id: int,
                            page: int = Query(default=1, ge=1),
                            page_size: int = Query(default=20, ge=1,
                                                   le=MAX_PAGE_SIZE),
-                           container: Container = Depends(get_container)):
-    if not entity_dao.exists(container.db, entity_id):
+                           db: psycopg.AsyncConnection = Depends(get_db)):
+    if not await entity_dao.exists(db, entity_id):
         raise HTTPException(status_code=404, detail="entity not found")
-    items, total = entity_dao.documents_for(
-        container.db, entity_id, page=page, page_size=page_size)
+    items, total = await entity_dao.documents_for(
+        db, entity_id, page=page, page_size=page_size)
     return DocumentPage(items=items, total=total, page=page,
                         page_size=page_size)

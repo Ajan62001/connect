@@ -3,16 +3,16 @@
 edge.relation is free TEXT in the DDL; the controlled vocabulary lives in
 domain/enums.EDGE_RELATIONS and is enforced HERE (adding a relation must
 never require a table rebuild). Inserts are idempotent against the
-active-edge unique index (OR IGNORE).
+active-edge partial unique index (ON CONFLICT ... WHERE status='active'
+DO NOTHING).
 """
 
 from __future__ import annotations
 
-import json
-import sqlite3
+import psycopg
 
 from connect.domain import enums as E
-from connect.storage.db import utc_now
+from connect.storage.pg import Jsonb, utc_now
 
 # v8 causal vocabulary + node-type signatures (design §4): reaction_to /
 # triggered_by connect events; enables/blocks span events and entities;
@@ -29,11 +29,15 @@ CAUSAL_SIGNATURES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "alternative_to": (("entity", "event"), ("entity", "event")),
 }
 
+_ON_CONFLICT_ACTIVE = (
+    " ON CONFLICT (src_type, src_id, dst_type, dst_id, relation)"
+    " WHERE status = 'active' DO NOTHING RETURNING id")
 
-def insert(conn: sqlite3.Connection, *, src_type: str, src_id: int,
-           dst_type: str, dst_id: int, relation: str,
-           provenance_document_id: int | None = None,
-           grade: int = 1) -> int | None:
+
+async def insert(conn: psycopg.AsyncConnection, *, src_type: str,
+                 src_id: int, dst_type: str, dst_id: int, relation: str,
+                 provenance_document_id: int | None = None,
+                 grade: int = 1) -> int | None:
     """Insert an active edge; returns the new edge id, or None when an
     identical active edge already exists (idx_edge_active_unique)."""
     if relation not in E.EDGE_RELATIONS:
@@ -41,24 +45,26 @@ def insert(conn: sqlite3.Connection, *, src_type: str, src_id: int,
     if src_type not in E.NODE_TYPES or dst_type not in E.NODE_TYPES:
         raise ValueError(f"unknown node type {src_type!r}/{dst_type!r}")
     now = utc_now()
-    with conn:
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO edge"
+    async with conn.transaction():
+        cur = await conn.execute(
+            "INSERT INTO edge"
             " (src_type, src_id, dst_type, dst_id, relation,"
             "  provenance_document_id, grade, asserted_at, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            + _ON_CONFLICT_ACTIVE,
             (src_type, src_id, dst_type, dst_id, relation,
              provenance_document_id, grade, now, now))
-    return int(cur.lastrowid) if cur.rowcount else None
+        row = await cur.fetchone()
+    return int(row["id"]) if row else None
 
 
-def insert_causal(conn: sqlite3.Connection, *, src_type: str, src_id: int,
-                  dst_type: str, dst_id: int, relation: str,
-                  properties: dict | None = None,
-                  provenance_document_id: int | None = None,
-                  provenance_dossier_id: int | None = None,
-                  confidence: float | None = None,
-                  grade: int = 2) -> int:
+async def insert_causal(conn: psycopg.AsyncConnection, *, src_type: str,
+                        src_id: int, dst_type: str, dst_id: int,
+                        relation: str, properties: dict | None = None,
+                        provenance_document_id: int | None = None,
+                        provenance_dossier_id: int | None = None,
+                        confidence: float | None = None,
+                        grade: int = 2) -> int:
     """Insert one investigation-grade causal edge (idempotent against the
     active-edge unique index). Returns the edge id — the EXISTING active
     edge's id when an identical edge is already present, so findings always
@@ -81,31 +87,35 @@ def insert_causal(conn: sqlite3.Connection, *, src_type: str, src_id: int,
             "alternative_to connects same-kind nodes "
             f"({src_type!r} != {dst_type!r})")
     now = utc_now()
-    with conn:
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO edge"
+    async with conn.transaction():
+        cur = await conn.execute(
+            "INSERT INTO edge"
             " (src_type, src_id, dst_type, dst_id, relation, properties,"
             "  provenance_document_id, provenance_dossier_id, confidence,"
             "  grade, asserted_at, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            + _ON_CONFLICT_ACTIVE,
             (src_type, src_id, dst_type, dst_id, relation,
-             json.dumps(properties or {}), provenance_document_id,
+             Jsonb(properties or {}), provenance_document_id,
              provenance_dossier_id, confidence, grade, now, now))
-    if cur.rowcount:
-        return int(cur.lastrowid)  # type: ignore[arg-type]
-    row = conn.execute(
-        "SELECT id FROM edge WHERE src_type = ? AND src_id = ?"
-        " AND dst_type = ? AND dst_id = ? AND relation = ?"
+        row = await cur.fetchone()
+    if row is not None:
+        return int(row["id"])
+    cur = await conn.execute(
+        "SELECT id FROM edge WHERE src_type = %s AND src_id = %s"
+        " AND dst_type = %s AND dst_id = %s AND relation = %s"
         " AND status = 'active'",
-        (src_type, src_id, dst_type, dst_id, relation)).fetchone()
-    assert row is not None, "active edge vanished mid-insert"
-    return int(row[0])
+        (src_type, src_id, dst_type, dst_id, relation))
+    existing = await cur.fetchone()
+    assert existing is not None, "active edge vanished mid-insert"
+    return int(existing["id"])
 
 
-def insert_links_to(conn: sqlite3.Connection, parent_document_id: int,
-                    child_document_id: int) -> int | None:
+async def insert_links_to(conn: psycopg.AsyncConnection,
+                          parent_document_id: int,
+                          child_document_id: int) -> int | None:
     """document(parent) -[links_to]-> document(child); provenance = parent."""
-    return insert(
+    return await insert(
         conn,
         src_type="document", src_id=parent_document_id,
         dst_type="document", dst_id=child_document_id,

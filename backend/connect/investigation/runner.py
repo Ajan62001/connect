@@ -1,6 +1,8 @@
 """InvestigationService — dossier lifecycle + the MANUAL tool loop
-(design §2.3). One 'investigation' job per run over the existing JobRunner;
-job_event.seq is the SSE id, exactly the Phase-3 analyses contract.
+(design §2.3). One 'investigation' job per run; start() enqueues a
+self-describing payload (seed + options) and the registered handler
+(workers/handlers/investigation.py) drives run(). job_event.seq is the
+SSE id, exactly the Phase-3 analyses contract.
 
 The loop drives ``complete_with_tools`` directly (NOT the generic
 tool_loop template) because every turn is individually metered: ledger row
@@ -14,10 +16,11 @@ synthesize is re-runnable from rows alone.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import sqlite3
 from typing import Any
+
+import psycopg
+from psycopg_pool import AsyncConnectionPool
 
 from connect.analysis.budget import AnalysisBudget
 from connect.ingestion.pipeline import IngestionPipeline
@@ -48,10 +51,11 @@ from connect.llm.provider import (
 from connect.llm.spend import BudgetExceeded, Governor
 from connect.llm.tiers import ModelTier
 from connect.orchestration import events
-from connect.orchestration.jobs import JobRunner
 from connect.retrieval.search_client import SearchClient
 from connect.sources.seeds import WEB_INVESTIGATION_SOURCE
-from connect.storage.db import utc_now
+from connect.storage.pg import Jsonb, utc_now
+from connect.workers.queue import JobQueue
+from connect.workers.registry import CancelToken
 
 log = logging.getLogger(__name__)
 
@@ -69,7 +73,7 @@ FORCE_CONCLUDE_FRACTION = 0.85
 
 
 class InvestigationService:
-    def __init__(self, conn: sqlite3.Connection, *, jobs: JobRunner,
+    def __init__(self, pool: AsyncConnectionPool, *, jobs: JobQueue,
                  provider: LLMProvider | None, governor: Governor,
                  search: SearchClient, ingest: IngestionPipeline | None,
                  embedder: Embedder, vectors: VectorIndex | None,
@@ -78,7 +82,7 @@ class InvestigationService:
                  default_max_web_fetches: int = 8,
                  synthesis_reserve_usd: float = 0.20,
                  synthesis_tier: str = "deep"):
-        self.conn = conn
+        self.pool = pool
         self.jobs = jobs
         self.provider = provider
         self.governor = governor          # the INVESTIGATION governor
@@ -100,143 +104,160 @@ class InvestigationService:
             max_iterations=self.default_max_iterations,
             max_web_fetches=self.default_max_web_fetches)
 
-    def start(self, seed: InvestigationSeed,
-              options: InvestigationOptions | None = None,
-              ) -> tuple[int, int]:
-        """Create dossier(kind='investigation') + the job; returns
-        (investigation_id, job_id). Raises LookupError when the seed
-        references a missing row."""
+    async def start(self, seed: InvestigationSeed,
+                    options: InvestigationOptions | None = None,
+                    ) -> tuple[int, int]:
+        """Create dossier(kind='investigation') + enqueue the job (the
+        payload is self-describing: the registered handler reconstructs
+        seed + options from it); returns (investigation_id, job_id).
+        Raises LookupError when the seed references a missing row."""
         opts = options or self.default_options()
-        input_text, input_type, parent_question_id = scoping.resolve_seed(
-            self.conn, seed)
-        with self.conn:
-            cur = self.conn.execute(
-                "INSERT INTO dossier (kind, input_text, input_type,"
-                " parent_question_id, budget_usd, status, created_at)"
-                " VALUES ('investigation', ?, ?, ?, ?, 'pending', ?)",
-                (input_text, input_type, parent_question_id,
-                 opts.budget_usd, utc_now()))
-            dossier_id = int(cur.lastrowid)  # type: ignore[arg-type]
-            if parent_question_id is not None:
-                self.conn.execute(
-                    "UPDATE question SET spawned_dossier_id = ?,"
-                    " updated_at = ? WHERE id = ?",
-                    (dossier_id, utc_now(), parent_question_id))
-
-        holder: dict[str, int] = {}
-
-        async def _run():
-            return await self._run_investigation(
-                dossier_id, seed, opts, holder["job_id"])
-
-        job_id = self.jobs.submit(
+        async with self.pool.connection() as conn:
+            input_text, input_type, parent_question_id = \
+                await scoping.resolve_seed(conn, seed)
+            async with conn.transaction():
+                cur = await conn.execute(
+                    "INSERT INTO dossier (kind, input_text, input_type,"
+                    " parent_question_id, budget_usd, status, created_at)"
+                    " VALUES ('investigation', %s, %s, %s, %s, 'pending',"
+                    " %s) RETURNING id",
+                    (input_text, input_type, parent_question_id,
+                     opts.budget_usd, utc_now()))
+                dossier_id = int((await cur.fetchone())["id"])
+                if parent_question_id is not None:
+                    await conn.execute(
+                        "UPDATE question SET spawned_dossier_id = %s,"
+                        " updated_at = %s WHERE id = %s",
+                        (dossier_id, utc_now(), parent_question_id))
+        job_id = await self.jobs.enqueue(
             "investigation",
-            {"dossier_id": dossier_id, "options": opts.model_dump()}, _run)
-        holder["job_id"] = job_id
-        with self.conn:
-            self.conn.execute("UPDATE job SET dossier_id = ? WHERE id = ?",
-                              (dossier_id, job_id))
+            {"dossier_id": dossier_id, "seed": seed.model_dump(),
+             "options": opts.model_dump()},
+            dossier_id=dossier_id)
         return dossier_id, job_id
 
-    def job_for(self, dossier_id: int) -> int | None:
-        row = self.conn.execute(
-            "SELECT id FROM job WHERE dossier_id = ?"
-            " ORDER BY id DESC LIMIT 1", (dossier_id,)).fetchone()
-        return int(row[0]) if row else None
+    async def job_for(self, dossier_id: int) -> int | None:
+        async with self.pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT id FROM job WHERE dossier_id = %s"
+                " ORDER BY id DESC LIMIT 1", (dossier_id,))
+            row = await cur.fetchone()
+        return int(row["id"]) if row else None
 
-    def cancel(self, dossier_id: int) -> bool:
-        row = self.conn.execute(
-            "SELECT status FROM dossier WHERE id = ?"
-            " AND kind = 'investigation'", (dossier_id,)).fetchone()
-        if row is None or row["status"] not in ("pending", "running"):
-            return False
-        job_id = self.job_for(dossier_id)
-        if job_id is not None:
-            self.jobs.cancel_job(job_id)
-        self._set_dossier(dossier_id, "cancelled", finished=True)
+    async def cancel(self, dossier_id: int) -> bool:
+        async with self.pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT status FROM dossier WHERE id = %s"
+                " AND kind = 'investigation'", (dossier_id,))
+            row = await cur.fetchone()
+            if row is None or row["status"] not in ("pending", "running"):
+                return False
+            job_id = await self.job_for(dossier_id)
+            if job_id is not None:
+                await self.jobs.request_cancel(job_id)
+            await self._set_dossier(conn, dossier_id, "cancelled",
+                                    finished=True)
         return True
 
-    # -- the job coroutine -----------------------------------------------------------
+    # -- the job body (driven by the registered 'investigation' handler) --------------
 
-    async def _run_investigation(self, dossier_id: int,
-                                 seed: InvestigationSeed,
-                                 opts: InvestigationOptions,
-                                 job_id: int) -> None:
+    async def run(self, conn: psycopg.AsyncConnection, dossier_id: int,
+                  seed: InvestigationSeed,
+                  opts: InvestigationOptions, *, job_id: int,
+                  cancel: CancelToken | None = None) -> None:
         if self.provider is None:
-            self._set_dossier(dossier_id, "failed", finished=True,
-                              error="ANTHROPIC_API_KEY not set")
+            await self._set_dossier(conn, dossier_id, "failed",
+                                    finished=True,
+                                    error="ANTHROPIC_API_KEY not set")
             raise LLMError("LLM provider not configured "
                            "(ANTHROPIC_API_KEY not set)")
 
-        def emit(type_: str, data: dict[str, Any] | None = None) -> int:
-            return events.emit(self.conn, job_id, type_, data)
+        async def emit(type_: str,
+                       data: dict[str, Any] | None = None) -> int:
+            return await events.emit(conn, job_id, type_, data)
 
-        self._set_dossier(dossier_id, "running", started=True)
+        await self._set_dossier(conn, dossier_id, "running", started=True)
         budget = AnalysisBudget(opts.budget_usd)
         stage = "scope"
         try:
-            pack = self._stage_scope(dossier_id, seed, emit)
+            # stage boundaries + loop iterations are the cooperative-cancel
+            # checkpoints
+            if cancel is not None:
+                await cancel.raise_if_cancelled()
+            pack = await self._stage_scope(conn, dossier_id, seed, emit)
             stage = "investigate"
+            if cancel is not None:
+                await cancel.raise_if_cancelled()
             state = await self._stage_investigate(
-                dossier_id, pack, opts, budget, emit)
+                conn, dossier_id, pack, opts, budget, emit, cancel=cancel)
             stage = "synthesize"
+            if cancel is not None:
+                await cancel.raise_if_cancelled()
             await self._stage_synthesize(
-                dossier_id, pack, budget, state, emit)
+                conn, dossier_id, pack, budget, state, emit)
         except asyncio.CancelledError:
-            self._section_finish(dossier_id, stage, "failed")
-            self._set_dossier(dossier_id, "cancelled", finished=True)
-            self._save_usage(dossier_id, budget, None)
+            await self._section_finish(conn, dossier_id, stage, "failed")
+            await self._set_dossier(conn, dossier_id, "cancelled",
+                                    finished=True)
+            await self._save_usage(conn, dossier_id, budget, None)
             raise
         except Exception as e:
-            self._section_finish(dossier_id, stage, "failed")
-            self._set_dossier(dossier_id, "failed", finished=True,
-                              error=str(e))
-            self._save_usage(dossier_id, budget, None)
+            await self._section_finish(conn, dossier_id, stage, "failed")
+            await self._set_dossier(conn, dossier_id, "failed",
+                                    finished=True, error=str(e))
+            await self._save_usage(conn, dossier_id, budget, None)
             raise
-        self._set_dossier(dossier_id, "completed", finished=True)
-        return None  # JobRunner's 'done' event carries empty data
+        await self._set_dossier(conn, dossier_id, "completed",
+                                finished=True)
+        return None  # the queue's 'done' event carries empty data
 
     # -- stage: scope (zero LLM) -------------------------------------------------------
 
-    def _stage_scope(self, dossier_id: int, seed: InvestigationSeed,
-                     emit) -> ScopePack:
-        self._section_start(dossier_id, "scope")
-        row = self.conn.execute(
-            "SELECT input_text, input_type FROM dossier WHERE id = ?",
-            (dossier_id,)).fetchone()
-        pack = scoping.build_scope_pack(
-            self.conn, embedder=self.embedder, vectors=self.vectors,
+    async def _stage_scope(self, conn: psycopg.AsyncConnection,
+                           dossier_id: int, seed: InvestigationSeed,
+                           emit) -> ScopePack:
+        await self._section_start(conn, dossier_id, "scope")
+        cur = await conn.execute(
+            "SELECT input_text, input_type FROM dossier WHERE id = %s",
+            (dossier_id,))
+        row = await cur.fetchone()
+        pack = await scoping.build_scope_pack(
+            conn, embedder=self.embedder, vectors=self.vectors,
             input_text=row["input_text"], input_type=row["input_type"],
             seed=seed)
         summary = (f"{len(pack.documents)} docs, {len(pack.anchors)}"
                    f" anchors, {len(pack.timeline)} timeline items,"
                    f" {len(pack.reaction_candidates)} reaction candidates,"
                    f" coverage {pack.coverage}")
-        self._section_complete(dossier_id, "scope",
-                               {"summary": summary, **pack.model_dump()})
-        emit("section_completed", {"section": "scope", "summary": summary})
+        await self._section_complete(conn, dossier_id, "scope",
+                                     {"summary": summary,
+                                      **pack.model_dump()})
+        await emit("section_completed", {"section": "scope",
+                                         "summary": summary})
         return pack
 
     # -- stage: investigate (the manual loop) --------------------------------------------
 
-    async def _stage_investigate(self, dossier_id: int, pack: ScopePack,
+    async def _stage_investigate(self, conn: psycopg.AsyncConnection,
+                                 dossier_id: int, pack: ScopePack,
                                  opts: InvestigationOptions,
-                                 budget: AnalysisBudget,
-                                 emit) -> InvestigationState:
+                                 budget: AnalysisBudget, emit,
+                                 cancel: CancelToken | None = None,
+                                 ) -> InvestigationState:
         assert self.provider is not None
-        self._section_start(dossier_id, "investigate")
+        await self._section_start(conn, dossier_id, "investigate")
         await questions_mod.generate_questions(
-            self.conn, self.provider, dossier_id=dossier_id, pack=pack,
+            conn, self.provider, dossier_id=dossier_id, pack=pack,
             governor=self.governor, budget=budget, emit=emit)
 
         state = InvestigationState(
             dossier_id=dossier_id, max_web_fetches=opts.max_web_fetches)
         executor = ToolExecutor(
-            self.conn, pipeline=self.ingest, search=self.search,
+            conn, pipeline=self.ingest, search=self.search,
             embedder=self.embedder, vectors=self.vectors, scope_pack=pack,
             state=state, emit=emit,
-            web_source_id=self._web_source_id(),
-            t1_enrich=self._make_t1_enricher(budget))
+            web_source_id=await self._web_source_id(conn),
+            t1_enrich=self._make_t1_enricher(conn, budget))
 
         model = self.provider.model_for(ModelTier.BALANCED)
         turn_proj = spend.cost_usd(model, input_tokens=EST_LOOP_IN,
@@ -245,13 +266,15 @@ class InvestigationService:
         messages: list[dict[str, Any]] = [{
             "role": "user",
             "content": scoping.render_scope_pack(pack)
-            + questions_mod.render_questions(self.conn, dossier_id)}]
+            + await questions_mod.render_questions(conn, dossier_id)}]
 
         iterations = 0
         force_next = False
         for n in range(1, opts.max_iterations + 1):
             if state.concluded:
                 break
+            if cancel is not None:  # iteration = cancel checkpoint
+                await cancel.raise_if_cancelled()
             spent = budget.spent_usd
             if (not state.corpus_only
                     and spent >= CORPUS_ONLY_FRACTION * opts.budget_usd):
@@ -261,7 +284,7 @@ class InvestigationService:
                      or spent + turn_proj > loop_cap)
             if not force:
                 try:
-                    self.governor.check(turn_proj)
+                    await self.governor.check(turn_proj)
                 except BudgetExceeded:
                     force = True  # one last forced-conclude call
             turn = await self.provider.complete_with_tools(
@@ -269,18 +292,18 @@ class InvestigationService:
                 tools=TOOL_DEFS, tier=ModelTier.BALANCED,
                 max_tokens=LOOP_MAX_TOKENS,
                 tool_choice="conclude" if force else None)
-            spend.record_call(self.conn, purpose=PURPOSE_INVESTIGATION,
-                              model=turn.model, usage=turn.usage)
+            await spend.record_call(conn, purpose=PURPOSE_INVESTIGATION,
+                                    model=turn.model, usage=turn.usage)
             budget.add(spend.cost_usd(
                 turn.model, input_tokens=turn.usage.input_tokens,
                 output_tokens=turn.usage.output_tokens,
                 cache_read_tokens=turn.usage.cache_read_tokens))
             iterations = n
-            emit("iteration", {
+            await emit("iteration", {
                 "n": n, "tools": [c.name for c in turn.tool_calls],
                 "cost_so_far": round(budget.spent_usd, 4),
                 "forced": force, "corpus_only": state.corpus_only})
-            self._save_usage(dossier_id, budget, state)
+            await self._save_usage(conn, dossier_id, budget, state)
 
             if not turn.tool_calls:
                 # end_turn without tools -> forced conclude next turn
@@ -306,7 +329,7 @@ class InvestigationService:
                    f" ${budget.spent_usd:.4f} spent"
                    + ("" if state.concluded else "; loop ended without"
                                                  " conclude"))
-        self._section_complete(dossier_id, "investigate", {
+        await self._section_complete(conn, dossier_id, "investigate", {
             "summary": summary,
             "iterations": iterations,
             "concluded": state.concluded,
@@ -319,38 +342,47 @@ class InvestigationService:
             "corpus_only": state.corpus_only,
             "cost_usd": round(budget.spent_usd, 4),
         })
-        emit("section_completed", {"section": "investigate",
-                                   "summary": summary})
+        await emit("section_completed", {"section": "investigate",
+                                         "summary": summary})
         return state
 
     # -- stage: synthesize ---------------------------------------------------------------
 
-    async def _stage_synthesize(self, dossier_id: int, pack: ScopePack,
+    async def _stage_synthesize(self, conn: psycopg.AsyncConnection,
+                                dossier_id: int, pack: ScopePack,
                                 budget: AnalysisBudget,
                                 state: InvestigationState, emit) -> None:
         assert self.provider is not None
-        self._section_start(dossier_id, "synthesize")
+        await self._section_start(conn, dossier_id, "synthesize")
+
+        async def _writer(d_id, stage, content, status="completed"):
+            await self._write_section(conn, d_id, stage, content,
+                                      status=status)
+
         summary = await synthesize.run(
-            self.conn, self.provider, dossier_id=dossier_id, pack=pack,
+            conn, self.provider, dossier_id=dossier_id, pack=pack,
             budget=budget, governor=self.governor, emit=emit,
             tier_pref=self.synthesis_tier,
             reserve_usd=self.synthesis_reserve_usd,
-            section_writer=self._write_section)
-        self._section_complete(dossier_id, "synthesize",
-                               {"summary": summary})
-        emit("section_completed", {"section": "synthesize",
-                                   "summary": summary})
-        self._save_usage(dossier_id, budget, state)
+            section_writer=_writer)
+        await self._section_complete(conn, dossier_id, "synthesize",
+                                     {"summary": summary})
+        await emit("section_completed", {"section": "synthesize",
+                                         "summary": summary})
+        await self._save_usage(conn, dossier_id, budget, state)
 
     # -- plumbing -----------------------------------------------------------------------
 
-    def _web_source_id(self) -> int | None:
-        row = self.conn.execute(
-            "SELECT id FROM source WHERE name = ?",
-            (WEB_INVESTIGATION_SOURCE,)).fetchone()
-        return int(row[0]) if row else None
+    async def _web_source_id(self,
+                             conn: psycopg.AsyncConnection) -> int | None:
+        cur = await conn.execute(
+            "SELECT id FROM source WHERE name = %s",
+            (WEB_INVESTIGATION_SOURCE,))
+        row = await cur.fetchone()
+        return int(row["id"]) if row else None
 
-    def _make_t1_enricher(self, budget: AnalysisBudget):
+    def _make_t1_enricher(self, conn: psycopg.AsyncConnection,
+                          budget: AnalysisBudget):
         """Synchronous T1 on investigation-fetched docs, ledgered under
         'investigation_t1' and debited against the per-run budget. Never
         raises into the fetch tool."""
@@ -359,15 +391,17 @@ class InvestigationService:
         async def _enrich(document_id: int) -> bool:
             if provider is None:
                 return False
-            row = self.conn.execute(
-                "SELECT id, title, content_text FROM document WHERE id = ?",
-                (document_id,)).fetchone()
+            cur = await conn.execute(
+                "SELECT id, title, content_text FROM document"
+                " WHERE id = %s",
+                (document_id,))
+            row = await cur.fetchone()
             if row is None:
                 return False
             model = provider.model_for(ModelTier.FAST)
             projected = spend.estimated_t1_cost(model, batch=False)
             try:
-                self.governor.check(projected)
+                await self.governor.check(projected)
                 budget.check(projected)
             except RuntimeError as e:
                 log.warning("investigation T1 skipped (doc %s): %s",
@@ -380,106 +414,113 @@ class InvestigationService:
             except LLMError as e:
                 log.warning("investigation T1 failed (doc %s): %s",
                             document_id, e)
-                t1_persist.mark_failed(self.conn, document_id)
+                await t1_persist.mark_failed(conn, document_id)
                 return False
-            spend.record_call(self.conn, purpose=PURPOSE_INVESTIGATION_T1,
-                              model=completion.model,
-                              usage=completion.usage)
+            await spend.record_call(conn,
+                                    purpose=PURPOSE_INVESTIGATION_T1,
+                                    model=completion.model,
+                                    usage=completion.usage)
             budget.add(spend.cost_usd(
                 completion.model,
                 input_tokens=completion.usage.input_tokens,
                 output_tokens=completion.usage.output_tokens,
                 cache_read_tokens=completion.usage.cache_read_tokens))
             try:
-                t1_persist.persist_t1(
-                    self.conn, document_id=document_id,
+                await t1_persist.persist_t1(
+                    conn, document_id=document_id,
                     result=completion.output, model=completion.model)
-            except sqlite3.Error:
+            except psycopg.Error:
                 log.exception("investigation T1 persist failed (doc %s)",
                               document_id)
-                t1_persist.mark_failed(self.conn, document_id)
+                await t1_persist.mark_failed(conn, document_id)
                 return False
             return True
 
         return _enrich
 
-    def _save_usage(self, dossier_id: int, budget: AnalysisBudget,
-                    state: InvestigationState | None) -> None:
+    async def _save_usage(self, conn: psycopg.AsyncConnection,
+                          dossier_id: int, budget: AnalysisBudget,
+                          state: InvestigationState | None) -> None:
         usage: dict[str, Any] = {"cost_usd": round(budget.spent_usd, 6)}
         if state is not None:
             usage["docs_added"] = state.docs_added
             usage["web_fetches_used"] = state.web_fetches_used
         else:
-            row = self.conn.execute(
-                "SELECT model_usage FROM dossier WHERE id = ?",
-                (dossier_id,)).fetchone()
+            cur = await conn.execute(
+                "SELECT model_usage FROM dossier WHERE id = %s",
+                (dossier_id,))
+            row = await cur.fetchone()
             if row is not None:
-                try:
-                    prior = json.loads(row["model_usage"] or "{}")
-                except ValueError:
-                    prior = {}
+                prior = (row["model_usage"]
+                         if isinstance(row["model_usage"], dict) else {})
                 usage = {**prior, **usage}
-        with self.conn:
-            self.conn.execute(
-                "UPDATE dossier SET model_usage = ? WHERE id = ?",
-                (json.dumps(usage), dossier_id))
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE dossier SET model_usage = %s WHERE id = %s",
+                (Jsonb(usage), dossier_id))
 
-    def _section_start(self, dossier_id: int, stage: str) -> None:
+    async def _section_start(self, conn: psycopg.AsyncConnection,
+                             dossier_id: int, stage: str) -> None:
         now = utc_now()
-        with self.conn:
-            self.conn.execute(
+        async with conn.transaction():
+            await conn.execute(
                 "INSERT INTO dossier_section (dossier_id, stage, status,"
-                " content, created_at) VALUES (?,?, 'running', '{}', ?)"
+                " content, created_at) VALUES (%s,%s, 'running', '{}', %s)"
                 " ON CONFLICT (dossier_id, stage) DO UPDATE SET"
-                " status='running', content='{}', created_at=excluded"
-                ".created_at, updated_at=NULL",
+                " status='running', content='{}'::jsonb,"
+                " created_at=EXCLUDED.created_at, updated_at=NULL",
                 (dossier_id, stage, now))
-            self.conn.execute(
-                "UPDATE dossier SET current_stage = ? WHERE id = ?",
+            await conn.execute(
+                "UPDATE dossier SET current_stage = %s WHERE id = %s",
                 (stage, dossier_id))
 
-    def _section_complete(self, dossier_id: int, stage: str,
-                          content: dict[str, Any]) -> None:
-        self._write_section(dossier_id, stage, content, status="completed")
+    async def _section_complete(self, conn: psycopg.AsyncConnection,
+                                dossier_id: int, stage: str,
+                                content: dict[str, Any]) -> None:
+        await self._write_section(conn, dossier_id, stage, content,
+                                  status="completed")
 
-    def _write_section(self, dossier_id: int, stage: str,
-                       content: dict[str, Any],
-                       status: str = "completed") -> None:
+    async def _write_section(self, conn: psycopg.AsyncConnection,
+                             dossier_id: int, stage: str,
+                             content: dict[str, Any],
+                             status: str = "completed") -> None:
         now = utc_now()
-        with self.conn:
-            self.conn.execute(
+        async with conn.transaction():
+            await conn.execute(
                 "INSERT INTO dossier_section (dossier_id, stage, status,"
                 " content, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,?)"
+                " VALUES (%s,%s,%s,%s,%s,%s)"
                 " ON CONFLICT (dossier_id, stage) DO UPDATE SET"
-                " status=excluded.status, content=excluded.content,"
-                " updated_at=excluded.updated_at",
-                (dossier_id, stage, status, json.dumps(content), now, now))
+                " status=EXCLUDED.status, content=EXCLUDED.content,"
+                " updated_at=EXCLUDED.updated_at",
+                (dossier_id, stage, status, Jsonb(content), now, now))
 
-    def _section_finish(self, dossier_id: int, stage: str,
-                        status: str) -> None:
-        with self.conn:
-            self.conn.execute(
-                "UPDATE dossier_section SET status = ?, updated_at = ?"
-                " WHERE dossier_id = ? AND stage = ?"
+    async def _section_finish(self, conn: psycopg.AsyncConnection,
+                              dossier_id: int, stage: str,
+                              status: str) -> None:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE dossier_section SET status = %s, updated_at = %s"
+                " WHERE dossier_id = %s AND stage = %s"
                 " AND status = 'running'",
                 (status, utc_now(), dossier_id, stage))
 
-    def _set_dossier(self, dossier_id: int, status: str, *,
-                     started: bool = False, finished: bool = False,
-                     error: str | None = None) -> None:
-        sets, params = ["status = ?"], [status]
+    async def _set_dossier(self, conn: psycopg.AsyncConnection,
+                           dossier_id: int, status: str, *,
+                           started: bool = False, finished: bool = False,
+                           error: str | None = None) -> None:
+        sets, params = ["status = %s"], [status]
         if started:
-            sets.append("started_at = ?")
+            sets.append("started_at = %s")
             params.append(utc_now())
         if finished:
-            sets.append("finished_at = ?")
+            sets.append("finished_at = %s")
             params.append(utc_now())
         if error is not None:
-            sets.append("error = ?")
+            sets.append("error = %s")
             params.append(error)
         params.append(dossier_id)
-        with self.conn:
-            self.conn.execute(
-                f"UPDATE dossier SET {', '.join(sets)} WHERE id = ?",
+        async with conn.transaction():
+            await conn.execute(
+                f"UPDATE dossier SET {', '.join(sets)} WHERE id = %s",
                 params)

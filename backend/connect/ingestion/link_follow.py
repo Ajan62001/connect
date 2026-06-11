@@ -25,8 +25,9 @@ document-[links_to]->document edge is written (provenance = parent, grade 1).
 from __future__ import annotations
 
 import logging
-import sqlite3
 from typing import TYPE_CHECKING
+
+import psycopg
 from urllib.parse import urlsplit
 
 from connect.domain.models import Document, DocumentLink
@@ -62,7 +63,7 @@ def select_candidates(links: list[DocumentLink], *,
     return (official + same_domain_files)[:max_per_doc]
 
 
-async def follow_link(conn: sqlite3.Connection,
+async def follow_link(conn: psycopg.AsyncConnection,
                       pipeline: "IngestionPipeline",
                       link: DocumentLink, *,
                       parent_id: int) -> Document | None:
@@ -71,21 +72,22 @@ async def follow_link(conn: sqlite3.Connection,
     try:
         # A document already at this exact URL needs no re-fetch — resolve
         # straight to it (politeness budget is the scarce resource here).
-        document = doc_dao.get_by_url(conn, link.url)
+        document = await doc_dao.get_by_url(conn, link.url)
         if document is None:
-            result = await pipeline.ingest_url(link.url, is_link_follow=True)
+            result = await pipeline.ingest_url(conn, link.url,
+                                               is_link_follow=True)
             document = result.document  # created=False = content-dedup hit
     except Exception as e:  # noqa: BLE001 — follow failure is data, never fatal
         log.warning("link follow failed for %s: %s", link.url, e)
-        link_dao.mark_failed(conn, link.id, str(e))
+        await link_dao.mark_failed(conn, link.id, str(e))
         return None
-    link_dao.mark_fetched(conn, link.id, document.id)
+    await link_dao.mark_fetched(conn, link.id, document.id)
     if document.id != parent_id:
-        edge_dao.insert_links_to(conn, parent_id, document.id)
+        await edge_dao.insert_links_to(conn, parent_id, document.id)
     return document
 
 
-async def auto_follow(conn: sqlite3.Connection,
+async def auto_follow(conn: psycopg.AsyncConnection,
                       pipeline: "IngestionPipeline", *,
                       parent_id: int, parent_url: str | None,
                       max_per_doc: int) -> tuple[int, int]:
@@ -94,11 +96,11 @@ async def auto_follow(conn: sqlite3.Connection,
     Runs strictly AFTER the parent row is committed (link rows and the
     parent document are durable before the first fetch goes out).
     """
-    links = link_dao.list_for_document(conn, parent_id)
+    links = await link_dao.list_for_document(conn, parent_id)
     candidates = select_candidates(
         links, parent_url=parent_url, max_per_doc=max_per_doc)
     for link in candidates:  # mark up front: visible work queue
-        link_dao.set_status(conn, link.id, "pending")
+        await link_dao.set_status(conn, link.id, "pending")
     ok = failed = 0
     for link in candidates:
         document = await follow_link(conn, pipeline, link, parent_id=parent_id)

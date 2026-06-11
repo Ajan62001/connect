@@ -1,0 +1,25 @@
+# connect reverse proxy (runtime design §7).
+#
+# CONNECT_DOMAIN unset/empty -> localhost (compose substitutes the empty
+# case; Caddy's own :localhost default covers only unset): Caddy serves
+# https://localhost
+# with its internal CA (self-signed; the browser will warn) and redirects
+# http -> https. Set CONNECT_DOMAIN to a real domain on a VPS (with host
+# ports 80/443 published — see docker-compose.yml) and Caddy provisions
+# Let's Encrypt automatically. That is the entire TLS story.
+#
+# Path routing replaces the Next.js rewrite in production: /api/* goes
+# straight to the backend, so SSE never crosses Next and the build-time
+# BACKEND_URL footgun is structurally gone. flush_interval -1 disables
+# response buffering for the SSE streams (explicit, though Caddy
+# auto-detects text/event-stream).
+{$CONNECT_DOMAIN:localhost} {
+	handle /api/* {
+		reverse_proxy api:8000 {
+			flush_interval -1
+		}
+	}
+	handle {
+		reverse_proxy frontend:3000
+	}
+}

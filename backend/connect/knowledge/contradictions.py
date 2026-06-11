@@ -12,10 +12,11 @@ tier 4 (unverified) for the best-tier columns.
 
 from __future__ import annotations
 
-import sqlite3
-from typing import Any
+from typing import Any, Mapping
 
-from connect.storage.db import utc_now
+import psycopg
+
+from connect.storage.pg import utc_now
 
 _SCAN_SQL = """
 WITH stances AS (
@@ -27,32 +28,34 @@ WITH stances AS (
     WHERE e.stance IN ('supports', 'refutes')
 )
 SELECT claim_id,
-       SUM(stance = 'supports') AS n_s,
-       SUM(stance = 'refutes')  AS n_r,
-       MIN(CASE WHEN stance = 'supports' THEN tier END) AS t_s,
-       MIN(CASE WHEN stance = 'refutes'  THEN tier END) AS t_r
+       COUNT(*) FILTER (WHERE stance = 'supports') AS n_s,
+       COUNT(*) FILTER (WHERE stance = 'refutes')  AS n_r,
+       MIN(tier) FILTER (WHERE stance = 'supports') AS t_s,
+       MIN(tier) FILTER (WHERE stance = 'refutes')  AS t_r
 FROM stances
 GROUP BY claim_id
-HAVING n_s > 0 AND n_r > 0
+HAVING COUNT(*) FILTER (WHERE stance = 'supports') > 0
+   AND COUNT(*) FILTER (WHERE stance = 'refutes') > 0
 """
 
 
-def scan(conn: sqlite3.Connection) -> int:
+async def scan(conn: psycopg.AsyncConnection) -> int:
     """Upsert contradiction rows for every claim with evidence on both
     sides; returns how many rows were inserted or updated."""
-    rows = conn.execute(_SCAN_SQL).fetchall()
+    cur = await conn.execute(_SCAN_SQL)
+    rows = await cur.fetchall()
     now = utc_now()
     touched = 0
-    with conn:
+    async with conn.transaction():
         for row in rows:
-            conn.execute(
+            await conn.execute(
                 "INSERT INTO contradiction (claim_id, n_support, n_refute,"
                 " best_tier_support, best_tier_refute, status, detected_at)"
-                " VALUES (?,?,?,?,?, 'open', ?)"
+                " VALUES (%s,%s,%s,%s,%s, 'open', %s)"
                 " ON CONFLICT (claim_id) DO UPDATE SET"
-                " n_support=excluded.n_support, n_refute=excluded.n_refute,"
-                " best_tier_support=excluded.best_tier_support,"
-                " best_tier_refute=excluded.best_tier_refute",
+                " n_support=EXCLUDED.n_support, n_refute=EXCLUDED.n_refute,"
+                " best_tier_support=EXCLUDED.best_tier_support,"
+                " best_tier_refute=EXCLUDED.best_tier_refute",
                 (row["claim_id"], row["n_s"], row["n_r"], row["t_s"],
                  row["t_r"], now))
             touched += 1
@@ -62,7 +65,7 @@ def scan(conn: sqlite3.Connection) -> int:
 # -- read / mutate (the /api/contradictions surface) --------------------------------
 
 
-def _to_dict(row: sqlite3.Row) -> dict[str, Any]:
+def _to_dict(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "id": row["id"],
         "claim": {"id": row["claim_id"], "text": row["claim_text"],
@@ -84,35 +87,39 @@ FROM contradiction k JOIN claim c ON c.id = k.claim_id
 """
 
 
-def list_page(conn: sqlite3.Connection, *, status: str | None = None,
-              page: int = 1, page_size: int = 20,
-              ) -> tuple[list[dict[str, Any]], int]:
+async def list_page(conn: psycopg.AsyncConnection, *,
+                    status: str | None = None,
+                    page: int = 1, page_size: int = 20,
+                    ) -> tuple[list[dict[str, Any]], int]:
     where, params = "", []
     if status is not None:
-        where = " WHERE k.status = ?"
+        where = " WHERE k.status = %s"
         params.append(status)
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM contradiction k{where}", params).fetchone()[0]
-    rows = conn.execute(
+    cur = await conn.execute(
+        f"SELECT COUNT(*) AS n FROM contradiction k{where}", params)
+    total = (await cur.fetchone())["n"]
+    cur = await conn.execute(
         f"{_LIST_SQL}{where} ORDER BY k.detected_at DESC, k.id DESC"
-        f" LIMIT ? OFFSET ?",
-        (*params, page_size, (page - 1) * page_size)).fetchall()
+        f" LIMIT %s OFFSET %s",
+        (*params, page_size, (page - 1) * page_size))
+    rows = await cur.fetchall()
     return [_to_dict(r) for r in rows], int(total)
 
 
-def get(conn: sqlite3.Connection,
-        contradiction_id: int) -> dict[str, Any] | None:
-    row = conn.execute(f"{_LIST_SQL} WHERE k.id = ?",
-                       (contradiction_id,)).fetchone()
+async def get(conn: psycopg.AsyncConnection,
+              contradiction_id: int) -> dict[str, Any] | None:
+    cur = await conn.execute(f"{_LIST_SQL} WHERE k.id = %s",
+                             (contradiction_id,))
+    row = await cur.fetchone()
     return _to_dict(row) if row else None
 
 
-def dismiss(conn: sqlite3.Connection,
-            contradiction_id: int) -> dict[str, Any] | None:
-    with conn:
-        cur = conn.execute(
-            "UPDATE contradiction SET status = 'dismissed', resolved_at = ?"
-            " WHERE id = ?", (utc_now(), contradiction_id))
+async def dismiss(conn: psycopg.AsyncConnection,
+                  contradiction_id: int) -> dict[str, Any] | None:
+    async with conn.transaction():
+        cur = await conn.execute(
+            "UPDATE contradiction SET status = 'dismissed', resolved_at = %s"
+            " WHERE id = %s", (utc_now(), contradiction_id))
     if cur.rowcount == 0:
         return None
-    return get(conn, contradiction_id)
+    return await get(conn, contradiction_id)

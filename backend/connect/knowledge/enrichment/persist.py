@@ -14,14 +14,15 @@
   claim_sighting rows (grade 1, extractor_model).
 - Idempotent: re-enriching a document deletes its prior T1 rows first; the
   whole replace runs in ONE transaction (raw SQL — the per-statement DAO
-  helpers each own a transaction and would commit mid-way).
+  helpers each own a transaction; psycopg nests them as SAVEPOINTs, but
+  this module keeps the explicit one-transaction shape).
 """
 
 from __future__ import annotations
 
-import json
-import sqlite3
-from typing import Any
+from typing import Any, Mapping
+
+import psycopg
 
 from connect.analysis.grounding import find_span as _find_span
 from connect.analysis.grounding import norm_ws as _norm_ws
@@ -34,9 +35,11 @@ from connect.domain.enums import (
 from connect.knowledge.enrichment.prompts import T1_PROMPT_VERSION
 from connect.knowledge.enrichment.t1 import EnrichmentT1
 from connect.knowledge.taxonomy import EVENT_TYPE_NAMES
-from connect.storage.db import utc_now
+from connect.storage.pg import Jsonb, utc_now
 
 CLAIM_MIN_WORTHINESS = 0.6
+
+_Row = Mapping[str, Any]
 
 
 def _norm_alias(text: str) -> str:
@@ -44,33 +47,33 @@ def _norm_alias(text: str) -> str:
     return _norm_ws(text).lower()
 
 
-def _entity_index(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
+async def _entity_index(conn: psycopg.AsyncConnection) -> dict[str, _Row]:
     """normalized name/alias -> entity row (single-user corpus scale)."""
-    index: dict[str, sqlite3.Row] = {}
-    for row in conn.execute("SELECT id, name, entity_type, aliases FROM entity"):
+    index: dict[str, _Row] = {}
+    cur = await conn.execute(
+        "SELECT id, name, entity_type, aliases FROM entity")
+    for row in await cur.fetchall():
         index.setdefault(_norm_alias(row["name"]), row)
-        try:
-            aliases = json.loads(row["aliases"] or "[]")
-        except (ValueError, TypeError):
-            aliases = []
-        for alias in aliases:
+        for alias in (row["aliases"] or []):
             if isinstance(alias, str):
                 index.setdefault(_norm_alias(alias), row)
     return index
 
 
-def persist_t1(conn: sqlite3.Connection, *, document_id: int,
-               result: EnrichmentT1, model: str,
-               prompt_version: str = T1_PROMPT_VERSION) -> dict[str, Any]:
+async def persist_t1(conn: psycopg.AsyncConnection, *, document_id: int,
+                     result: EnrichmentT1, model: str,
+                     prompt_version: str = T1_PROMPT_VERSION,
+                     ) -> dict[str, Any]:
     """Replace the document's T1 rows with ``result``; one transaction.
 
     Returns counters: topics, entities_created, entities_matched, mentions,
     claims, claims_dropped_span, claims_below_threshold, statements,
     statements_dropped_span, statements_dropped_speaker.
     """
-    doc = conn.execute(
+    cur = await conn.execute(
         "SELECT id, content_text, published_at, fetched_at FROM document"
-        " WHERE id = ?", (document_id,)).fetchone()
+        " WHERE id = %s", (document_id,))
+    doc = await cur.fetchone()
     if doc is None:
         raise ValueError(f"document {document_id} not found")
     content_text = doc["content_text"] or ""
@@ -82,35 +85,38 @@ def persist_t1(conn: sqlite3.Connection, *, document_id: int,
              "claims_below_threshold": 0, "statements": 0,
              "statements_dropped_span": 0, "statements_dropped_speaker": 0}
 
-    entity_index = _entity_index(conn)
+    entity_index = await _entity_index(conn)
 
-    with conn:
+    async with conn.transaction():
         # --- delete-then-insert: replace this document's T1 rows ------------
-        conn.execute(
-            "DELETE FROM document_enrichment WHERE document_id = ?",
+        await conn.execute(
+            "DELETE FROM document_enrichment WHERE document_id = %s",
             (document_id,))
-        conn.execute(
-            "DELETE FROM document_topic WHERE document_id = ? AND source = 't1'",
+        await conn.execute(
+            "DELETE FROM document_topic WHERE document_id = %s"
+            " AND source = 't1'",
             (document_id,))
-        conn.execute(
-            "DELETE FROM entity_mention WHERE document_id = ?", (document_id,))
-        conn.execute(
-            "DELETE FROM claim_sighting WHERE document_id = ?", (document_id,))
-        conn.execute(
-            "DELETE FROM statement WHERE document_id = ?", (document_id,))
+        await conn.execute(
+            "DELETE FROM entity_mention WHERE document_id = %s",
+            (document_id,))
+        await conn.execute(
+            "DELETE FROM claim_sighting WHERE document_id = %s",
+            (document_id,))
+        await conn.execute(
+            "DELETE FROM statement WHERE document_id = %s", (document_id,))
         # claims first sighted here and now orphaned go too
-        conn.execute(
-            "DELETE FROM claim WHERE first_document_id = ? AND NOT EXISTS"
+        await conn.execute(
+            "DELETE FROM claim WHERE first_document_id = %s AND NOT EXISTS"
             " (SELECT 1 FROM claim_sighting WHERE claim_id = claim.id)",
             (document_id,))
 
         # --- enrichment row ---------------------------------------------------
         event_type = (result.event_type
                       if result.event_type in EVENT_TYPE_NAMES else "other")
-        conn.execute(
+        await conn.execute(
             "INSERT INTO document_enrichment (document_id, summary,"
             " event_type, model, prompt_version, created_at)"
-            " VALUES (?,?,?,?,?,?)",
+            " VALUES (%s,%s,%s,%s,%s,%s)",
             (document_id, result.summary, event_type, model,
              prompt_version, now))
 
@@ -118,9 +124,11 @@ def persist_t1(conn: sqlite3.Connection, *, document_id: int,
         for topic in result.topics:
             if topic not in T1_TOPICS:
                 continue
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO document_topic (document_id, topic,"
-                " source) VALUES (?,?, 't1')", (document_id, topic))
+            cur = await conn.execute(
+                "INSERT INTO document_topic (document_id, topic, source)"
+                " VALUES (%s,%s, 't1')"
+                " ON CONFLICT (document_id, topic) DO NOTHING",
+                (document_id, topic))
             stats["topics"] += cur.rowcount
 
         # --- entities: get-or-create by normalized alias-exact match --------
@@ -137,24 +145,28 @@ def persist_t1(conn: sqlite3.Connection, *, document_id: int,
             row = entity_index.get(norm)
             if row is None:
                 entity_type = ent.type if ent.type in ENTITY_TYPES else "other"
-                cur = conn.execute(
-                    "INSERT OR IGNORE INTO entity (name, entity_type,"
-                    " aliases, grade, extractor_model, prompt_version,"
-                    " created_at) VALUES (?,?,?,?,?,?,?)",
-                    (surface, entity_type, json.dumps([surface]), 1,
+                cur = await conn.execute(
+                    "INSERT INTO entity (name, entity_type, aliases, grade,"
+                    " extractor_model, prompt_version, created_at)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s)"
+                    " ON CONFLICT (name, entity_type) DO NOTHING"
+                    " RETURNING id",
+                    (surface, entity_type, Jsonb([surface]), 1,
                      model, prompt_version, now))
-                if cur.rowcount:
-                    entity_id = int(cur.lastrowid)  # type: ignore[arg-type]
+                new_row = await cur.fetchone()
+                if new_row is not None:
+                    entity_id = int(new_row["id"])
                     stats["entities_created"] += 1
                 else:  # UNIQUE(name, entity_type) race with identical name
-                    entity_id = conn.execute(
-                        "SELECT id FROM entity WHERE name = ? AND"
-                        " entity_type = ?", (surface, entity_type)
-                    ).fetchone()[0]
+                    cur = await conn.execute(
+                        "SELECT id FROM entity WHERE name = %s AND"
+                        " entity_type = %s", (surface, entity_type))
+                    entity_id = (await cur.fetchone())["id"]
                     stats["entities_matched"] += 1
-                row = conn.execute(
+                cur = await conn.execute(
                     "SELECT id, name, entity_type, aliases FROM entity"
-                    " WHERE id = ?", (entity_id,)).fetchone()
+                    " WHERE id = %s", (entity_id,))
+                row = await cur.fetchone()
                 entity_index[norm] = row
             else:
                 entity_id = row["id"]
@@ -162,24 +174,25 @@ def persist_t1(conn: sqlite3.Connection, *, document_id: int,
                 # novel surface form (exact string not yet recorded) ->
                 # append to aliases; matching stays normalized, growth is
                 # verbatim so the table keeps real-world spellings
-                aliases = json.loads(row["aliases"] or "[]")
+                aliases = list(row["aliases"] or [])
                 if surface != row["name"] and surface not in aliases:
                     aliases.append(surface)
-                    conn.execute(
-                        "UPDATE entity SET aliases = ?, updated_at = ?"
-                        " WHERE id = ?",
-                        (json.dumps(aliases), now, entity_id))
-                    row = conn.execute(
+                    await conn.execute(
+                        "UPDATE entity SET aliases = %s, updated_at = %s"
+                        " WHERE id = %s",
+                        (Jsonb(aliases), now, entity_id))
+                    cur = await conn.execute(
                         "SELECT id, name, entity_type, aliases FROM entity"
-                        " WHERE id = ?", (entity_id,)).fetchone()
+                        " WHERE id = %s", (entity_id,))
+                    row = await cur.fetchone()
                     entity_index[norm] = row
 
             span_start, span_end = _find_span(surface, content_text)
-            conn.execute(
+            await conn.execute(
                 "INSERT INTO entity_mention (document_id, entity_id,"
                 " surface, span_start, span_end, method, grade,"
                 " extractor_model, prompt_version, created_at)"
-                " VALUES (?,?,?,?,?, 'llm', 1, ?, ?, ?)",
+                " VALUES (%s,%s,%s,%s,%s, 'llm', 1, %s, %s, %s)",
                 (document_id, entity_id, surface, span_start, span_end,
                  model, prompt_version, now))
             stats["mentions"] += 1
@@ -192,17 +205,18 @@ def persist_t1(conn: sqlite3.Connection, *, document_id: int,
             if claim.check_worthiness < CLAIM_MIN_WORTHINESS:
                 stats["claims_below_threshold"] += 1
                 continue
-            cur = conn.execute(
+            cur = await conn.execute(
                 "INSERT INTO claim (text, first_document_id,"
-                " check_worthiness, created_at) VALUES (?,?,?,?)",
+                " check_worthiness, created_at) VALUES (%s,%s,%s,%s)"
+                " RETURNING id",
                 (claim.text, document_id, claim.check_worthiness, now))
-            claim_id = int(cur.lastrowid)  # type: ignore[arg-type]
+            claim_id = int((await cur.fetchone())["id"])
             q_start, q_end = _find_span(claim.quoted_span, content_text)
-            conn.execute(
+            await conn.execute(
                 "INSERT INTO claim_sighting (claim_id, document_id, quote,"
                 " quote_start, quote_end, stance, grade, extractor_model,"
                 " prompt_version, created_at)"
-                " VALUES (?,?,?,?,?, 'asserts', 1, ?, ?, ?)",
+                " VALUES (%s,%s,%s,%s,%s, 'asserts', 1, %s, %s, %s)",
                 (claim_id, document_id, claim.quoted_span, q_start, q_end,
                  model, prompt_version, now))
             stats["claims"] += 1
@@ -226,40 +240,44 @@ def persist_t1(conn: sqlite3.Connection, *, document_id: int,
                 continue
             topics = [t for t in st.topics if t in T1_TOPICS]
             q_start, q_end = _find_span(st.quote, content_text)
-            conn.execute(
+            await conn.execute(
                 "INSERT INTO statement (document_id, entity_id, quote,"
                 " quote_start, quote_end, topics, position_summary,"
                 " stated_at, grade, extractor_model, prompt_version,"
-                " created_at) VALUES (?,?,?,?,?,?,?,?, 1, ?, ?, ?)",
+                " created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s, 1, %s, %s, %s)",
                 (document_id, row["id"], st.quote, q_start, q_end,
-                 json.dumps(topics), st.position_summary or None,
+                 Jsonb(topics), st.position_summary or None,
                  stated_at, model, prompt_version, now))
             stats["statements"] += 1
 
         # --- flip the document -------------------------------------------------
-        conn.execute(
+        await conn.execute(
             "UPDATE document SET enrichment_tier = 1,"
-            " enrichment_status = 'done' WHERE id = ?", (document_id,))
+            " enrichment_status = 'done' WHERE id = %s", (document_id,))
 
     return stats
 
 
-def mark_failed(conn: sqlite3.Connection, document_id: int) -> None:
-    with conn:
-        conn.execute(
-            "UPDATE document SET enrichment_status = 'failed' WHERE id = ?",
+async def mark_failed(conn: psycopg.AsyncConnection,
+                      document_id: int) -> None:
+    async with conn.transaction():
+        await conn.execute(
+            "UPDATE document SET enrichment_status = 'failed'"
+            " WHERE id = %s",
             (document_id,))
 
 
-def mark_queued(conn: sqlite3.Connection, document_ids: list[int]) -> None:
-    with conn:
-        conn.executemany(
-            "UPDATE document SET enrichment_status = 'queued' WHERE id = ?",
-            [(d,) for d in document_ids])
+async def mark_queued(conn: psycopg.AsyncConnection,
+                      document_ids: list[int]) -> None:
+    async with conn.transaction():
+        await conn.execute(
+            "UPDATE document SET enrichment_status = 'queued'"
+            " WHERE id = ANY(%s)", (document_ids,))
 
 
-def mark_pending(conn: sqlite3.Connection, document_ids: list[int]) -> None:
-    with conn:
-        conn.executemany(
-            "UPDATE document SET enrichment_status = 'pending' WHERE id = ?",
-            [(d,) for d in document_ids])
+async def mark_pending(conn: psycopg.AsyncConnection,
+                       document_ids: list[int]) -> None:
+    async with conn.transaction():
+        await conn.execute(
+            "UPDATE document SET enrichment_status = 'pending'"
+            " WHERE id = ANY(%s)", (document_ids,))

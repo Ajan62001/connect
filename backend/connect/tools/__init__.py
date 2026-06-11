@@ -1,1 +1,1 @@
-"""Operational CLI tools (python -m connect.tools.<name>)."""
+"""Operational tools (ETL etc.) — the only package allowed to import sqlite3."""

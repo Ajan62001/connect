@@ -11,14 +11,14 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
+
+import psycopg
 
 from connect.domain import enums as E
 from connect.ingestion.pipeline import IngestionPipeline
 from connect.investigation.schema import ScopePack
-from connect.investigation.scoping import rrf_fuse
 from connect.investigation.writeback import (
     FindingValidationError,
     record_finding,
@@ -26,9 +26,9 @@ from connect.investigation.writeback import (
 from connect.knowledge.embedder import Embedder
 from connect.knowledge.vector import VectorIndex
 from connect.llm.provider import ToolCall, ToolDef, ToolOutcome
+from connect.retrieval.search import hybrid_document_ids
 from connect.retrieval.search_client import SearchClient, SearchError
-from connect.storage import fts as fts_dao
-from connect.storage.db import utc_now
+from connect.storage.pg import Jsonb, utc_now
 
 log = logging.getLogger(__name__)
 
@@ -278,14 +278,14 @@ class ToolExecutor:
     """Dispatches one ToolCall; every failure becomes an is_error outcome,
     never an exception into the loop."""
 
-    def __init__(self, conn: sqlite3.Connection, *,
+    def __init__(self, conn: psycopg.AsyncConnection, *,
                  pipeline: IngestionPipeline | None,
                  search: SearchClient,
                  embedder: Embedder,
                  vectors: VectorIndex | None,
                  scope_pack: ScopePack,
                  state: InvestigationState,
-                 emit: Callable[[str, dict[str, Any]], Any],
+                 emit: Callable[[str, dict[str, Any]], Awaitable[Any]],
                  web_source_id: int | None = None,
                  t1_enrich: Callable[[int], Awaitable[bool]] | None = None):
         self.conn = conn
@@ -327,28 +327,20 @@ class ToolExecutor:
         before = args.get("published_before")
         after = args.get("published_after")
 
-        fts_ids: list[int] = []
-        try:
-            items, _total = fts_dao.search_documents(
-                self.conn, query, page=1, page_size=top_k * 2)
-            fts_ids = [i.id for i in items]
-        except sqlite3.Error:
-            log.exception("search_corpus FTS failed")
-        vec_ids: list[int] = []
-        if self.vectors is not None:
-            vecs = self.embedder.embed([query])
-            if vecs:
-                vec_ids = [doc_id for doc_id, _s
-                           in self.vectors.search(vecs[0], k=top_k * 2)]
-        fused = rrf_fuse([fts_ids, vec_ids]) if vec_ids else fts_ids
+        # the shared hybrid path (retrieval layer): lexical + vector under
+        # RRF; either leg degrades to empty, fusion of one list is the list
+        fused = await hybrid_document_ids(
+            self.conn, query, embedder=self.embedder, vectors=self.vectors,
+            lexical_k=top_k * 2, vector_k=top_k * 2)
 
         results: list[dict[str, Any]] = []
         for doc_id in fused:
-            row = self.conn.execute(
+            cur = await self.conn.execute(
                 "SELECT d.id, d.title, d.published_at, d.content_text,"
                 " s.name AS source_name, s.credibility_tier"
                 " FROM document d LEFT JOIN source s ON s.id = d.source_id"
-                " WHERE d.id = ?", (doc_id,)).fetchone()
+                " WHERE d.id = %s", (doc_id,))
+            row = await cur.fetchone()
             if row is None:
                 continue
             published = row["published_at"]
@@ -400,9 +392,10 @@ class ToolExecutor:
         url = str(args.get("url", "")).strip()
         if not url:
             return ToolOutcome(content="url is required", is_error=True)
-        existing = self.conn.execute(
-            "SELECT id, title FROM document WHERE url = ?"
-            " OR canonical_url = ? LIMIT 1", (url, url)).fetchone()
+        cur = await self.conn.execute(
+            "SELECT id, title FROM document WHERE url = %s"
+            " OR canonical_url = %s LIMIT 1", (url, url))
+        existing = await cur.fetchone()
         if existing is not None:
             self.state.touched_doc_ids.add(existing["id"])
             return {"document_id": existing["id"],
@@ -417,15 +410,16 @@ class ToolExecutor:
             return ToolOutcome(content="ingestion pipeline unavailable",
                                is_error=True)
         result = await self.pipeline.ingest_url(
-            url, source_id=self.web_source_id)
+            self.conn, url, source_id=self.web_source_id)
         self.state.web_fetches_used += 1
         doc = result.document
         self.state.touched_doc_ids.add(doc.id)
         t1_done = False
         if result.created:
             self.state.docs_added += 1
-            self.emit("doc_ingested", {"document_id": doc.id,
-                                       "url": url, "title": doc.title})
+            await self.emit("doc_ingested", {"document_id": doc.id,
+                                             "url": url,
+                                             "title": doc.title})
             if self.t1_enrich is not None:
                 t1_done = await self.t1_enrich(doc.id)
         return {"document_id": doc.id, "title": doc.title,
@@ -440,11 +434,12 @@ class ToolExecutor:
             return ToolOutcome(content="document_id must be an integer",
                                is_error=True)
         offset = max(0, int(args.get("offset", 0) or 0))
-        row = self.conn.execute(
+        cur = await self.conn.execute(
             "SELECT d.id, d.title, d.url, d.published_at, d.content_text,"
             " s.name AS source_name, s.credibility_tier"
             " FROM document d LEFT JOIN source s ON s.id = d.source_id"
-            " WHERE d.id = ?", (doc_id,)).fetchone()
+            " WHERE d.id = %s", (doc_id,))
+        row = await cur.fetchone()
         if row is None:
             return ToolOutcome(content=f"document {doc_id} not found",
                                is_error=True)
@@ -472,50 +467,51 @@ class ToolExecutor:
         sql = ("SELECT id, src_type, src_id, dst_type, dst_id, relation,"
                " properties, provenance_document_id, confidence, grade"
                " FROM edge WHERE status = 'active' AND"
-               " ((src_type = ? AND src_id = ?)"
-               "  OR (dst_type = ? AND dst_id = ?))")
+               " ((src_type = %s AND src_id = %s)"
+               "  OR (dst_type = %s AND dst_id = %s))")
         params: list[Any] = [node_type, node_id, node_type, node_id]
         if relations:
-            marks = ",".join("?" * len(relations))
-            sql += f" AND relation IN ({marks})"
-            params.extend(relations)
+            sql += " AND relation = ANY(%s)"
+            params.append(list(relations))
         grouped: dict[str, list[dict[str, Any]]] = {}
-        for row in self.conn.execute(sql + " ORDER BY id DESC LIMIT 60",
-                                     params):
+        cur = await self.conn.execute(sql + " ORDER BY id DESC LIMIT 60",
+                                      params)
+        for row in await cur.fetchall():
             outgoing = (row["src_type"] == node_type
                         and row["src_id"] == node_id)
             other_type = row["dst_type"] if outgoing else row["src_type"]
             other_id = row["dst_id"] if outgoing else row["src_id"]
-            speculation = False
-            try:
-                speculation = bool(json.loads(
-                    row["properties"] or "{}").get("speculation"))
-            except ValueError:
-                pass
+            properties = (row["properties"]
+                          if isinstance(row["properties"], dict) else {})
+            speculation = bool(properties.get("speculation"))
             grouped.setdefault(row["relation"], []).append({
                 "edge_id": row["id"],
                 "direction": "out" if outgoing else "in",
                 "other_type": other_type, "other_id": other_id,
-                "other_title": self._node_title(other_type, other_id),
+                "other_title": await self._node_title(other_type, other_id),
                 "speculation": speculation,
                 "provenance_document_id": row["provenance_document_id"],
                 "confidence": row["confidence"], "grade": row["grade"],
             })
         return {"node": {"type": node_type, "id": node_id,
-                         "title": self._node_title(node_type, node_id)},
+                         "title": await self._node_title(node_type,
+                                                         node_id)},
                 "relations": grouped}
 
-    def _node_title(self, node_type: str, node_id: int) -> str | None:
-        sql = {"entity": "SELECT name FROM entity WHERE id = ?",
-               "event": "SELECT title FROM event WHERE id = ?",
-               "document": "SELECT title FROM document WHERE id = ?",
-               "claim": "SELECT text FROM claim WHERE id = ?",
-               "dossier": "SELECT input_text FROM dossier WHERE id = ?",
+    async def _node_title(self, node_type: str,
+                          node_id: int) -> str | None:
+        sql = {"entity": "SELECT name AS t FROM entity WHERE id = %s",
+               "event": "SELECT title AS t FROM event WHERE id = %s",
+               "document": "SELECT title AS t FROM document WHERE id = %s",
+               "claim": "SELECT text AS t FROM claim WHERE id = %s",
+               "dossier": "SELECT input_text AS t FROM dossier"
+                          " WHERE id = %s",
                }.get(node_type)
         if sql is None:
             return None
-        row = self.conn.execute(sql, (node_id,)).fetchone()
-        return (row[0][:120] if row and row[0] else None)
+        cur = await self.conn.execute(sql, (node_id,))
+        row = await cur.fetchone()
+        return (row["t"][:120] if row and row["t"] else None)
 
     async def _tool_entity_timeline(self, args: dict[str, Any]) -> Any:
         entity_id = args.get("entity_id")
@@ -524,38 +520,43 @@ class ToolExecutor:
             if not name:
                 return ToolOutcome(
                     content="entity_id or name is required", is_error=True)
-            row = self.conn.execute(
-                "SELECT id FROM entity WHERE lower(name) = lower(?)"
-                " LIMIT 1", (name,)).fetchone()
+            cur = await self.conn.execute(
+                "SELECT id FROM entity WHERE lower(name) = lower(%s)"
+                " LIMIT 1", (name,))
+            row = await cur.fetchone()
             if row is None:
-                row = self.conn.execute(
-                    "SELECT id FROM entity WHERE name LIKE ? LIMIT 1",
-                    (f"%{name}%",)).fetchone()
+                cur = await self.conn.execute(
+                    "SELECT id FROM entity WHERE name ILIKE %s LIMIT 1",
+                    (f"%{name}%",))
+                row = await cur.fetchone()
             if row is None:
                 return ToolOutcome(content=f"entity {name!r} not found",
                                    is_error=True)
-            entity_id = int(row[0])
+            entity_id = int(row["id"])
         window = max(1, min(int(args.get("window_days", 365) or 365), 3650))
-        ent = self.conn.execute(
-            "SELECT id, name, entity_type FROM entity WHERE id = ?",
-            (entity_id,)).fetchone()
+        cur = await self.conn.execute(
+            "SELECT id, name, entity_type FROM entity WHERE id = %s",
+            (entity_id,))
+        ent = await cur.fetchone()
         if ent is None:
             return ToolOutcome(content=f"entity {entity_id} not found",
                                is_error=True)
-        events = self.conn.execute(
+        cur = await self.conn.execute(
             "SELECT DISTINCT e.id, e.title, e.event_type, e.occurred_on,"
             " e.doc_count FROM event e"
             " JOIN event_assignment ea ON ea.event_id = e.id"
             " JOIN entity_mention m ON m.document_id = ea.document_id"
-            " WHERE m.entity_id = ? AND (e.occurred_on IS NULL OR"
-            f" e.occurred_on >= date('now', '-{window} days'))"
-            " ORDER BY e.occurred_on", (entity_id,)).fetchall()
-        claims = self.conn.execute(
+            " WHERE m.entity_id = %s AND (e.occurred_on IS NULL OR"
+            " e.occurred_on >= (now() AT TIME ZONE 'utc')::date - %s)"
+            " ORDER BY e.occurred_on", (entity_id, window))
+        events = await cur.fetchall()
+        cur = await self.conn.execute(
             "SELECT DISTINCT c.id, c.text, c.verdict, c.confidence"
             " FROM claim c JOIN document d ON d.id = c.first_document_id"
             " JOIN entity_mention m ON m.document_id = d.id"
-            " WHERE m.entity_id = ? ORDER BY c.id DESC LIMIT 20",
-            (entity_id,)).fetchall()
+            " WHERE m.entity_id = %s ORDER BY c.id DESC LIMIT 20",
+            (entity_id,))
+        claims = await cur.fetchall()
         return {
             "entity": {"entity_id": ent["id"], "name": ent["name"],
                        "entity_type": ent["entity_type"]},
@@ -573,11 +574,12 @@ class ToolExecutor:
         if not date:
             return ToolOutcome(content="date is required", is_error=True)
         window = max(1, min(int(args.get("window_days", 120) or 120), 730))
-        rows = self.conn.execute(
+        cur = await self.conn.execute(
             "SELECT id, kind, scope, occurs_on, ends_on, label"
             " FROM calendar_event"
-            " WHERE ABS(julianday(occurs_on) - julianday(?)) <= ?"
-            " ORDER BY occurs_on", (date[:10], window)).fetchall()
+            " WHERE ABS(occurs_on - %s::date) <= %s"
+            " ORDER BY occurs_on", (date[:10], window))
+        rows = await cur.fetchall()
         return {"items": [
             {"calendar_event_id": r["id"], "kind": r["kind"],
              "scope": r["scope"], "occurs_on": r["occurs_on"],
@@ -586,7 +588,7 @@ class ToolExecutor:
     # -- writes -------------------------------------------------------------------
 
     async def _tool_record_finding(self, args: dict[str, Any]) -> Any:
-        result = record_finding(
+        result = await record_finding(
             self.conn, dossier_id=self.state.dossier_id,
             scope_pack=self.scope_pack, args=args, emit=self.emit)
         self.state.findings_recorded += 1
@@ -613,17 +615,17 @@ class ToolExecutor:
             priority = min(1.0, max(0.0, float(priority)))
         except (TypeError, ValueError):
             priority = 0.5
-        with self.conn:
-            cur = self.conn.execute(
+        async with self.conn.transaction():
+            cur = await self.conn.execute(
                 "INSERT INTO question (dossier_id, qtype, text, about_type,"
                 " about_id, status, priority, created_at)"
-                " VALUES (?,?,?,?,?, 'open', ?, ?)",
+                " VALUES (%s,%s,%s,%s,%s, 'open', %s, %s) RETURNING id",
                 (self.state.dossier_id, qtype, text, about_type, about_id,
                  priority, utc_now()))
-        question_id = int(cur.lastrowid)  # type: ignore[arg-type]
+            question_id = int((await cur.fetchone())["id"])
         self.state.questions_raised += 1
-        self.emit("question_raised", {"question_id": question_id,
-                                      "qtype": qtype, "text": text})
+        await self.emit("question_raised", {"question_id": question_id,
+                                            "qtype": qtype, "text": text})
         return {"question_id": question_id}
 
     async def _tool_conclude(self, args: dict[str, Any]) -> Any:
@@ -642,25 +644,30 @@ class ToolExecutor:
             if not isinstance(question_id, int) or status not in (
                     "answered", "partial", "open"):
                 continue
-            row = self.conn.execute(
-                "SELECT id FROM question WHERE id = ? AND dossier_id = ?",
-                (question_id, self.state.dossier_id)).fetchone()
-            if row is None:
+            cur = await self.conn.execute(
+                "SELECT id FROM question WHERE id = %s AND dossier_id = %s",
+                (question_id, self.state.dossier_id))
+            if await cur.fetchone() is None:
                 continue
-            finding_ids = [f for f in (res.get("finding_ids") or [])
-                           if isinstance(f, int) and self.conn.execute(
-                               "SELECT 1 FROM finding WHERE id = ?",
-                               (f,)).fetchone() is not None]
+            finding_ids = []
+            for f in (res.get("finding_ids") or []):
+                if not isinstance(f, int):
+                    continue
+                cur = await self.conn.execute(
+                    "SELECT 1 FROM finding WHERE id = %s", (f,))
+                if await cur.fetchone() is not None:
+                    finding_ids.append(f)
             if status == "answered" and not finding_ids:
                 status = "partial"  # honest: answered needs findings
-            with self.conn:
-                self.conn.execute(
-                    "UPDATE question SET status = ?, answer_summary = ?,"
-                    " answer_finding_ids = ?, updated_at = ? WHERE id = ?",
+            async with self.conn.transaction():
+                await self.conn.execute(
+                    "UPDATE question SET status = %s, answer_summary = %s,"
+                    " answer_finding_ids = %s, updated_at = %s"
+                    " WHERE id = %s",
                     (status, res.get("answer_summary"),
-                     json.dumps(finding_ids), utc_now(), question_id))
-            self.emit("question_resolved",
-                      {"question_id": question_id, "status": status})
+                     Jsonb(finding_ids), utc_now(), question_id))
+            await self.emit("question_resolved",
+                            {"question_id": question_id, "status": status})
             resolved.append({"question_id": question_id, "status": status})
         self.state.concluded = True
         self.state.conclude_summary = summary

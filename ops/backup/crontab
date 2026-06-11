@@ -1,0 +1,5 @@
+# connect backups (UTC inside the container) — runtime design §6.
+# 02:30 pg_dump; 03:00 blob hardlink snapshot. Each run prunes its own
+# retention (7 daily + 4 weekly). Output goes to the container log.
+30 2 * * * /usr/local/bin/backup.sh pg > /proc/1/fd/1 2>&1
+0 3 * * * /usr/local/bin/backup.sh blobs > /proc/1/fd/1 2>&1

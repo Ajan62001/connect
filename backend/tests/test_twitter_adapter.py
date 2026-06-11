@@ -174,28 +174,27 @@ async def test_discover_without_key_raises_adapter_skip():
         await adapter.sample({"handles": ["PIB_India"]})
 
 
-async def test_poll_without_key_records_clean_skip_status(container):
-    source = source_dao.insert(
-        container.db, name="X gov test", type_="twitter",
+async def test_poll_without_key_records_clean_skip_status(container, db):
+    source = await source_dao.insert(
+        db, name="X gov test", type_="twitter",
         config={"handles": ["PIB_India"]}, credibility_tier=1)
     poller = SourcePoller(
-        container.db, pipeline=container.pipeline,
+        container.pool, pipeline=container.pipeline,
         adapters={"twitter": TwitterAdapter(api_key=None)})
 
-    status = await poller.poll_source(source)
+    status = await poller.poll_source(db, source)
     assert status == "skipped: TWITTERAPI_IO_API_KEY not set"
-    stored = source_dao.get(container.db, source.id)
+    stored = await source_dao.get(db, source.id)
     assert stored.last_poll_status == "skipped: TWITTERAPI_IO_API_KEY not set"
     assert stored.last_polled_at is not None
-    assert doc_dao.url_exists(
-        container.db, "https://x.com/PIB_India/status/1932700000000000001") \
-        is False
+    assert await doc_dao.url_exists(
+        db, "https://x.com/PIB_India/status/1932700000000000001") is False
 
 
 # --- end to end through the poller + pipeline ------------------------------------------
 
 
-async def test_poll_twitter_source_end_to_end(container):
+async def test_poll_twitter_source_end_to_end(container, db):
     queries: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -210,52 +209,53 @@ async def test_poll_twitter_source_end_to_end(container):
             "<p>The Union Cabinet approved phase two of the mission with "
             "an outlay of seventy six thousand crore rupees.</p>"),
     })
-    source = source_dao.insert(
-        container.db, name="X gov e2e", type_="twitter",
+    source = await source_dao.insert(
+        db, name="X gov e2e", type_="twitter",
         config={"handles": ["PIB_India", "PIBFactCheck"]},
         credibility_tier=1)
-    poller = SourcePoller(container.db, pipeline=container.pipeline,
+    poller = SourcePoller(container.pool, pipeline=container.pipeline,
                           adapters={"twitter": adapter})
 
-    status = await poller.poll_source(source)
+    status = await poller.poll_source(db, source)
     assert status == "ok: 2 new, 0 dup, 0 error"
 
-    doc = doc_dao.get_by_url(
-        container.db, "https://x.com/PIB_India/status/1932700000000000001")
+    doc = await doc_dao.get_by_url(
+        db, "https://x.com/PIB_India/status/1932700000000000001")
     assert doc is not None
     assert doc.media_type == "tweet"
     assert doc.author == "@PIB_India"
     assert doc.source_id == source.id
-    assert doc.published_at == "2026-06-10T09:15:00Z"  # hint wins
+    assert doc.published_at == "2026-06-10T09:15:00.000Z"  # hint wins
     assert doc.title.startswith("@PIB_India: Cabinet approves")
 
     # raw blob is the tweet JSON
-    row = container.db.execute(
-        "SELECT raw_blob_path FROM document WHERE id=?", (doc.id,)).fetchone()
-    raw = container.blobs.get(row["raw_blob_path"])
+    from dbutil import qv
+    blob_path = await qv(db, "SELECT raw_blob_path FROM document"
+                             " WHERE id=%s", doc.id)
+    raw = container.blobs.get(blob_path)
     assert json.loads(raw)["id"] == "1932700000000000001"
 
     # expanded url -> document_link row, classified official + auto-followed
-    links = link_dao.list_for_document(container.db, doc.id)
+    links = await link_dao.list_for_document(db, doc.id)
     assert [l.url for l in links] == [PIB_PRESS_URL]
     assert links[0].is_official and not links[0].is_file
     assert links[0].status == "fetched"
     assert links[0].resolved_document_id is not None
 
     # quoted tweet text was appended on the second document
-    doc2 = doc_dao.get_by_url(
-        container.db,
+    doc2 = await doc_dao.get_by_url(
+        db,
         "https://x.com/PIBFactCheck/status/1932700000000000002")
     assert doc2 is not None
     assert "[quoting @viralhandle]:" in doc2.content_text
-    assert link_dao.list_for_document(container.db, doc2.id) == []
+    assert await link_dao.list_for_document(db, doc2.id) == []
 
     # second poll: cursor advanced to last_polled_at, tweet ids are
     # idempotent via URL dedup
-    polled = source_dao.get(container.db, source.id)
-    status = await poller.poll_source(polled)
+    polled = await source_dao.get(db, source.id)
+    status = await poller.poll_source(db, polled)
     assert status == "ok: 0 new, 2 dup, 0 error"
     assert len(queries) == 2
     assert queries[1].endswith(
         f"since_time:{_epoch(polled.last_polled_at)}")
-    assert doc_dao.get_by_url(container.db, doc.url).id == doc.id
+    assert (await doc_dao.get_by_url(db, doc.url)).id == doc.id

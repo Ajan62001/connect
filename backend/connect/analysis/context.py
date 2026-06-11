@@ -6,9 +6,10 @@ provider or the ledger directly, so no call can escape cost control.
 
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
+
+import psycopg
 
 from connect.analysis.budget import AnalysisBudget
 from connect.analysis.schema import NormalizedInput
@@ -31,7 +32,7 @@ EST_ADJUDICATION_IN, EST_ADJUDICATION_OUT = 600, 50
 
 @dataclass
 class AnalysisContext:
-    conn: sqlite3.Connection
+    conn: psycopg.AsyncConnection
     provider: LLMProvider
     governor: Any                       # llm.spend.Governor
     budget: AnalysisBudget
@@ -41,7 +42,7 @@ class AnalysisContext:
     vectors: VectorIndex | None
     dossier_id: int
     max_evidence_per_claim: int
-    emit: Callable[[str, dict[str, Any]], None]   # job_event writer
+    emit: Callable[[str, dict[str, Any]], Awaitable[Any]]  # job_event writer
     normalized: NormalizedInput | None = None
     stage_summaries: dict[str, str] = field(default_factory=dict)
 
@@ -58,13 +59,14 @@ class AnalysisContext:
         AnalysisBudgetExceeded (per-analysis) BEFORE spending, LLMError on
         provider failure."""
         projected = self.projected_cost(tier, est_in, est_out)
-        self.governor.check(projected)
+        await self.governor.check(projected)
         self.budget.check(projected)
         completion = await self.provider.complete_structured(
             system=system, messages=[{"role": "user", "content": user}],
             schema=schema, tier=tier, max_tokens=max_tokens)
-        spend.record_call(self.conn, purpose=PURPOSE_ANALYSIS,
-                          model=completion.model, usage=completion.usage)
+        await spend.record_call(self.conn, purpose=PURPOSE_ANALYSIS,
+                                model=completion.model,
+                                usage=completion.usage)
         self.budget.add(spend.cost_usd(
             completion.model,
             input_tokens=completion.usage.input_tokens,

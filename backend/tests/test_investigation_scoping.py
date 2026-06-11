@@ -11,11 +11,10 @@ from connect.investigation.schema import InvestigationSeed, ScopeDoc
 from connect.investigation.scoping import (
     EventLite,
     reaction_candidate_pairs,
-    rrf_fuse,
     scan_causal_markers,
 )
-from connect.storage import db as db_mod
-from connect.storage.db import utc_now
+from connect.retrieval.search import rrf_fuse
+from connect.storage.pg import utc_now
 
 
 def ev(event_id, occurred_on, entities, centroid, *, window_days=7,
@@ -144,48 +143,48 @@ def test_coverage_thin_heuristics():
 
 
 class TestResolveSeed:
-    @pytest.fixture()
-    def conn(self, tmp_path):
-        c = db_mod.connect(tmp_path / "t.db")
-        db_mod.init_db(c)
-        yield c
-        c.close()
-
-    def test_topic_entity_event_story_question(self, conn):
-        with conn:
-            conn.execute("INSERT INTO entity (name, entity_type, created_at)"
-                         " VALUES ('RBI', 'organization', ?)", (utc_now(),))
-            conn.execute("INSERT INTO event (title, created_at)"
-                         " VALUES ('Repo hike', ?)", (utc_now(),))
-            conn.execute("INSERT INTO story (title, created_at)"
-                         " VALUES ('Rate cycle', ?)", (utc_now(),))
-            conn.execute(
-                "INSERT INTO dossier (kind, input_text, status, created_at)"
-                " VALUES ('investigation', 'x', 'pending', ?)", (utc_now(),))
-            conn.execute(
-                "INSERT INTO question (dossier_id, qtype, text, created_at)"
-                " VALUES (1, 'why_now', 'Why now?', ?)", (utc_now(),))
-        assert scoping.resolve_seed(
+    async def test_topic_entity_event_story_question(self, db):
+        conn = db
+        await conn.execute(
+            "INSERT INTO entity (name, entity_type, created_at)"
+            " VALUES ('RBI', 'organization', %s)", (utc_now(),))
+        await conn.execute("INSERT INTO event (title, created_at)"
+                           " VALUES ('Repo hike', %s)", (utc_now(),))
+        await conn.execute("INSERT INTO story (title, created_at)"
+                           " VALUES ('Rate cycle', %s)", (utc_now(),))
+        cur = await conn.execute(
+            "INSERT INTO dossier (kind, input_text, status, created_at)"
+            " VALUES ('investigation', 'x', 'pending', %s) RETURNING id",
+            (utc_now(),))
+        dossier_id = (await cur.fetchone())["id"]
+        cur = await conn.execute(
+            "INSERT INTO question (dossier_id, qtype, text, created_at)"
+            " VALUES (%s, 'why_now', 'Why now?', %s) RETURNING id",
+            (dossier_id, utc_now()))
+        question_id = (await cur.fetchone())["id"]
+        assert await scoping.resolve_seed(
             conn, InvestigationSeed(topic=" digital rupee ")) == (
                 "digital rupee", "topic", None)
-        assert scoping.resolve_seed(
-            conn, InvestigationSeed(entity_id=1)) == ("RBI", "entity", None)
-        assert scoping.resolve_seed(
+        assert await scoping.resolve_seed(
+            conn, InvestigationSeed(entity_id=1)) == ("RBI", "entity",
+                                                      None)
+        assert await scoping.resolve_seed(
             conn, InvestigationSeed(event_id=1)) == ("Repo hike", "event",
                                                      None)
-        assert scoping.resolve_seed(
+        assert await scoping.resolve_seed(
             conn, InvestigationSeed(story_id=1)) == ("Rate cycle", "story",
                                                      None)
         # question recursion: topic'd text + parent_question_id
-        assert scoping.resolve_seed(
-            conn, InvestigationSeed(question_id=1)) == ("Why now?", "topic",
-                                                        1)
+        assert await scoping.resolve_seed(
+            conn, InvestigationSeed(question_id=question_id)) == (
+                "Why now?", "topic", question_id)
 
-    def test_missing_rows_raise_lookup_error(self, conn):
+    async def test_missing_rows_raise_lookup_error(self, db):
         with pytest.raises(LookupError):
-            scoping.resolve_seed(conn, InvestigationSeed(entity_id=99))
+            await scoping.resolve_seed(db, InvestigationSeed(entity_id=99))
         with pytest.raises(LookupError):
-            scoping.resolve_seed(conn, InvestigationSeed(question_id=99))
+            await scoping.resolve_seed(db,
+                                       InvestigationSeed(question_id=99))
 
 
 def test_seed_validator_exactly_one():

@@ -9,8 +9,9 @@ the PM — at single-user corpus scale this is milliseconds.
 
 from __future__ import annotations
 
-import json
-import sqlite3
+from typing import Any, Mapping
+
+import psycopg
 
 from connect.domain.models import (
     CoOccurringEntity,
@@ -46,7 +47,7 @@ def _like_escape(q: str) -> str:
     return (q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
 
 
-def _to_list_entity(row: sqlite3.Row) -> EntityListItem:
+def _to_list_entity(row: Mapping[str, Any]) -> EntityListItem:
     return EntityListItem(
         id=row["id"],
         name=row["name"],
@@ -57,52 +58,57 @@ def _to_list_entity(row: sqlite3.Row) -> EntityListItem:
     )
 
 
-def list_page(conn: sqlite3.Connection, *, q: str | None = None,
-              page: int = 1, page_size: int = 20,
-              ) -> tuple[list[EntityListItem], int]:
-    """Mention-count-ordered entity listing; q matches name OR alias."""
+async def list_page(conn: psycopg.AsyncConnection, *, q: str | None = None,
+                    page: int = 1, page_size: int = 20,
+                    ) -> tuple[list[EntityListItem], int]:
+    """Mention-count-ordered entity listing; q matches name OR alias.
+
+    ILIKE (SQLite LIKE was case-insensitive for ASCII — PG's is not; the
+    sneakiest SQLite-ism in the codebase). Substring search over the
+    aliases jsonb goes through its ::text cast — served by the trigram GIN
+    indexes at scale.
+    """
     where, params = "", []
     if q:
-        where = ("WHERE (e.name LIKE ? ESCAPE '\\'"
-                 " OR e.aliases LIKE ? ESCAPE '\\')")
+        where = (r"WHERE (e.name ILIKE %s ESCAPE '\'"
+                 r" OR e.aliases::text ILIKE %s ESCAPE '\')")
         pattern = f"%{_like_escape(q)}%"
         params = [pattern, pattern]
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM entity e {where}", params).fetchone()[0]
-    rows = conn.execute(
+    cur = await conn.execute(
+        f"SELECT COUNT(*) AS n FROM entity e {where}", params)
+    total = (await cur.fetchone())["n"]
+    cur = await conn.execute(
         f"WITH {_STATS_CTE}"
         f" SELECT e.id, e.name, e.entity_type, st.mention_count,"
         f" st.document_count, st.last_seen_at"
         f" FROM entity e JOIN entity_stats st ON st.entity_id = e.id"
         f" {where}"
         f" ORDER BY st.mention_count DESC, e.name ASC"
-        f" LIMIT ? OFFSET ?",
-        (*params, page_size, (page - 1) * page_size)).fetchall()
+        f" LIMIT %s OFFSET %s",
+        (*params, page_size, (page - 1) * page_size))
+    rows = await cur.fetchall()
     return [_to_list_entity(r) for r in rows], int(total)
 
 
-def search(conn: sqlite3.Connection, q: str, *,
-           limit: int = 20) -> tuple[list[EntityListItem], int]:
-    items, total = list_page(conn, q=q, page=1, page_size=limit)
+async def search(conn: psycopg.AsyncConnection, q: str, *,
+                 limit: int = 20) -> tuple[list[EntityListItem], int]:
+    items, total = await list_page(conn, q=q, page=1, page_size=limit)
     return items, total
 
 
-def get_detail(conn: sqlite3.Connection, entity_id: int, *,
-               co_occurring_limit: int = 20,
-               documents_limit: int = 10) -> EntityDetail | None:
-    row = conn.execute(
+async def get_detail(conn: psycopg.AsyncConnection, entity_id: int, *,
+                     co_occurring_limit: int = 20,
+                     documents_limit: int = 10) -> EntityDetail | None:
+    cur = await conn.execute(
         f"WITH {_STATS_CTE}"
         f" SELECT e.*, st.mention_count, st.document_count,"
         f" st.first_seen_at, st.last_seen_at"
         f" FROM entity e JOIN entity_stats st ON st.entity_id = e.id"
-        f" WHERE e.id = ?", (entity_id,)).fetchone()
+        f" WHERE e.id = %s", (entity_id,))
+    row = await cur.fetchone()
     if row is None:
         return None
-    try:
-        aliases = [a for a in json.loads(row["aliases"] or "[]")
-                   if isinstance(a, str)]
-    except (ValueError, TypeError):
-        aliases = []
+    aliases = [a for a in (row["aliases"] or []) if isinstance(a, str)]
     return EntityDetail(
         entity=EntityInfo(
             id=row["id"], name=row["name"], entity_type=row["entity_type"],
@@ -112,65 +118,70 @@ def get_detail(conn: sqlite3.Connection, entity_id: int, *,
         document_count=row["document_count"] or 0,
         first_seen_at=row["first_seen_at"],
         last_seen_at=row["last_seen_at"],
-        topics=topics_for(conn, entity_id),
-        co_occurring=co_occurring(conn, entity_id,
-                                  limit=co_occurring_limit),
-        documents=documents_for(conn, entity_id, page=1,
-                                page_size=documents_limit)[0],
-        events=event_dao.events_for_entity(conn, entity_id, limit=10),
-        delta=delta_since_cursor(conn, entity_id),
-        has_views=statement_dao.has_views(conn, entity_id),
+        topics=await topics_for(conn, entity_id),
+        co_occurring=await co_occurring(conn, entity_id,
+                                        limit=co_occurring_limit),
+        documents=(await documents_for(conn, entity_id, page=1,
+                                       page_size=documents_limit))[0],
+        events=await event_dao.events_for_entity(conn, entity_id, limit=10),
+        delta=await delta_since_cursor(conn, entity_id),
+        has_views=await statement_dao.has_views(conn, entity_id),
     )
 
 
-def delta_since_cursor(conn: sqlite3.Connection,
-                       entity_id: int) -> EntityDelta | None:
+async def delta_since_cursor(conn: psycopg.AsyncConnection,
+                             entity_id: int) -> EntityDelta | None:
     """New events / documents / claims for the entity since its view_cursor
     (surface='entity'); None when the page has never been visited.
 
     "New" means when the KNOWLEDGE arrived (each row's created_at), not the
     document's publication date — the DeltaBanner answers "what did the KB
     learn since I last looked"."""
-    cursor = cursor_dao.get(conn, "entity", entity_id)
+    cursor = await cursor_dao.get(conn, "entity", entity_id)
     if cursor is None:
         return None
-    documents = conn.execute(
-        "SELECT COUNT(DISTINCT document_id) FROM entity_mention"
-        " WHERE entity_id = ? AND created_at > ?",
-        (entity_id, cursor)).fetchone()[0]
-    events = conn.execute(
-        "SELECT COUNT(DISTINCT ea.event_id) FROM event_assignment ea"
-        " WHERE ea.event_id IS NOT NULL AND ea.created_at > ?"
+    cur = await conn.execute(
+        "SELECT COUNT(DISTINCT document_id) AS n FROM entity_mention"
+        " WHERE entity_id = %s AND created_at > %s",
+        (entity_id, cursor))
+    documents = (await cur.fetchone())["n"]
+    cur = await conn.execute(
+        "SELECT COUNT(DISTINCT ea.event_id) AS n FROM event_assignment ea"
+        " WHERE ea.event_id IS NOT NULL AND ea.created_at > %s"
         " AND ea.document_id IN"
-        "   (SELECT document_id FROM entity_mention WHERE entity_id = ?)",
-        (cursor, entity_id)).fetchone()[0]
-    claims = conn.execute(
-        "SELECT COUNT(DISTINCT cs.claim_id) FROM claim_sighting cs"
-        " WHERE cs.created_at > ? AND cs.document_id IN"
-        "   (SELECT document_id FROM entity_mention WHERE entity_id = ?)",
-        (cursor, entity_id)).fetchone()[0]
+        "   (SELECT document_id FROM entity_mention WHERE entity_id = %s)",
+        (cursor, entity_id))
+    events = (await cur.fetchone())["n"]
+    cur = await conn.execute(
+        "SELECT COUNT(DISTINCT cs.claim_id) AS n FROM claim_sighting cs"
+        " WHERE cs.created_at > %s AND cs.document_id IN"
+        "   (SELECT document_id FROM entity_mention WHERE entity_id = %s)",
+        (cursor, entity_id))
+    claims = (await cur.fetchone())["n"]
     return EntityDelta(events=int(events), documents=int(documents),
                        claims=int(claims))
 
 
-def topics_for(conn: sqlite3.Connection, entity_id: int) -> list[TopicCount]:
+async def topics_for(conn: psycopg.AsyncConnection,
+                     entity_id: int) -> list[TopicCount]:
     """Topic distribution over the documents this entity is mentioned in."""
-    rows = conn.execute(
+    cur = await conn.execute(
         "SELECT dt.topic, COUNT(DISTINCT dt.document_id) AS n"
         " FROM document_topic dt"
         " WHERE dt.document_id IN"
-        "   (SELECT document_id FROM entity_mention WHERE entity_id = ?)"
+        "   (SELECT document_id FROM entity_mention WHERE entity_id = %s)"
         " GROUP BY dt.topic ORDER BY n DESC, dt.topic ASC",
-        (entity_id,)).fetchall()
+        (entity_id,))
+    rows = await cur.fetchall()
     return [TopicCount(topic=r["topic"], count=r["n"]) for r in rows]
 
 
-def co_occurring(conn: sqlite3.Connection, entity_id: int, *,
-                 limit: int = 20,
-                 min_together: int = 2) -> list[CoOccurringEntity]:
+async def co_occurring(conn: psycopg.AsyncConnection, entity_id: int, *,
+                       limit: int = 20,
+                       min_together: int = 2) -> list[CoOccurringEntity]:
     """Entities sharing documents with this one, lift-normalized
     (design-doc SQL: together / other's total document frequency)."""
-    rows = conn.execute(
+    cur = await conn.execute(
         f"""
 WITH pairs AS (
     SELECT m2.entity_id AS other_id,
@@ -178,7 +189,7 @@ WITH pairs AS (
     FROM entity_mention m1
     JOIN entity_mention m2
       ON m2.document_id = m1.document_id AND m2.entity_id <> m1.entity_id
-    WHERE m1.entity_id = ?
+    WHERE m1.entity_id = %s
     GROUP BY m2.entity_id
 ),
 {_STATS_CTE}
@@ -189,10 +200,11 @@ SELECT e.id, e.name, e.entity_type,
 FROM pairs p
 JOIN entity e ON e.id = p.other_id
 JOIN entity_stats st ON st.entity_id = e.id
-WHERE p.together >= ?
+WHERE p.together >= %s
 ORDER BY lift DESC, p.together DESC, e.name ASC
-LIMIT ?""",
-        (entity_id, min_together, limit)).fetchall()
+LIMIT %s""",
+        (entity_id, min_together, limit))
+    rows = await cur.fetchall()
     return [
         CoOccurringEntity(entity=_to_list_entity(r), together=r["together"],
                           lift=float(r["lift"]))
@@ -200,25 +212,28 @@ LIMIT ?""",
     ]
 
 
-def documents_for(conn: sqlite3.Connection, entity_id: int, *,
-                  page: int = 1, page_size: int = 20,
-                  ) -> tuple[list[DocumentListItem], int]:
+async def documents_for(conn: psycopg.AsyncConnection, entity_id: int, *,
+                        page: int = 1, page_size: int = 20,
+                        ) -> tuple[list[DocumentListItem], int]:
     """Documents mentioning the entity, newest first."""
-    total = conn.execute(
-        "SELECT COUNT(DISTINCT document_id) FROM entity_mention"
-        " WHERE entity_id = ?", (entity_id,)).fetchone()[0]
-    rows = conn.execute(
+    cur = await conn.execute(
+        "SELECT COUNT(DISTINCT document_id) AS n FROM entity_mention"
+        " WHERE entity_id = %s", (entity_id,))
+    total = (await cur.fetchone())["n"]
+    cur = await conn.execute(
         f"SELECT {_LIST_COLS}"
         f" FROM document d"
         f" LEFT JOIN source s ON s.id = d.source_id"
         f" WHERE d.id IN"
-        f"   (SELECT document_id FROM entity_mention WHERE entity_id = ?)"
+        f"   (SELECT document_id FROM entity_mention WHERE entity_id = %s)"
         f" ORDER BY COALESCE(d.published_at, d.fetched_at) DESC, d.id DESC"
-        f" LIMIT ? OFFSET ?",
-        (entity_id, page_size, (page - 1) * page_size)).fetchall()
+        f" LIMIT %s OFFSET %s",
+        (entity_id, page_size, (page - 1) * page_size))
+    rows = await cur.fetchall()
     return [_to_list_item(r) for r in rows], int(total)
 
 
-def exists(conn: sqlite3.Connection, entity_id: int) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM entity WHERE id = ?", (entity_id,)).fetchone() is not None
+async def exists(conn: psycopg.AsyncConnection, entity_id: int) -> bool:
+    cur = await conn.execute(
+        "SELECT 1 FROM entity WHERE id = %s", (entity_id,))
+    return await cur.fetchone() is not None

@@ -12,9 +12,26 @@ TEXT = (
 def test_health(client):
     body = client.get("/api/health").json()
     assert body["ok"] is True
-    assert body["schema_version"] == 9
+    assert body["schema_version"] == 2   # PG lineage (v2: runtime/queue)
     assert body["vector_backend"] == "disabled"  # embeddings off in tests
-    assert body["db_path"].endswith("connect.db")
+    assert body["db_path"].startswith("postgresql://")
+    # the DSN's password must never leak through the unauthenticated
+    # health endpoint — it is redacted to *** (storage.pg.redact_dsn)
+    assert ":connect@" not in body["db_path"]
+    assert ":***@" in body["db_path"]
+
+
+def test_redact_dsn():
+    from connect.storage.pg import redact_dsn
+
+    assert (redact_dsn("postgresql://u:secret@h:5/db")
+            == "postgresql://u:***@h:5/db")
+    # url-encoded / odd passwords, and passwordless DSNs stay intact
+    assert (redact_dsn("postgresql://u:p%40ss@h/db")
+            == "postgresql://u:***@h/db")
+    assert redact_dsn("postgresql://h:5432/db") == "postgresql://h:5432/db"
+    assert (redact_dsn("host=h password=secret dbname=db")
+            == "host=h password=*** dbname=db")
 
 
 def test_seeded_sources_present(client):

@@ -1,5 +1,7 @@
-"""App factory + lifespan: migrate -> seed -> poller (if enabled) -> job
-runner; clean shutdown. All routes live under /api.
+"""App factory + lifespan: migrate -> seed -> queue + SSE event bus; clean
+shutdown. All routes live under /api. Background jobs run in worker
+processes (python -m connect.workers.main); the api-flavor container keeps
+an embedded execution mode for no-docker dev and tests.
 
 Run:  uvicorn connect.api.main:app --port 8000
   or: uvicorn --factory connect.api.main:create_app --port 8000
@@ -44,8 +46,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        container.startup()           # open DB, migrate, seed, wire pipeline
-        container.start_background()  # poller (if enabled)
+        await container.startup()     # migrate, open pool, seed, wire pipeline
+        container.start_background()  # SSE event bus (LISTEN job_events)
         try:
             yield
         finally:

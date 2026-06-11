@@ -11,7 +11,7 @@ Used by GET /api/calendar and (Phase 3) the suggestion scorer's
 
 from __future__ import annotations
 
-import sqlite3
+import psycopg
 
 # (kind, scope, occurs_on, ends_on, label)
 CALENDAR_SEED: tuple[tuple[str, str, str, str | None, str], ...] = (
@@ -65,31 +65,34 @@ CALENDAR_SEED: tuple[tuple[str, str, str, str | None, str], ...] = (
 )
 
 
-def seed_calendar_events(conn: sqlite3.Connection) -> int:
+async def seed_calendar_events(conn: psycopg.AsyncConnection) -> int:
     """Insert missing fixture rows (matched on kind+label+occurs_on);
     returns how many were added. Idempotent."""
     added = 0
-    with conn:
+    async with conn.transaction():
         for kind, scope, occurs_on, ends_on, label in CALENDAR_SEED:
-            exists = conn.execute(
-                "SELECT 1 FROM calendar_event WHERE kind = ? AND label = ?"
-                " AND occurs_on = ?", (kind, label, occurs_on)).fetchone()
-            if exists:
+            cur = await conn.execute(
+                "SELECT 1 FROM calendar_event WHERE kind = %s AND label = %s"
+                " AND occurs_on = %s", (kind, label, occurs_on))
+            if await cur.fetchone():
                 continue
-            conn.execute(
+            await conn.execute(
                 "INSERT INTO calendar_event (kind, scope, occurs_on,"
-                " ends_on, label) VALUES (?,?,?,?,?)",
+                " ends_on, label) VALUES (%s,%s,%s,%s,%s)",
                 (kind, scope, occurs_on, ends_on, label))
             added += 1
     return added
 
 
-def upcoming(conn: sqlite3.Connection, days: int = 120) -> list[sqlite3.Row]:
+async def upcoming(conn: psycopg.AsyncConnection,
+                   days: int = 120) -> list[dict]:
     """Calendar rows still in progress or starting within ``days`` from
     today (UTC), soonest first."""
-    return conn.execute(
+    cur = await conn.execute(
         "SELECT id, kind, scope, occurs_on, ends_on, label"
         " FROM calendar_event"
-        " WHERE COALESCE(ends_on, occurs_on) >= date('now')"
-        "   AND occurs_on <= date('now', ?)"
-        " ORDER BY occurs_on ASC, id ASC", (f"+{days} days",)).fetchall()
+        " WHERE COALESCE(ends_on, occurs_on)"
+        "       >= (now() AT TIME ZONE 'utc')::date"
+        "   AND occurs_on <= (now() AT TIME ZONE 'utc')::date + %s"
+        " ORDER BY occurs_on ASC, id ASC", (days,))
+    return await cur.fetchall()

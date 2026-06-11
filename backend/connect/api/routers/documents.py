@@ -20,6 +20,7 @@ from connect.storage import enrichment as enrichment_dao
 from connect.storage import events as event_dao
 from connect.storage import fts as fts_dao
 from connect.storage import links as link_dao
+from connect.storage import statements as statement_dao
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -108,6 +109,8 @@ async def get_document(doc_id: int,
         "linked_from": link_dao.linked_from(container.db, doc_id),
         "enrichment": enrichment_dao.get_for_document(container.db, doc_id),
         "event": event_dao.event_for_document(container.db, doc_id),
+        "statements": statement_dao.statements_for_document(
+            container.db, doc_id),
     })
 
 

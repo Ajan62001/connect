@@ -221,6 +221,12 @@ export interface EntityDetail {
   events: EntityEventRef[];
   /** Counts since the view cursor; null when no cursor exists (Phase 2). */
   delta: EntityDelta | null;
+  /**
+   * True when at least one attributed statement exists for this entity
+   * (schema v9) — gates the "Views & statements" section. Optional so a
+   * pre-v9 backend keeps the page rendering.
+   */
+  has_views?: boolean;
 }
 
 export interface EntityListParams {
@@ -257,6 +263,9 @@ export interface Document extends DocumentListItem {
   enrichment: DocumentEnrichment | null;
   /** Event this document clustered into (T2); null until promotion. */
   event: DocumentEventRef | null;
+  /** Attributed statements extracted from this document (schema v9);
+   *  optional so a pre-v9 backend keeps the page rendering. */
+  statements?: DocumentStatement[];
 }
 
 // --- Phase 2: events / threads / briefs / cursors / calendar ----------------
@@ -270,6 +279,7 @@ export interface DocumentEventRef {
 export type BriefSectionKey =
   | "watch_dev"
   | "thread_move"
+  | "position_shift"
   | "contradiction"
   | "trending_claim"
   | "suggestion";
@@ -279,7 +289,8 @@ export type BriefObjectType =
   | "document"
   | "claim"
   | "contradiction"
-  | "thread";
+  | "thread"
+  | "position_shift";
 
 export interface BriefItem {
   id: number;
@@ -302,8 +313,10 @@ export interface BriefMeta {
 }
 
 /**
- * All five keys are always present (empty arrays fine); contradiction,
- * trending_claim and suggestion stay empty until Phase 3 verification.
+ * All six keys are always present (empty arrays fine); contradiction,
+ * trending_claim and suggestion stay empty until Phase 3 verification, and
+ * position_shift until schema v9 — consumers read each with `?? []` so an
+ * older backend that omits a key degrades gracefully.
  */
 export type BriefSections = Record<BriefSectionKey, BriefItem[]>;
 
@@ -550,6 +563,84 @@ export interface ContradictionListParams {
   status?: ContradictionStatus;
   page?: number;
   page_size?: number;
+}
+
+// --- Leader views & position tracking (schema v9) ----------------------------
+
+export type PositionShiftKind = "shifted" | "reversed";
+
+/** One topic a speaker has attributed statements on (views index row). */
+export interface ViewsTopic {
+  topic: string;
+  statement_count: number;
+  first_at: string | null;
+  last_at: string | null;
+  /** Open position shifts on this topic. */
+  shift_count: number;
+  /** position_summary of the newest statement; null when none recorded. */
+  latest_position: string | null;
+}
+
+/** GET /api/entities/{id}/views — topics ordered by statement_count desc. */
+export interface EntityViews {
+  entity: { id: number; name: string; entity_type: EntityType };
+  topics: ViewsTopic[];
+}
+
+/** One attributed, span-verified verbatim statement (per-topic timeline). */
+export interface Statement {
+  id: number;
+  quote: string;
+  /** Neutral <=140-char paraphrase of the stance; may be null. */
+  position_summary: string | null;
+  stated_at: string | null;
+  document_id: number;
+  source_name: string | null;
+  credibility_tier: number | null;
+  url: string | null;
+  title: string | null;
+}
+
+/** Detected drift between two of a speaker's statements on one topic. */
+export interface PositionShift {
+  id: number;
+  kind: PositionShiftKind;
+  note: string | null;
+  /** Older statement (the "was" side). */
+  from_statement_id: number;
+  /** Newer statement (the "now" side). */
+  to_statement_id: number;
+  detected_at: string;
+}
+
+/**
+ * Cached per-(entity, topic) evolution summary. `text` carries [[s<id>]]
+ * citation markers into the statement list; `stale: true` means regeneration
+ * was blocked (budget governor) and the text may lag the newest statements.
+ */
+export interface EvolutionSummary {
+  text: string;
+  /** Statement ids cited by the text's markers. */
+  citations: number[];
+  generated_at: string;
+  stale: boolean;
+}
+
+/** GET /api/entities/{id}/views/{topic} — statements newest first. */
+export interface TopicViews {
+  topic: string;
+  evolution_summary: EvolutionSummary | null;
+  statements: Statement[];
+  shifts: PositionShift[];
+}
+
+/** Statement hung off GET /api/documents/{id} (speaker-side projection). */
+export interface DocumentStatement {
+  id: number;
+  speaker: EntityRef;
+  quote: string;
+  topics: string[];
+  position_summary: string | null;
 }
 
 export interface Page<T> {
@@ -1158,6 +1249,32 @@ export function listEntityDocuments(
   return request<Page<DocumentListItem>>(
     `/api/entities/${id}/documents${qs({ ...params })}`,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Leader views & position tracking (schema v9)
+// ---------------------------------------------------------------------------
+
+export function getEntityViews(id: number): Promise<EntityViews> {
+  return request<EntityViews>(`/api/entities/${id}/views`);
+}
+
+/**
+ * Reading a topic's views lazily regenerates a stale evolution summary
+ * server-side (governed), so this call can take a few seconds when the
+ * summary is being refreshed; fresh reads are instant.
+ */
+export function getTopicViews(id: number, topic: string): Promise<TopicViews> {
+  return request<TopicViews>(
+    `/api/entities/${id}/views/${encodeURIComponent(topic)}`,
+  );
+}
+
+/** 200 — returns the updated row. */
+export function dismissPositionShift(id: number): Promise<PositionShift> {
+  return request<PositionShift>(`/api/position-shifts/${id}/dismiss`, {
+    method: "POST",
+  });
 }
 
 // ---------------------------------------------------------------------------

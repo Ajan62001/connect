@@ -26,7 +26,11 @@ from typing import Any
 from connect.analysis.grounding import find_span as _find_span
 from connect.analysis.grounding import norm_ws as _norm_ws
 from connect.analysis.grounding import span_is_verbatim  # noqa: F401 — re-export
-from connect.domain.enums import ENTITY_TYPES, T1_TOPICS
+from connect.domain.enums import (
+    ENTITY_TYPES,
+    STATEMENT_SPEAKER_TYPES,
+    T1_TOPICS,
+)
 from connect.knowledge.enrichment.prompts import T1_PROMPT_VERSION
 from connect.knowledge.enrichment.t1 import EnrichmentT1
 from connect.knowledge.taxonomy import EVENT_TYPE_NAMES
@@ -61,19 +65,22 @@ def persist_t1(conn: sqlite3.Connection, *, document_id: int,
     """Replace the document's T1 rows with ``result``; one transaction.
 
     Returns counters: topics, entities_created, entities_matched, mentions,
-    claims, claims_dropped_span, claims_below_threshold.
+    claims, claims_dropped_span, claims_below_threshold, statements,
+    statements_dropped_span, statements_dropped_speaker.
     """
     doc = conn.execute(
-        "SELECT id, content_text FROM document WHERE id = ?",
-        (document_id,)).fetchone()
+        "SELECT id, content_text, published_at, fetched_at FROM document"
+        " WHERE id = ?", (document_id,)).fetchone()
     if doc is None:
         raise ValueError(f"document {document_id} not found")
     content_text = doc["content_text"] or ""
+    stated_at = doc["published_at"] or doc["fetched_at"]
     now = utc_now()
 
     stats = {"topics": 0, "entities_created": 0, "entities_matched": 0,
              "mentions": 0, "claims": 0, "claims_dropped_span": 0,
-             "claims_below_threshold": 0}
+             "claims_below_threshold": 0, "statements": 0,
+             "statements_dropped_span": 0, "statements_dropped_speaker": 0}
 
     entity_index = _entity_index(conn)
 
@@ -89,6 +96,8 @@ def persist_t1(conn: sqlite3.Connection, *, document_id: int,
             "DELETE FROM entity_mention WHERE document_id = ?", (document_id,))
         conn.execute(
             "DELETE FROM claim_sighting WHERE document_id = ?", (document_id,))
+        conn.execute(
+            "DELETE FROM statement WHERE document_id = ?", (document_id,))
         # claims first sighted here and now orphaned go too
         conn.execute(
             "DELETE FROM claim WHERE first_document_id = ? AND NOT EXISTS"
@@ -197,6 +206,35 @@ def persist_t1(conn: sqlite3.Connection, *, document_id: int,
                 (claim_id, document_id, claim.quoted_span, q_start, q_end,
                  model, prompt_version, now))
             stats["claims"] += 1
+
+        # --- statements: grounded + attributable speaker ----------------------
+        # The speaker resolves through the SAME normalized alias-exact index
+        # the entities loop maintains (speakers are also listed in entities,
+        # so this-document speakers are already in the index via the
+        # get-or-create path above). Statements whose quote fails span
+        # verification, whose speaker is unknown, or whose speaker's entity
+        # type cannot speak (not in STATEMENT_SPEAKER_TYPES) are DROPPED and
+        # counted — an unattributable or invented quote never becomes a view.
+        for st in result.statements:
+            if not span_is_verbatim(st.quote, content_text):
+                stats["statements_dropped_span"] += 1
+                continue
+            speaker_norm = _norm_alias(st.speaker_surface)
+            row = entity_index.get(speaker_norm)
+            if row is None or row["entity_type"] not in STATEMENT_SPEAKER_TYPES:
+                stats["statements_dropped_speaker"] += 1
+                continue
+            topics = [t for t in st.topics if t in T1_TOPICS]
+            q_start, q_end = _find_span(st.quote, content_text)
+            conn.execute(
+                "INSERT INTO statement (document_id, entity_id, quote,"
+                " quote_start, quote_end, topics, position_summary,"
+                " stated_at, grade, extractor_model, prompt_version,"
+                " created_at) VALUES (?,?,?,?,?,?,?,?, 1, ?, ?, ?)",
+                (document_id, row["id"], st.quote, q_start, q_end,
+                 json.dumps(topics), st.position_summary or None,
+                 stated_at, model, prompt_version, now))
+            stats["statements"] += 1
 
         # --- flip the document -------------------------------------------------
         conn.execute(

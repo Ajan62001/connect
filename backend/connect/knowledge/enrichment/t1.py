@@ -20,8 +20,11 @@ MAX_SUMMARY_CHARS = 240
 MAX_TOPICS = 5
 MAX_ENTITIES = 15
 MAX_CLAIMS = 5
+MAX_STATEMENTS = 6
+MAX_STATEMENT_TOPICS = 3
+MAX_POSITION_SUMMARY_CHARS = 140
 MAX_CONTENT_WORDS = 1200   # title + first ~1200 words go to the model
-T1_MAX_OUTPUT_TOKENS = 1024
+T1_MAX_OUTPUT_TOKENS = 1536
 
 
 class _Frozen(BaseModel):
@@ -44,12 +47,32 @@ class T1Claim(_Frozen):
         return min(1.0, max(0.0, v))
 
 
+class T1Statement(_Frozen):
+    """One attributed utterance: speaker_surface SAID quote (verbatim).
+    Span verification + speaker-type filtering happen in persist.py."""
+    speaker_surface: str
+    quote: str
+    topics: list[str] = []
+    position_summary: str = ""
+
+    @field_validator("topics")
+    @classmethod
+    def _clamp_topics(cls, v: list[str]) -> list[str]:
+        return v[:MAX_STATEMENT_TOPICS]
+
+    @field_validator("position_summary")
+    @classmethod
+    def _clamp_position_summary(cls, v: str) -> str:
+        return v.strip()[:MAX_POSITION_SUMMARY_CHARS]
+
+
 class EnrichmentT1(_Frozen):
     summary: str
     event_type: str
     topics: list[str] = []
     entities: list[T1Entity] = []
     claims: list[T1Claim] = []
+    statements: list[T1Statement] = []
 
     @field_validator("summary")
     @classmethod
@@ -71,6 +94,11 @@ class EnrichmentT1(_Frozen):
     @classmethod
     def _clamp_claims(cls, v: list[T1Claim]) -> list[T1Claim]:
         return v[:MAX_CLAIMS]
+
+    @field_validator("statements")
+    @classmethod
+    def _clamp_statements(cls, v: list[T1Statement]) -> list[T1Statement]:
+        return v[:MAX_STATEMENTS]
 
 
 def build_user_message(title: str | None, content_text: str,

@@ -31,11 +31,14 @@ from connect.storage.schema import (
     FINDING_DDL,
     FINDING_EVIDENCE_DDL,
     JOB_TABLE_DDL,
+    POSITION_SHIFT_DDL,
     QUESTION_DDL,
     SCHEMA_VERSION,
     SOURCE_TABLE_DDL,
+    STATEMENT_DDL,
     StorageError,
     StorageVersionError,
+    VIEW_SUMMARY_DDL,
 )
 
 
@@ -209,6 +212,30 @@ def _migrate_7_to_8(conn: sqlite3.Connection) -> None:
         conn.execute(f"DROP TABLE {backup}")
 
 
+def _migrate_8_to_9(conn: sqlite3.Connection) -> None:
+    """v9 (leader views & position tracking): statement / position_shift /
+    view_summary tables + the brief_item.section vocabulary rebuild
+    ('position_shift' joins BRIEF_SECTIONS).
+
+    brief_item is rebuilt with the EXACT fresh-create DDL string (the
+    v2 -> v3 pattern: copy out -> drop -> recreate -> copy back; column set
+    unchanged, so SELECT *) — migrated and fresh DBs declare byte-identical
+    tables. The brief_item index (dropped with the table) is recreated after
+    the copy. apply() runs with foreign_keys OFF, rowids survive the copy.
+    The new tables are plain creates (additive)."""
+    for ddl in (*STATEMENT_DDL, *POSITION_SHIFT_DDL, *VIEW_SUMMARY_DDL):
+        conn.execute(ddl)
+    backup = "_mig_brief_item"
+    conn.execute(f"DROP TABLE IF EXISTS {backup}")
+    conn.execute(f"CREATE TABLE {backup} AS SELECT * FROM brief_item")
+    conn.execute("DROP TABLE brief_item")
+    conn.execute(BRIEF_ITEM_TABLE_DDL)
+    conn.execute(f"INSERT INTO brief_item SELECT * FROM {backup}")
+    conn.execute(f"DROP TABLE {backup}")
+    for ddl in BRIEF_ITEM_INDEX_DDL:
+        conn.execute(ddl)
+
+
 # Registry: version N -> function taking N's schema to N+1's. Forward-only.
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_1_to_2,
@@ -218,6 +245,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     5: _migrate_5_to_6,
     6: _migrate_6_to_7,
     7: _migrate_7_to_8,
+    8: _migrate_8_to_9,
 }
 
 

@@ -112,11 +112,15 @@ WatchKind = Literal["entity", "topic", "thread", "claim", "search"]
 WATCH_HIT_OBJECT_TYPES = ("document", "event", "claim", "contradiction")
 
 BRIEF_SECTIONS = (
-    "watch_dev", "thread_move", "contradiction", "trending_claim", "suggestion")
+    "watch_dev", "thread_move", "contradiction", "trending_claim",
+    "suggestion", "position_shift")
 BriefSection = Literal[
-    "watch_dev", "thread_move", "contradiction", "trending_claim", "suggestion"]
-BRIEF_OBJECT_TYPES = ("event", "document", "claim", "contradiction", "thread")
-BriefObjectType = Literal["event", "document", "claim", "contradiction", "thread"]
+    "watch_dev", "thread_move", "contradiction", "trending_claim",
+    "suggestion", "position_shift"]
+BRIEF_OBJECT_TYPES = ("event", "document", "claim", "contradiction", "thread",
+                      "position_shift")
+BriefObjectType = Literal["event", "document", "claim", "contradiction",
+                          "thread", "position_shift"]
 CONTRADICTION_STATUSES = ("open", "dismissed", "resolved")
 CALENDAR_KINDS = ("election", "budget", "parliament_session", "rbi_mpc", "other")
 TOPIC_SOURCES = ("rule", "t1")
@@ -133,6 +137,18 @@ T1_TOPICS = (
     "defence", "foreign-policy", "energy", "telecom", "data-privacy",
     "labour", "education", "health", "environment", "federalism",
     "parliament", "budget", "banking", "markets", "misinformation", "other")
+
+# --- statements / position tracking (v9) -------------------------------------
+
+# Entity types allowed to SPEAK — a statement's resolved speaker must carry
+# one of these; anything else (place, law, scheme, ...) is dropped at persist.
+STATEMENT_SPEAKER_TYPES = ("person", "organization", "ministry",
+                           "political_party")
+
+POSITION_SHIFT_KINDS = ("shifted", "reversed")
+PositionShiftKind = Literal["shifted", "reversed"]
+POSITION_SHIFT_STATUSES = ("open", "dismissed")
+PositionShiftStatus = Literal["open", "dismissed"]
 
 # --- vector backends (health reporting) -------------------------------------
 

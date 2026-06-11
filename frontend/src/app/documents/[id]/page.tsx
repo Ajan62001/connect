@@ -11,6 +11,7 @@ import Link from "next/link";
 import { toast } from "sonner";
 
 import { EntityPill } from "@/components/entities/EntityPill";
+import { StatementsCard } from "@/components/views/StatementsCard";
 import { PageHeader } from "@/components/shared/PageHeader";
 import { QueryError } from "@/components/shared/QueryError";
 import { StatusChip, WatchHitChip } from "@/components/shared/StatusChip";
@@ -436,6 +437,8 @@ export default function DocumentPage({
               {document.data.enrichment ? (
                 <EnrichmentCard enrichment={document.data.enrichment} />
               ) : null}
+              {/* `?? []` tolerates a backend that predates schema v9. */}
+              <StatementsCard statements={document.data.statements ?? []} />
               {document.data.content_text ? (
                 <div className="max-w-prose text-[0.95rem] leading-7 whitespace-pre-wrap">
                   {document.data.content_text}

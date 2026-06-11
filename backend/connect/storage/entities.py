@@ -23,6 +23,7 @@ from connect.domain.models import (
 )
 from connect.storage import cursors as cursor_dao
 from connect.storage import events as event_dao
+from connect.storage import statements as statement_dao
 from connect.storage.documents import _LIST_COLS, _to_list_item
 
 # Shared per-entity stat aggregates (joined onto entity as 'st').
@@ -118,6 +119,7 @@ def get_detail(conn: sqlite3.Connection, entity_id: int, *,
                                 page_size=documents_limit)[0],
         events=event_dao.events_for_entity(conn, entity_id, limit=10),
         delta=delta_since_cursor(conn, entity_id),
+        has_views=statement_dao.has_views(conn, entity_id),
     )
 
 

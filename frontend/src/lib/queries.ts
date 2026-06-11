@@ -58,6 +58,10 @@ export const queryKeys = {
   entity: (id: number) => ["entities", "detail", id] as const,
   entityDocuments: (id: number, params: { page?: number; page_size?: number }) =>
     ["entities", "detail", id, "documents", params] as const,
+  /** Prefix of every topicViews key, so one invalidation refreshes both. */
+  entityViews: (id: number) => ["entities", "detail", id, "views"] as const,
+  topicViews: (id: number, topic: string) =>
+    ["entities", "detail", id, "views", topic] as const,
   search: (q: string, kind: SearchKind) => ["search", kind, q] as const,
   spend: (days: number) => ["spend", days] as const,
   briefs: ["brief"] as const,
@@ -257,6 +261,51 @@ export function useEntityDocuments(
     queryFn: () => api.listEntityDocuments(id, params),
     placeholderData: keepPreviousData,
     enabled: enabled && Number.isFinite(id),
+  });
+}
+
+// --------------------------------------------------------------------------
+// Leader views & position tracking (schema v9)
+// --------------------------------------------------------------------------
+
+/** Topic index for an entity's "Views & statements" section. */
+export function useEntityViews(id: number, enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.entityViews(id),
+    queryFn: () => api.getEntityViews(id),
+    enabled: enabled && Number.isFinite(id),
+  });
+}
+
+/**
+ * Per-topic statement timeline. Reading the endpoint can trigger a governed
+ * LLM regeneration of the evolution summary server-side, so the query stays
+ * idle until the user explicitly selects a topic (`topic: null` disables it)
+ * and a generous staleTime avoids gratuitous re-reads.
+ */
+export function useTopicViews(entityId: number, topic: string | null) {
+  return useQuery({
+    queryKey: queryKeys.topicViews(entityId, topic ?? ""),
+    queryFn: () => api.getTopicViews(entityId, topic ?? ""),
+    enabled:
+      Number.isFinite(entityId) && topic !== null && topic.trim().length > 0,
+    staleTime: 5 * 60_000,
+  });
+}
+
+/**
+ * Dismisses one position shift. Invalidating the entityViews prefix refreshes
+ * both the topic chips (shift counts) and any open per-topic panel.
+ */
+export function useDismissShift(entityId: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (shiftId: number) => api.dismissPositionShift(shiftId),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.entityViews(entityId),
+      });
+    },
   });
 }
 

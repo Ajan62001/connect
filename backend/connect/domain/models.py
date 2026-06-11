@@ -18,6 +18,7 @@ from connect.domain.enums import (
     EnrichmentStatus,
     LinkStatus,
     MediaType,
+    PositionShiftStatus,
     SourceType,
     VectorBackend,
     WatchKind,
@@ -179,6 +180,15 @@ class DocumentEventRef(_Frozen):
     title: str
 
 
+class DocumentStatement(_Frozen):
+    """One attributed utterance on the document detail (v9)."""
+    id: int
+    speaker: EnrichmentEntityRef
+    quote: str
+    topics: list[str] = Field(default_factory=list)
+    position_summary: str | None = None
+
+
 class Document(DocumentListItem):
     author: str | None = None
     language: str | None = None
@@ -188,6 +198,7 @@ class Document(DocumentListItem):
     linked_from: list[LinkedFrom] = Field(default_factory=list)
     enrichment: DocumentEnrichment | None = None
     event: DocumentEventRef | None = None
+    statements: list[DocumentStatement] = Field(default_factory=list)
 
 
 class LinkFetchResult(_Frozen):
@@ -268,6 +279,76 @@ class EntityDetail(_Frozen):
     documents: list[DocumentListItem] = Field(default_factory=list)
     events: list[EntityEventRef] = Field(default_factory=list)
     delta: EntityDelta | None = None
+    # v9: the entity has statement rows — show the Views tab
+    has_views: bool = False
+
+
+# --- leader views & position tracking (v9) ---------------------------------------
+
+class EntityViewTopic(_Frozen):
+    """One topic the entity has spoken on (the views index row)."""
+    topic: str
+    statement_count: int = 0
+    first_at: str | None = None
+    last_at: str | None = None
+    shift_count: int = 0
+    latest_position: str | None = None
+
+
+class EntityViews(_Frozen):
+    entity: EnrichmentEntityRef
+    topics: list[EntityViewTopic] = Field(default_factory=list)
+
+
+class EvolutionSummary(_Frozen):
+    """Cached per-(entity, topic) summary; citations are statement ids."""
+    text: str
+    citations: list[int] = Field(default_factory=list)
+    generated_at: str
+    stale: bool = False
+
+
+class TopicStatement(_Frozen):
+    """One statement on the per-topic timeline (newest first)."""
+    id: int
+    quote: str
+    position_summary: str | None = None
+    stated_at: str | None = None
+    document_id: int
+    source_name: str | None = None
+    credibility_tier: int | None = None
+    url: str | None = None
+    title: str | None = None
+
+
+class PositionShiftRef(_Frozen):
+    """One open shift on the per-topic timeline."""
+    id: int
+    kind: str | None = None
+    note: str | None = None
+    from_statement_id: int
+    to_statement_id: int
+    detected_at: str
+
+
+class TopicViews(_Frozen):
+    topic: str
+    evolution_summary: EvolutionSummary | None = None
+    statements: list[TopicStatement] = Field(default_factory=list)
+    shifts: list[PositionShiftRef] = Field(default_factory=list)
+
+
+class PositionShiftRow(_Frozen):
+    """The full position_shift row (dismiss response)."""
+    id: int
+    entity_id: int
+    topic: str
+    from_statement_id: int
+    to_statement_id: int
+    kind: str | None = None
+    note: str | None = None
+    detected_at: str
+    status: PositionShiftStatus = "open"
 
 
 # --- enrichment sweep ------------------------------------------------------------
@@ -275,6 +356,9 @@ class EntityDetail(_Frozen):
 class EnrichmentSweepRequest(_Frozen):
     mode: Literal["sync", "batch"]
     limit: int | None = Field(default=None, ge=1)
+    # v9: 'statements' backfills docs enriched before t1-v2 (full T1 re-run;
+    # idempotent replace). None = the normal pending-docs sweep.
+    target: Literal["statements"] | None = None
 
 
 # --- spend ----------------------------------------------------------------------
@@ -426,12 +510,13 @@ class BriefItem(_Frozen):
 
 
 class BriefSections(_Frozen):
-    """All five keys always present (empty until their phase fills them)."""
+    """All six keys always present (empty until their phase fills them)."""
     watch_dev: list[BriefItem] = Field(default_factory=list)
     thread_move: list[BriefItem] = Field(default_factory=list)
     contradiction: list[BriefItem] = Field(default_factory=list)
     trending_claim: list[BriefItem] = Field(default_factory=list)
     suggestion: list[BriefItem] = Field(default_factory=list)
+    position_shift: list[BriefItem] = Field(default_factory=list)
 
 
 class BriefInfo(_Frozen):

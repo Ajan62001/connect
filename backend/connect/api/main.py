@@ -26,6 +26,7 @@ from connect.api.routers import (
     feed,
     health,
     investigations,
+    position_shifts,
     search,
     sources,
     spend,
@@ -71,6 +72,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(analyses.router, prefix="/api")
     app.include_router(contradictions.router, prefix="/api")
     app.include_router(investigations.router, prefix="/api")
+    app.include_router(position_shifts.router, prefix="/api")
     return app
 
 

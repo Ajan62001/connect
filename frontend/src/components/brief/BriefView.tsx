@@ -15,6 +15,7 @@ import {
   Loader2Icon,
   ScaleIcon,
   TrendingUpIcon,
+  ZapIcon,
   type LucideIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -45,7 +46,7 @@ interface SectionConfig {
   icon: LucideIcon;
 }
 
-/** The five brief sections, in display order — all always present in the API. */
+/** The six brief sections, in display order — all always present in the API. */
 const SECTIONS: SectionConfig[] = [
   {
     key: "watch_dev",
@@ -58,6 +59,13 @@ const SECTIONS: SectionConfig[] = [
     title: "Story threads that moved",
     description: "Threads that gained events since the last brief.",
     icon: GitBranchIcon,
+  },
+  {
+    key: "position_shift",
+    title: "Position shifts",
+    description:
+      "Speakers whose stated position on a topic shifted or reversed since the last brief.",
+    icon: ZapIcon,
   },
   {
     key: "contradiction",
@@ -130,6 +138,9 @@ function itemHref(item: BriefItem): string | null {
     case "contradiction":
       return "/contradictions";
     case "claim":
+      return null;
+    case "position_shift":
+      // Rendered by PositionShiftRow, which links the speaker's entity page.
       return null;
   }
 }
@@ -228,6 +239,98 @@ function AnalyzeButton({ item }: { item: BriefItem }) {
   );
 }
 
+/** Kind badge colorways — reversed reads stronger than shifted. */
+const SHIFT_KIND_STYLES: Record<string, string> = {
+  reversed: "bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-300",
+  shifted: "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300",
+};
+
+/** One side of the was/now quote pair on a position_shift card. */
+function ShiftQuote({
+  label,
+  quote,
+  date,
+}: {
+  label: string;
+  quote: string | null;
+  date: string | null;
+}) {
+  return (
+    <div className="min-w-0 space-y-1 rounded-lg border bg-card p-2.5">
+      <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+        {label}
+        {date ? ` · ${formatDay(date)}` : ""}
+      </p>
+      {quote ? (
+        <blockquote className="line-clamp-3 border-l-2 border-border pl-2 text-xs leading-5 text-muted-foreground">
+          &ldquo;{quote}&rdquo;
+        </blockquote>
+      ) : (
+        <p className="text-xs text-muted-foreground">Quote unavailable.</p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * position_shift rows get their own card body: entity name, topic, kind
+ * badge, and the two verbatim quotes side-by-side with their dates. All
+ * payload reads are defensive — a missing key degrades, never crashes.
+ */
+function PositionShiftRow({ item }: { item: BriefItem }) {
+  const entityId = payloadNumber(item.payload, "entity_id");
+  const entityName =
+    payloadString(item.payload, "entity_name", "name") ??
+    (entityId !== null ? `Entity #${entityId}` : "Unknown speaker");
+  const topic = payloadString(item.payload, "topic");
+  const kind = payloadString(item.payload, "kind");
+  const fromQuote = payloadString(item.payload, "from_quote");
+  const toQuote = payloadString(item.payload, "to_quote");
+  const fromDate = payloadString(item.payload, "from_date");
+  const toDate = payloadString(item.payload, "to_date");
+
+  return (
+    <li className="flex items-start gap-3 py-3 first:pt-0 last:pb-0">
+      <SeenDot item={item} />
+      <div className="min-w-0 flex-1 space-y-1.5">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+          {entityId !== null ? (
+            <Link
+              href={`/entity/${entityId}`}
+              className="text-sm font-medium underline-offset-4 hover:underline"
+            >
+              {entityName}
+            </Link>
+          ) : (
+            <span className="text-sm font-medium">{entityName}</span>
+          )}
+          {topic ? <Badge variant="secondary">{topic}</Badge> : null}
+          {kind ? (
+            <Badge
+              variant="secondary"
+              className={SHIFT_KIND_STYLES[kind] ?? ""}
+            >
+              <ZapIcon aria-hidden />
+              {kind}
+            </Badge>
+          ) : null}
+        </div>
+        {fromQuote !== null || toQuote !== null ? (
+          <div className="grid gap-2 sm:grid-cols-2">
+            <ShiftQuote label="Was" quote={fromQuote} date={fromDate} />
+            <ShiftQuote label="Now" quote={toQuote} date={toDate} />
+          </div>
+        ) : null}
+        {item.reason ? (
+          <p className="text-xs text-muted-foreground/80 italic">
+            {item.reason}
+          </p>
+        ) : null}
+      </div>
+    </li>
+  );
+}
+
 function BriefItemRow({ item }: { item: BriefItem }) {
   const href = itemHref(item);
   const title = itemTitle(item);
@@ -294,9 +397,13 @@ function BriefSectionCard({
           <p className="text-sm text-muted-foreground">Nothing new today.</p>
         ) : (
           <ul className="divide-y">
-            {ordered.map((item) => (
-              <BriefItemRow key={item.id} item={item} />
-            ))}
+            {ordered.map((item) =>
+              item.section === "position_shift" ? (
+                <PositionShiftRow key={item.id} item={item} />
+              ) : (
+                <BriefItemRow key={item.id} item={item} />
+              ),
+            )}
           </ul>
         )}
       </CardContent>

@@ -22,7 +22,7 @@ import sqlite3
 
 from connect.domain import enums as E
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 # --- error hierarchy ---------------------------------------------------------
@@ -524,6 +524,77 @@ FINDING_DDL: tuple[str, ...] = (_DDL_FINDING, *_DDL_FINDING_INDEXES)
 FINDING_EVIDENCE_DDL: tuple[str, ...] = (
     _DDL_FINDING_EVIDENCE, *_DDL_FINDING_EVIDENCE_INDEXES)
 
+# v9 (leader views): one attributed utterance — a speaker entity SAID the
+# verbatim quote in a document. Distinct from claim (checkable fact):
+# statements capture POSITIONS/views and always carry attribution. Replaced
+# per-document with the other T1 rows (idempotent re-enrichment).
+_DDL_STATEMENT = f"""
+CREATE TABLE IF NOT EXISTS statement (
+    id               INTEGER PRIMARY KEY,
+    document_id      INTEGER NOT NULL REFERENCES document(id) ON DELETE CASCADE,
+    entity_id        INTEGER NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+    quote            TEXT NOT NULL,
+    quote_start      INTEGER,
+    quote_end        INTEGER,
+    topics           TEXT NOT NULL DEFAULT '[]',
+    position_summary TEXT,
+    stated_at        TEXT,
+{_GRADE_COLS},
+    created_at       TEXT NOT NULL
+)"""
+
+_DDL_STATEMENT_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_statement_entity"
+    " ON statement(entity_id, stated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_statement_document"
+    " ON statement(document_id)",
+)
+
+# v9: detected drift between two of a speaker's statements on one topic.
+# Both sides are verbatim quotes, so a shift is grounded by construction.
+# Statement FKs cascade: re-enriching a document replaces its statements
+# and any shift built on a replaced quote dies with it.
+_DDL_POSITION_SHIFT = f"""
+CREATE TABLE IF NOT EXISTS position_shift (
+    id                INTEGER PRIMARY KEY,
+    entity_id         INTEGER NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+    topic             TEXT NOT NULL,
+    from_statement_id INTEGER NOT NULL REFERENCES statement(id) ON DELETE CASCADE,
+    to_statement_id   INTEGER NOT NULL REFERENCES statement(id) ON DELETE CASCADE,
+    kind              TEXT CHECK (kind IN {E.sql_in(E.POSITION_SHIFT_KINDS)}),
+    note              TEXT,
+    detected_at       TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'open'
+                      CHECK (status IN {E.sql_in(E.POSITION_SHIFT_STATUSES)})
+)"""
+
+_DDL_POSITION_SHIFT_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_position_shift_entity"
+    " ON position_shift(entity_id, topic)",
+)
+
+# v9: cached per-(entity, topic) evolution summary — regenerated lazily on
+# read when stale (statement count grew by >= 2 or a newer shift exists);
+# fresh reads are $0. citations = JSON int list of statement ids.
+_DDL_VIEW_SUMMARY = """
+CREATE TABLE IF NOT EXISTS view_summary (
+    entity_id              INTEGER NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+    topic                  TEXT NOT NULL,
+    text                   TEXT,
+    citations              TEXT NOT NULL DEFAULT '[]',
+    statement_count_at_gen INTEGER,
+    generated_at           TEXT,
+    PRIMARY KEY (entity_id, topic)
+)"""
+
+# Exported for migrations.py (migrate_8_to_9 creates the same tables and
+# rebuilds brief_item with the EXACT fresh-create DDL — the v9 BRIEF_SECTIONS
+# vocabulary adds 'position_shift').
+STATEMENT_DDL: tuple[str, ...] = (_DDL_STATEMENT, *_DDL_STATEMENT_INDEXES)
+POSITION_SHIFT_DDL: tuple[str, ...] = (
+    _DDL_POSITION_SHIFT, *_DDL_POSITION_SHIFT_INDEXES)
+VIEW_SUMMARY_DDL: tuple[str, ...] = (_DDL_VIEW_SUMMARY,)
+
 _DDL_JOB = f"""
 CREATE TABLE IF NOT EXISTS job (
     id          INTEGER PRIMARY KEY,
@@ -745,6 +816,11 @@ ALL_DDL: tuple[str, ...] = (
     *_DDL_FINDING_EVIDENCE_INDEXES,
     _DDL_CLAIM_SIGHTING,
     *_DDL_CLAIM_SIGHTING_INDEXES,
+    _DDL_STATEMENT,          # FKs document + entity
+    *_DDL_STATEMENT_INDEXES,
+    _DDL_POSITION_SHIFT,     # FKs entity + statement
+    *_DDL_POSITION_SHIFT_INDEXES,
+    _DDL_VIEW_SUMMARY,
     _DDL_VERDICT_HISTORY,
     _DDL_CONTRADICTION,
     _DDL_JOB,

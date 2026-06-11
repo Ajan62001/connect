@@ -36,6 +36,7 @@ from connect.knowledge.enrichment.promotion import (  # noqa: F401 — re-export
     is_fact_checker_source,
 )
 from connect.knowledge.enrichment.prompts import T1_PROMPT_VERSION
+from connect.knowledge.linking import position_tracker
 from connect.llm import spend
 from connect.llm.batch_runner import BatchItem, BatchRunner, BatchResult
 from connect.llm.provider import LLMError, LLMProvider
@@ -58,6 +59,18 @@ ORDER BY d.id
 LIMIT ?
 """
 
+# v9 backfill (target='statements'): docs already T1-enriched under a prompt
+# older than t1-v2 (no statement extraction yet). Full re-extraction —
+# persist_t1 is an idempotent per-doc replace.
+_BACKFILL_STATEMENTS_SQL = """
+SELECT d.id, d.title, d.content_text
+FROM document d
+JOIN document_enrichment de ON de.document_id = d.id
+WHERE de.prompt_version < ?
+ORDER BY d.id
+LIMIT ?
+"""
+
 
 class EnrichmentService:
     def __init__(self, conn: sqlite3.Connection, *,
@@ -73,8 +86,14 @@ class EnrichmentService:
 
     # -- selection ----------------------------------------------------------------
 
-    def select_eligible(self, limit: int = DEFAULT_SWEEP_LIMIT,
-                        ) -> list[sqlite3.Row]:
+    def select_eligible(self, limit: int = DEFAULT_SWEEP_LIMIT, *,
+                        target: str | None = None) -> list[sqlite3.Row]:
+        """target=None: pending docs (the normal sweep). target='statements':
+        docs already enriched with prompt_version < t1-v2 (the backfill)."""
+        if target == "statements":
+            return self.conn.execute(
+                _BACKFILL_STATEMENTS_SQL,
+                (T1_PROMPT_VERSION, limit)).fetchall()
         return self.conn.execute(_ELIGIBLE_SQL, (limit,)).fetchall()
 
     # -- sync ----------------------------------------------------------------------
@@ -118,11 +137,13 @@ class EnrichmentService:
         stats = await self._maybe_t2(document_id, manual=True)
         return f"promoted: {stats}"
 
-    async def run_sync(self, limit: int | None = None) -> dict[str, Any]:
+    async def run_sync(self, limit: int | None = None, *,
+                       target: str | None = None) -> dict[str, Any]:
         """Inline sweep: one FAST call per eligible doc, stopping cleanly on
         BudgetExceeded (remainder stays 'pending')."""
         provider = self._require_provider()
-        rows = self.select_eligible(limit or DEFAULT_SWEEP_LIMIT)
+        rows = self.select_eligible(limit or DEFAULT_SWEEP_LIMIT,
+                                    target=target)
         model = provider.model_for(ModelTier.FAST)
         per_call = spend.estimated_t1_cost(model, batch=False)
         done = failed = 0
@@ -166,10 +187,25 @@ class EnrichmentService:
             log.exception("T1 persistence failed for document %s", row["id"])
             persist.mark_failed(self.conn, row["id"])
             return None
+        shift_stats = await self._maybe_shifts(row["id"])
+        if shift_stats is not None:
+            stats["shifts"] = shift_stats
         t2_stats = await self._maybe_t2(row["id"])
         if t2_stats is not None:
             stats["t2"] = t2_stats
         return stats
+
+    async def _maybe_shifts(self, document_id: int) -> dict[str, Any] | None:
+        """Position-shift detection over the doc's freshly persisted
+        statements (knowledge/linking/position_tracker). Never raises —
+        a tracker failure is logged and the T1 result stands."""
+        try:
+            return await position_tracker.detect_shifts(
+                self.conn, self.provider, self.governor, document_id)
+        except Exception:  # noqa: BLE001 — tracking must never fail T1
+            log.exception("shift detection failed for document %s",
+                          document_id)
+            return {"document_id": document_id, "error": "shifts_failed"}
 
     async def _maybe_t2(self, document_id: int, *,
                         manual: bool = False) -> dict[str, Any] | None:
@@ -190,7 +226,8 @@ class EnrichmentService:
 
     # -- batch ----------------------------------------------------------------------
 
-    async def run_batch(self, limit: int | None = None) -> dict[str, Any]:
+    async def run_batch(self, limit: int | None = None, *,
+                        target: str | None = None) -> dict[str, Any]:
         """One Message Batch over the eligible set; polls until ended and
         ingests results through the same persist path as sync."""
         provider = self._require_provider()
@@ -198,7 +235,8 @@ class EnrichmentService:
         if runner is None:
             raise LLMError("batch runner not configured "
                            "(ANTHROPIC_API_KEY not set)")
-        rows = self.select_eligible(limit or DEFAULT_SWEEP_LIMIT)
+        rows = self.select_eligible(limit or DEFAULT_SWEEP_LIMIT,
+                                    target=target)
         if not rows:
             return {"mode": "batch", "selected": 0, "submitted": 0}
 
@@ -276,6 +314,7 @@ class EnrichmentService:
                                result=parsed, model=model,
                                prompt_version=T1_PROMPT_VERSION)
             done += 1
+            await self._maybe_shifts(document_id)
             if await self._maybe_t2(document_id) is not None:
                 promoted += 1
         return {"done": done, "failed": failed, "promoted_t2": promoted}

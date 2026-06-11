@@ -45,6 +45,8 @@ THREAD_LOOKBACK_DAYS = 1  # "moved since yesterday"
 MAX_CONTRADICTION_ITEMS = 10
 MAX_TRENDING_ITEMS = 10
 MAX_SUGGESTIONS = 5
+# v9 -------------------------------------------------------------------------------
+MAX_POSITION_SHIFT_ITEMS = 10
 # ">= 3 distinct sources" assumes ~15 live sources; start at 2 (design
 # result.consumption open question #4)
 TRENDING_MIN_SOURCES = 2
@@ -106,6 +108,7 @@ def _generate(conn: sqlite3.Connection, brief_date: str) -> None:
     drafts += _contradiction_items(conn, brief_date)
     drafts += _trending_claim_items(conn, brief_date)
     drafts += _suggestion_items(conn, brief_date)
+    drafts += _position_shift_items(conn, brief_date)
     with conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO brief (brief_date, generated_at)"
@@ -424,6 +427,51 @@ def _score_suggestion(conn: sqlite3.Connection, brief_date: str,
         reason=" · ".join(parts), components=components,
         payload={"title": claim["text"], "verdict": claim["verdict"],
                  "score": score})
+
+
+def _position_shift_items(conn: sqlite3.Connection,
+                          brief_date: str) -> list[_Draft]:
+    """Open position shifts detected since the LAST brief (all open shifts
+    on the very first brief). Watched entities rank first, then newest.
+    Both quotes are frozen in the payload — verbatim by construction."""
+    prev = conn.execute(
+        "SELECT generated_at FROM brief WHERE brief_date < ?"
+        " ORDER BY brief_date DESC LIMIT 1", (brief_date,)).fetchone()
+    since = prev["generated_at"] if prev is not None else "1970-01-01"
+    rows = conn.execute(
+        "SELECT ps.id, ps.entity_id, ps.topic, ps.kind, ps.note,"
+        " ps.detected_at, e.name AS entity_name,"
+        " sf.quote AS from_quote, st.quote AS to_quote,"
+        " sf.stated_at AS from_date, st.stated_at AS to_date,"
+        " EXISTS (SELECT 1 FROM watch w WHERE w.kind = 'entity'"
+        "   AND w.entity_id = ps.entity_id AND w.muted = 0) AS watched"
+        " FROM position_shift ps"
+        " JOIN entity e ON e.id = ps.entity_id"
+        " JOIN statement sf ON sf.id = ps.from_statement_id"
+        " JOIN statement st ON st.id = ps.to_statement_id"
+        " WHERE ps.status = 'open' AND ps.detected_at > ?"
+        " ORDER BY watched DESC, ps.detected_at DESC, ps.id DESC LIMIT ?",
+        (since, MAX_POSITION_SHIFT_ITEMS)).fetchall()
+    drafts: list[_Draft] = []
+    for row in rows:
+        from_day = (row["from_date"] or "")[:10] or "earlier"
+        to_day = (row["to_date"] or "")[:10] or "now"
+        verb = "Reversed" if row["kind"] == "reversed" else "Shifted"
+        reason = (f"{verb} position on {row['topic']}"
+                  f" · was {from_day}, now {to_day}")
+        drafts.append(_Draft(
+            section="position_shift", object_type="position_shift",
+            object_id=row["id"], reason=reason,
+            components={"kind": row["kind"], "topic": row["topic"],
+                        "watched": bool(row["watched"])},
+            payload={"entity_id": row["entity_id"],
+                     "entity_name": row["entity_name"],
+                     "topic": row["topic"], "kind": row["kind"],
+                     "from_quote": row["from_quote"],
+                     "to_quote": row["to_quote"],
+                     "from_date": row["from_date"],
+                     "to_date": row["to_date"]}))
+    return drafts
 
 
 # -- read path -------------------------------------------------------------------------

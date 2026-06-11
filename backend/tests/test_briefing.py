@@ -13,7 +13,7 @@ from connect.llm.spend import today_utc
 from connect.storage.db import utc_now
 
 ALL_SECTIONS = ("watch_dev", "thread_move", "contradiction",
-                "trending_claim", "suggestion")
+                "trending_claim", "suggestion", "position_shift")
 
 
 @pytest.fixture()

@@ -15,6 +15,7 @@ import { DeltaBanner } from "@/components/entities/DeltaBanner";
 import { EntityPill, EntityTypeChip } from "@/components/entities/EntityPill";
 import { EventTimeline } from "@/components/events/EventTimeline";
 import { InvestigateButton } from "@/components/investigation/InvestigateButton";
+import { ViewsSection } from "@/components/views/ViewsSection";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { Paginator } from "@/components/shared/Paginator";
 import { QueryError } from "@/components/shared/QueryError";
@@ -296,6 +297,11 @@ export default function EntityPage({
                 ))}
               </div>
             </section>
+          ) : null}
+
+          {/* `?? false` tolerates a backend that predates schema v9 views. */}
+          {(entity.data.has_views ?? false) ? (
+            <ViewsSection entityId={entityId} />
           ) : null}
 
           {entity.data.co_occurring.length > 0 ? (

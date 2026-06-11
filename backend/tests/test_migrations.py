@@ -88,8 +88,8 @@ def test_migrate_v1_to_v3(tmp_path):
     conn = db_mod.connect(db_path)
     assert migrations.read_version(conn) == 1
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 8
-    assert migrations.read_version(conn) == 8
+    assert version == SCHEMA_VERSION == 9
+    assert migrations.read_version(conn) == 9
 
     # document_link exists, matching the fresh-create schema (same DDL)
     tables = {r[0] for r in conn.execute(
@@ -141,8 +141,8 @@ def test_migrate_v2_to_v3(tmp_path):
     conn.rollback()  # the failed INSERT left an implicit transaction open
 
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 8
-    assert migrations.read_version(conn) == 8
+    assert version == SCHEMA_VERSION == 9
+    assert migrations.read_version(conn) == 9
 
     # old data intact across the rebuild (rowids preserved)
     row = conn.execute(
@@ -243,7 +243,7 @@ def test_migrate_copy_of_live_db(tmp_path):
                         " name='document_link'").fetchone() else None
 
     version = db_mod.init_db(conn)  # migrates if the copy is still v1/v2
-    assert version == SCHEMA_VERSION == 8
+    assert version == SCHEMA_VERSION == 9
 
     assert conn.execute("SELECT COUNT(*) FROM document").fetchone()[0] \
         == docs_before
@@ -270,6 +270,28 @@ def test_migrate_copy_of_live_db(tmp_path):
     assert conn.execute(
         "SELECT rowid FROM document_fts WHERE document_fts MATCH"
         " '\"migration smoke spreadsheet\"'").fetchone()
+    # v9 smoke on the migrated copy: the statement tables landed and accept
+    # rows (FK targets are real corpus rows when present)
+    for table in ("statement", "position_shift", "view_summary"):
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name=?",
+            (table,)).fetchone(), table
+    doc_id = conn.execute(
+        "SELECT id FROM document WHERE content_hash='h-migration-smoke'"
+    ).fetchone()[0]
+    with conn:
+        conn.execute(
+            "INSERT INTO entity (name, entity_type, aliases, created_at)"
+            " VALUES ('Migration Smoke Speaker', 'person', '[]',"
+            " '2026-06-11T00:00:00Z')")
+        entity_id = conn.execute(
+            "SELECT id FROM entity WHERE name='Migration Smoke Speaker'"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO statement (document_id, entity_id, quote, topics,"
+            " stated_at, created_at) VALUES (?, ?, 'migration smoke tweet',"
+            " '[\"other\"]', '2026-06-11T00:00:00Z',"
+            " '2026-06-11T00:00:00Z')", (doc_id, entity_id))
     conn.close()
 
 
@@ -318,8 +340,8 @@ def test_migrate_v3_to_v4(tmp_path):
     conn.rollback()
 
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 8
-    assert migrations.read_version(conn) == 8
+    assert version == SCHEMA_VERSION == 9
+    assert migrations.read_version(conn) == 9
 
     # the new table exists, byte-identical to fresh-create
     fresh = db_mod.connect(tmp_path / "fresh.db")
@@ -424,8 +446,8 @@ def test_migrate_v4_to_v5(tmp_path):
     conn.rollback()  # the failed INSERT left an implicit transaction open
 
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 8
-    assert migrations.read_version(conn) == 8
+    assert version == SCHEMA_VERSION == 9
+    assert migrations.read_version(conn) == 9
 
     # old data intact across the rebuild (rowids preserved, FK child intact)
     row = conn.execute(
@@ -533,8 +555,8 @@ def test_migrate_v5_to_v6(tmp_path):
     conn = db_mod.connect(db_path)
     assert migrations.read_version(conn) == 5
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 8
-    assert migrations.read_version(conn) == 8
+    assert version == SCHEMA_VERSION == 9
+    assert migrations.read_version(conn) == 9
 
     # new table + rebuilt table are byte-identical to fresh-create
     fresh = db_mod.connect(tmp_path / "fresh6.db")
@@ -648,6 +670,139 @@ def _make_v7_db(path) -> None:
     conn.close()
 
 
+# --- v8 -> v9 (leader views: statement/position_shift/view_summary) -------------
+
+# The v8 brief_item DDL, derived from the current one by removing the v9
+# section — guarded so a future vocab change can't silently no-op.
+_V8_BRIEF_ITEM_DDL = schema.BRIEF_ITEM_TABLE_DDL.replace(
+    ", 'position_shift')", ")")
+assert _V8_BRIEF_ITEM_DDL != schema.BRIEF_ITEM_TABLE_DDL
+
+
+def _make_v8_db(path) -> None:
+    """Recreate a v8 database: current schema minus statement /
+    position_shift / view_summary, with the v8 brief_item vocabulary."""
+    conn = db_mod.connect(path)
+    db_mod.init_db(conn)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    with conn:
+        conn.execute("BEGIN")
+        conn.execute("DROP TABLE position_shift")  # FKs statement: drop first
+        conn.execute("DROP TABLE statement")
+        conn.execute("DROP TABLE view_summary")
+        conn.execute("DROP TABLE brief_item")  # drops its index too
+        conn.execute(_V8_BRIEF_ITEM_DDL)
+        conn.execute(schema.BRIEF_ITEM_INDEX_DDL[0])
+        conn.execute("UPDATE meta SET value='8' WHERE key='schema_version'")
+        # v8-era data that must survive
+        conn.execute(
+            "INSERT INTO brief (brief_date, generated_at) VALUES"
+            " ('2026-06-01', '2026-06-01T06:00:00Z')")
+        conn.execute(
+            "INSERT INTO brief_item (brief_id, section, rank, object_type,"
+            " object_id, reason_json, payload, seen) VALUES"
+            " (1, 'watch_dev', 1, 'document', 7, '{\"reason\":\"r\"}',"
+            " '{\"title\":\"t\"}', 1)")
+        conn.execute(
+            "INSERT INTO entity (name, entity_type, aliases, created_at)"
+            " VALUES ('FM', 'person', '[]', '2026-06-01T00:00:00Z')")
+        conn.execute(
+            "INSERT INTO document (fetched_at, media_type, content_text,"
+            " content_hash) VALUES ('2026-06-01T00:00:00Z', 'text',"
+            " 'the minister said GST will be simplified', 'h-v8-doc')")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.close()
+
+
+def test_migrate_v8_to_v9(tmp_path):
+    db_path = tmp_path / "v8.db"
+    _make_v8_db(db_path)
+
+    conn = db_mod.connect(db_path)
+    assert migrations.read_version(conn) == 8
+    # the v8 vocab really was in force before migrating
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO brief_item (brief_id, section, rank, object_type,"
+            " object_id) VALUES (1, 'position_shift', 1, 'position_shift', 1)")
+    conn.rollback()
+    with pytest.raises(sqlite3.OperationalError):  # no statement table yet
+        conn.execute("SELECT 1 FROM statement")
+
+    version = db_mod.init_db(conn)
+    assert version == SCHEMA_VERSION == 9
+    assert migrations.read_version(conn) == 9
+
+    # new + rebuilt tables byte-identical to fresh-create
+    fresh = db_mod.connect(tmp_path / "fresh9.db")
+    db_mod.init_db(fresh)
+
+    def ddl(c, name):
+        return c.execute("SELECT sql FROM sqlite_master WHERE name=?",
+                         (name,)).fetchone()[0]
+
+    for table in ("statement", "position_shift", "view_summary",
+                  "brief_item"):
+        assert ddl(conn, table) == ddl(fresh, table), table
+    indexes = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index'")}
+    for index in ("idx_statement_entity", "idx_statement_document",
+                  "idx_position_shift_entity", "idx_brief_item_brief"):
+        assert index in indexes
+    fresh.close()
+
+    # old brief_item row intact (rowids preserved)
+    row = conn.execute("SELECT * FROM brief_item WHERE id=1").fetchone()
+    assert (row["section"], row["rank"], row["object_type"],
+            row["object_id"], row["seen"]) == ("watch_dev", 1, "document",
+                                               7, 1)
+    assert row["payload"] == '{"title":"t"}'
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert not {t for t in tables if t.startswith("_mig_")}
+
+    # the new vocabulary + tables are live...
+    with conn:
+        conn.execute(
+            "INSERT INTO brief_item (brief_id, section, rank, object_type,"
+            " object_id) VALUES (1, 'position_shift', 1, 'position_shift', 1)")
+        conn.execute(
+            "INSERT INTO statement (document_id, entity_id, quote, topics,"
+            " stated_at, created_at) VALUES (1, 1, 'GST will be simplified',"
+            " '[\"taxation\"]', '2026-06-01T00:00:00Z',"
+            " '2026-06-11T00:00:00Z')")
+        conn.execute(
+            "INSERT INTO statement (document_id, entity_id, quote, topics,"
+            " stated_at, created_at) VALUES (1, 1, 'the minister said',"
+            " '[\"taxation\"]', '2026-06-02T00:00:00Z',"
+            " '2026-06-11T00:00:00Z')")
+        conn.execute(
+            "INSERT INTO position_shift (entity_id, topic,"
+            " from_statement_id, to_statement_id, kind, detected_at)"
+            " VALUES (1, 'taxation', 1, 2, 'reversed',"
+            " '2026-06-11T00:00:00Z')")
+        conn.execute(
+            "INSERT INTO view_summary (entity_id, topic, text, citations,"
+            " statement_count_at_gen, generated_at) VALUES (1, 'taxation',"
+            " 's', '[1]', 2, '2026-06-11T00:00:00Z')")
+    # ...and the CHECKs still reject garbage
+    for bad in (
+            "INSERT INTO position_shift (entity_id, topic,"
+            " from_statement_id, to_statement_id, kind, detected_at)"
+            " VALUES (1, 'taxation', 1, 2, 'softened',"
+            " '2026-06-11T00:00:00Z')",
+            "INSERT INTO position_shift (entity_id, topic,"
+            " from_statement_id, to_statement_id, kind, detected_at, status)"
+            " VALUES (1, 'taxation', 1, 2, 'shifted',"
+            " '2026-06-11T00:00:00Z', 'archived')",
+            "INSERT INTO brief_item (brief_id, section, rank, object_type,"
+            " object_id) VALUES (1, 'bogus_section', 1, 'document', 1)"):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(bad)
+        conn.rollback()
+    conn.close()
+
+
 def test_migrate_v7_to_v8(tmp_path):
     db_path = tmp_path / "v7.db"
     _make_v7_db(db_path)
@@ -664,8 +819,8 @@ def test_migrate_v7_to_v8(tmp_path):
         conn.execute("SELECT kind FROM dossier")
 
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 8
-    assert migrations.read_version(conn) == 8
+    assert version == SCHEMA_VERSION == 9
+    assert migrations.read_version(conn) == 9
 
     # rebuilt + new tables byte-identical to fresh-create
     fresh = db_mod.connect(tmp_path / "fresh8.db")

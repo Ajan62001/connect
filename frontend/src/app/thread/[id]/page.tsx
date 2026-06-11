@@ -6,6 +6,7 @@ import { ArrowLeftIcon, GitBranchIcon, MilestoneIcon } from "lucide-react";
 
 import { EntityPill } from "@/components/entities/EntityPill";
 import { EventTimeline } from "@/components/events/EventTimeline";
+import { InvestigateButton } from "@/components/investigation/InvestigateButton";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { QueryError } from "@/components/shared/QueryError";
 import { Badge } from "@/components/ui/badge";
@@ -73,6 +74,9 @@ export default function ThreadPage({
               >
                 {thread.data.story.status}
               </Badge>
+              <span className="ml-auto">
+                <InvestigateButton seed={{ story_id: threadId }} />
+              </span>
             </div>
             <p
               className="text-sm text-muted-foreground"

@@ -13,6 +13,7 @@ import {
 import { DocumentTable } from "@/components/documents/DocumentTable";
 import { EntityPill } from "@/components/entities/EntityPill";
 import { EventTypeChip } from "@/components/events/EventTimeline";
+import { InvestigateButton } from "@/components/investigation/InvestigateButton";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { QueryError } from "@/components/shared/QueryError";
 import { Badge } from "@/components/ui/badge";
@@ -85,16 +86,19 @@ export default function EventPage({
                 </span>
               </div>
             </div>
-            {event.data.event.story_id !== null ? (
-              <Button
-                variant="outline"
-                size="sm"
-                render={<Link href={`/thread/${event.data.event.story_id}`} />}
-              >
-                <GitBranchIcon data-icon="inline-start" />
-                View thread
-              </Button>
-            ) : null}
+            <div className="flex shrink-0 items-center gap-2">
+              <InvestigateButton seed={{ event_id: eventId }} />
+              {event.data.event.story_id !== null ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  render={<Link href={`/thread/${event.data.event.story_id}`} />}
+                >
+                  <GitBranchIcon data-icon="inline-start" />
+                  View thread
+                </Button>
+              ) : null}
+            </div>
           </div>
 
           {event.data.event.summary ? (

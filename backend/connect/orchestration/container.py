@@ -14,6 +14,7 @@ import sqlite3
 
 from connect.analysis.pipeline import AnalysisService
 from connect.ingestion.blobs import BlobStore
+from connect.investigation.runner import InvestigationService
 from connect.ingestion.fetcher import Fetcher
 from connect.ingestion.pipeline import IngestionPipeline
 from connect.ingestion.poller import SourcePoller
@@ -28,7 +29,7 @@ from connect.knowledge.vector import VectorIndex, create_vector_index
 from connect.llm.anthropic_provider import AnthropicProvider
 from connect.llm.batch_runner import AnthropicBatchRunner
 from connect.llm.provider import LLMProvider
-from connect.llm.spend import Governor
+from connect.llm.spend import INVESTIGATION_PURPOSES, Governor
 from connect.llm.tiers import tier_models
 from connect.orchestration.config import Settings
 from connect.orchestration.jobs import JobRunner
@@ -81,6 +82,9 @@ class Container:
         self.search_client: SearchClient = create_search_client(
             settings.tavily_api_key)
         self.analysis: AnalysisService | None = None
+        # v8: investigation mode — its OWN daily governor + service.
+        self.investigation_governor: Governor | None = None
+        self.investigations: InvestigationService | None = None
 
     # -- lifecycle --------------------------------------------------------------
 
@@ -91,8 +95,14 @@ class Container:
         seed_sources(self.conn)
         seed_event_types(self.conn)
         seed_calendar_events(self.conn)
+        # general governor excludes investigation spend; the investigation
+        # governor sees ONLY it — neither budget gates or charges the other
         self.governor = Governor(
-            self.conn, self.settings.daily_llm_budget_usd)
+            self.conn, self.settings.daily_llm_budget_usd,
+            exclude_purposes=INVESTIGATION_PURPOSES)
+        self.investigation_governor = Governor(
+            self.conn, self.settings.investigation_daily_budget_usd,
+            purposes=INVESTIGATION_PURPOSES)
         self.enrichment = EnrichmentService(
             self.conn,
             provider=self.llm,
@@ -142,6 +152,24 @@ class Container:
             vectors=self.vectors,
             budget_usd=self.settings.analysis_budget_usd,
             default_max_evidence=self.settings.analysis_max_evidence,
+        )
+        self.investigations = InvestigationService(
+            self.conn,
+            jobs=self.jobs,
+            provider=self.llm,
+            governor=self.investigation_governor,
+            search=self.search_client,
+            ingest=self.pipeline,
+            embedder=self.embedder,
+            vectors=self.vectors,
+            default_budget_usd=self.settings.investigation_budget_usd,
+            default_max_iterations=self.settings
+            .investigation_max_iterations,
+            default_max_web_fetches=self.settings
+            .investigation_max_web_fetches,
+            synthesis_reserve_usd=self.settings
+            .investigation_synthesis_reserve_usd,
+            synthesis_tier=self.settings.investigation_synthesis_tier,
         )
         log.info("container up: db=%s schema=v%s vectors=%s",
                  self.settings.db_path, self.schema_version,

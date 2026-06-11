@@ -24,6 +24,9 @@ from connect.llm.provider import (
     LLMProvider,
     StructuredCompletion,
     TModel,
+    ToolCall,
+    ToolDef,
+    ToolTurn,
     Usage,
 )
 from connect.llm.tiers import DEFAULT_TIER_MODELS, ModelTier
@@ -69,6 +72,57 @@ class AnthropicProvider(LLMProvider):
         text = "".join(
             block.text for block in resp.content if block.type == "text")
         return Completion(text=text, model=resp.model, usage=_usage(resp.usage))
+
+    async def complete_with_tools(self, *, system: str | None,
+                                  messages: Sequence[dict[str, Any]],
+                                  tools: Sequence[ToolDef],
+                                  tier: ModelTier, max_tokens: int,
+                                  cache: bool = True,
+                                  tool_choice: str | None = None,
+                                  ) -> ToolTurn:
+        """One tools-enabled messages.create turn (SDK 0.109.1 surface:
+        tools=[{name, description, input_schema}], tool_choice
+        {'type':'tool','name':...}, content blocks 'text'/'tool_use').
+        ``cache`` marks the system block ``cache_control: ephemeral`` — the
+        prompt prefix (tools + system) is cached, so every later iteration
+        re-reads it at ~0.1x the input rate."""
+        model = self.model_for(tier)
+        kwargs: dict[str, Any] = {}
+        if system is not None:
+            if cache:
+                kwargs["system"] = [{
+                    "type": "text", "text": system,
+                    "cache_control": {"type": "ephemeral"}}]
+            else:
+                kwargs["system"] = system
+        if tool_choice is not None:
+            kwargs["tool_choice"] = {"type": "tool", "name": tool_choice}
+        try:
+            resp = await self._client.messages.create(
+                model=model, max_tokens=max_tokens,
+                messages=list(messages),
+                tools=[t.model_dump() for t in tools], **kwargs)
+        except anthropic.APIError as e:
+            raise LLMError(f"anthropic tool call failed: {e}") from e
+        text_parts: list[str] = []
+        calls: list[ToolCall] = []
+        raw: list[dict[str, Any]] = []
+        for block in resp.content:
+            if block.type == "text":
+                text_parts.append(block.text)
+                raw.append({"type": "text", "text": block.text})
+            elif block.type == "tool_use":
+                calls.append(ToolCall(id=block.id, name=block.name,
+                                      input=dict(block.input or {})))
+                raw.append({"type": "tool_use", "id": block.id,
+                            "name": block.name,
+                            "input": dict(block.input or {})})
+            else:  # pragma: no cover — future block types replay as-is
+                raw.append(block.model_dump(mode="json", exclude_none=True))
+        return ToolTurn(
+            text="".join(text_parts), tool_calls=calls,
+            stop_reason=resp.stop_reason or "end_turn", raw_content=raw,
+            model=resp.model, usage=_usage(resp.usage))
 
     async def complete_structured(self, *, system: str | None,
                                   messages: Sequence[dict[str, Any]],

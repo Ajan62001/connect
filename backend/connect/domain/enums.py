@@ -51,7 +51,11 @@ EDGE_STATUSES = ("active", "superseded", "retracted")
 # rebuild every time a phase adds a relation); the vocabulary is enforced in
 # Python by storage/edges.py. Grows phase by phase.
 # 'follows' (Phase 2): event -> event story threading.
-EDGE_RELATIONS = ("links_to", "follows")
+# v8 (investigation mode): the causal vocabulary — reaction_to/triggered_by
+# (event -> event), enables/blocks (event|entity -> event|entity),
+# alternative_to (same-kind pairs). Signatures enforced in storage/edges.py.
+EDGE_RELATIONS = ("links_to", "follows", "reaction_to", "triggered_by",
+                  "enables", "blocks", "alternative_to")
 
 # --- document links (Phase 0.5: in-content link extraction & follow) --------
 
@@ -68,18 +72,36 @@ STORY_STATUSES = ("active", "archived")
 # --- dossiers (Pillar A; tables ship in v1, pipeline is a later phase) ------
 
 DOSSIER_STATUSES = ("pending", "running", "completed", "failed", "cancelled")
-DOSSIER_INPUT_TYPES = ("claim", "policy", "event", "document")
+# v8 appends topic/entity/story (investigation seeds).
+DOSSIER_INPUT_TYPES = ("claim", "policy", "event", "document",
+                       "topic", "entity", "story")
+# v8 appends the investigation stages + its section-row names.
 DOSSIER_STAGES = (
     "normalize", "provenance", "verify", "extract_link",
-    "forces", "impacts", "loopholes", "assemble")
+    "forces", "impacts", "loopholes", "assemble",
+    "scope", "investigate", "synthesize", "timeline", "causal_narrative",
+    "actors", "alternatives", "open_questions", "watch_next")
 SECTION_STATUSES = ("pending", "running", "completed", "failed", "skipped")
+
+# v8: a dossier is either an analysis (Phase 3) or an investigation.
+DOSSIER_KINDS = ("analysis", "investigation")
+
+# --- investigations (v8) -----------------------------------------------------
+
+QUESTION_TYPES = (
+    "why_now", "why_this_design", "why_not_alternative", "who_pushed",
+    "what_triggered", "why_silent", "who_benefits", "what_next")
+QUESTION_STATUSES = ("open", "partial", "answered", "dropped")
+FINDING_KINDS = (
+    "reaction", "trigger", "alternative", "actor_motive", "timing",
+    "context", "consequence")
 
 # --- jobs ------------------------------------------------------------------
 
 JOB_KINDS = (
     "poll_source", "ingest_url", "analysis",
     "enrich_t1_sync", "enrich_t1_batch", "enrich_t2", "reverify_claim",
-    "brief_generate")
+    "brief_generate", "investigation")
 JOB_STATUSES = ("queued", "running", "done", "failed", "cancelled")
 
 # --- watches / consumption -------------------------------------------------

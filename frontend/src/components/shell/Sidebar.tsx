@@ -11,6 +11,7 @@ import {
   ScaleIcon,
   SearchIcon,
   SunIcon,
+  TelescopeIcon,
 } from "lucide-react";
 
 import { useBriefToday, useOpenContradictionCount } from "@/lib/queries";
@@ -22,6 +23,7 @@ const NAV_ITEMS = [
   { href: "/library", label: "Library", icon: LibraryBigIcon },
   { href: "/search", label: "Search", icon: SearchIcon },
   { href: "/analyze", label: "Analyze", icon: FlaskConicalIcon },
+  { href: "/investigations", label: "Investigations", icon: TelescopeIcon },
   { href: "/contradictions", label: "Contradictions", icon: ScaleIcon },
   { href: "/sources", label: "Sources", icon: DatabaseIcon },
   { href: "/watchlist", label: "Watchlist", icon: EyeIcon },
@@ -57,6 +59,8 @@ export function Sidebar() {
             (href === "/library" && pathname.startsWith("/documents")) ||
             (href === "/search" && pathname.startsWith("/entity")) ||
             (href === "/analyze" && pathname.startsWith("/analysis")) ||
+            (href === "/investigations" &&
+              pathname.startsWith("/investigation")) ||
             (href === "/today" &&
               (pathname.startsWith("/brief") ||
                 pathname.startsWith("/thread") ||

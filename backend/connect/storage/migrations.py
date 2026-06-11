@@ -25,8 +25,13 @@ from connect.storage.schema import (
     DOCUMENT_INDEX_DDL,
     DOCUMENT_LINK_DDL,
     DOCUMENT_TABLE_DDL,
+    DOSSIER_SECTION_TABLE_DDL,
+    DOSSIER_TABLE_DDL,
     EVENT_EMBEDDING_DDL,
+    FINDING_DDL,
+    FINDING_EVIDENCE_DDL,
     JOB_TABLE_DDL,
+    QUESTION_DDL,
     SCHEMA_VERSION,
     SOURCE_TABLE_DDL,
     StorageError,
@@ -159,6 +164,51 @@ def _migrate_6_to_7(conn: sqlite3.Connection) -> None:
         conn.execute(ddl)
 
 
+def _migrate_7_to_8(conn: sqlite3.Connection) -> None:
+    """v8 (investigation mode): question/finding/finding_evidence tables +
+    three CHECK-vocabulary rebuilds.
+
+    - dossier gains kind/parent_question_id/budget_usd columns and the
+      topic/entity/story input types + investigation stages — rebuilt with
+      the EXACT fresh-create DDL; the copy-back lists the v7 columns
+      explicitly so the new columns take their DDL defaults
+      (kind='analysis', parent_question_id NULL, budget_usd NULL).
+    - dossier_section's stage vocabulary and job's kind vocabulary grow —
+      rebuilt with SELECT * (column sets unchanged).
+    Same copy-out -> drop -> recreate -> copy-back pattern as v2 -> v3;
+    apply() runs with foreign_keys OFF, rowids survive the copies. The new
+    tables are created FIRST so the rebuilt dossier's FK on question(id)
+    resolves by name. Indexes dropped with a table are recreated after the
+    copy-back.
+    """
+    for ddl in (*QUESTION_DDL, *FINDING_DDL, *FINDING_EVIDENCE_DDL):
+        conn.execute(ddl)
+
+    backup = "_mig_dossier"
+    conn.execute(f"DROP TABLE IF EXISTS {backup}")
+    conn.execute(f"CREATE TABLE {backup} AS SELECT * FROM dossier")
+    conn.execute("DROP TABLE dossier")
+    conn.execute(DOSSIER_TABLE_DDL)
+    conn.execute(
+        "INSERT INTO dossier (id, title, input_text, input_type,"
+        " input_document_id, status, current_stage, error, model_usage,"
+        " created_at, started_at, finished_at)"
+        " SELECT id, title, input_text, input_type, input_document_id,"
+        " status, current_stage, error, model_usage, created_at,"
+        f" started_at, finished_at FROM {backup}")
+    conn.execute(f"DROP TABLE {backup}")
+
+    for table, table_ddl in (("dossier_section", DOSSIER_SECTION_TABLE_DDL),
+                             ("job", JOB_TABLE_DDL)):
+        backup = f"_mig_{table}"
+        conn.execute(f"DROP TABLE IF EXISTS {backup}")
+        conn.execute(f"CREATE TABLE {backup} AS SELECT * FROM {table}")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(table_ddl)
+        conn.execute(f"INSERT INTO {table} SELECT * FROM {backup}")
+        conn.execute(f"DROP TABLE {backup}")
+
+
 # Registry: version N -> function taking N's schema to N+1's. Forward-only.
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_1_to_2,
@@ -167,6 +217,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     4: _migrate_4_to_5,
     5: _migrate_5_to_6,
     6: _migrate_6_to_7,
+    7: _migrate_7_to_8,
 }
 
 

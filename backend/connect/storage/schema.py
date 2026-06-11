@@ -22,7 +22,7 @@ import sqlite3
 
 from connect.domain import enums as E
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 # --- error hierarchy ---------------------------------------------------------
@@ -415,13 +415,19 @@ CREATE TABLE IF NOT EXISTS contradiction (
     resolved_at         TEXT
 )"""
 
+# v8 adds kind (analysis|investigation), parent_question_id (manual question
+# recursion lineage) and budget_usd (the per-run cap frozen at creation).
 _DDL_DOSSIER = f"""
 CREATE TABLE IF NOT EXISTS dossier (
     id                 INTEGER PRIMARY KEY,
+    kind               TEXT NOT NULL DEFAULT 'analysis'
+                       CHECK (kind IN {E.sql_in(E.DOSSIER_KINDS)}),
     title              TEXT,
     input_text         TEXT NOT NULL,
     input_type         TEXT CHECK (input_type IN {E.sql_in(E.DOSSIER_INPUT_TYPES)}),
     input_document_id  INTEGER REFERENCES document(id),
+    parent_question_id INTEGER REFERENCES question(id),
+    budget_usd         REAL,
     status             TEXT NOT NULL DEFAULT 'pending'
                        CHECK (status IN {E.sql_in(E.DOSSIER_STATUSES)}),
     current_stage      TEXT CHECK (current_stage IN {E.sql_in(E.DOSSIER_STAGES)}),
@@ -444,6 +450,79 @@ CREATE TABLE IF NOT EXISTS dossier_section (
     updated_at TEXT,
     UNIQUE (dossier_id, stage)
 )"""
+
+# v8 (investigation mode): typed why-questions — first-class persisted
+# objects; the loop's work queue and the open-questions product surface.
+# question <-> dossier FKs are mutually circular; SQLite resolves FK targets
+# at DML time, so declaration order is irrelevant.
+_DDL_QUESTION = f"""
+CREATE TABLE IF NOT EXISTS question (
+    id                 INTEGER PRIMARY KEY,
+    dossier_id         INTEGER NOT NULL REFERENCES dossier(id) ON DELETE CASCADE,
+    qtype              TEXT NOT NULL CHECK (qtype IN {E.sql_in(E.QUESTION_TYPES)}),
+    text               TEXT NOT NULL,
+    about_type         TEXT CHECK (about_type IN {E.sql_in(E.NODE_TYPES)}),
+    about_id           INTEGER,
+    status             TEXT NOT NULL DEFAULT 'open'
+                       CHECK (status IN {E.sql_in(E.QUESTION_STATUSES)}),
+    priority           REAL NOT NULL DEFAULT 0.5,
+    answer_summary     TEXT,
+    answer_finding_ids TEXT NOT NULL DEFAULT '[]',
+    spawned_dossier_id INTEGER REFERENCES dossier(id),
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT
+)"""
+
+_DDL_QUESTION_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_question_dossier ON question(dossier_id)",
+    "CREATE INDEX IF NOT EXISTS idx_question_about"
+    " ON question(about_type, about_id)",
+)
+
+# v8: one grounded (or explicitly speculative) connection the loop recorded;
+# persisted incrementally so a crash loses nothing already found.
+_DDL_FINDING = f"""
+CREATE TABLE IF NOT EXISTS finding (
+    id          INTEGER PRIMARY KEY,
+    dossier_id  INTEGER NOT NULL REFERENCES dossier(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL CHECK (kind IN {E.sql_in(E.FINDING_KINDS)}),
+    text        TEXT NOT NULL,
+    speculation INTEGER NOT NULL DEFAULT 0,
+    confidence  REAL,
+    question_id INTEGER REFERENCES question(id),
+    edge_id     INTEGER REFERENCES edge(id),
+    payload     TEXT NOT NULL DEFAULT '{{}}',
+    created_at  TEXT NOT NULL
+)"""
+
+_DDL_FINDING_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_finding_dossier ON finding(dossier_id)",
+)
+
+# v8: span-verified verbatim quotes backing a finding (offsets best-effort).
+_DDL_FINDING_EVIDENCE = """
+CREATE TABLE IF NOT EXISTS finding_evidence (
+    id          INTEGER PRIMARY KEY,
+    finding_id  INTEGER NOT NULL REFERENCES finding(id) ON DELETE CASCADE,
+    document_id INTEGER NOT NULL REFERENCES document(id),
+    quote       TEXT NOT NULL,
+    quote_start INTEGER,
+    quote_end   INTEGER
+)"""
+
+_DDL_FINDING_EVIDENCE_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_finding_evidence_finding"
+    " ON finding_evidence(finding_id)",
+)
+
+# Exported for migrations.py (migrate_7_to_8 creates the same tables and
+# rebuilds dossier/dossier_section/job with the EXACT fresh-create DDL).
+DOSSIER_TABLE_DDL: str = _DDL_DOSSIER
+DOSSIER_SECTION_TABLE_DDL: str = _DDL_DOSSIER_SECTION
+QUESTION_DDL: tuple[str, ...] = (_DDL_QUESTION, *_DDL_QUESTION_INDEXES)
+FINDING_DDL: tuple[str, ...] = (_DDL_FINDING, *_DDL_FINDING_INDEXES)
+FINDING_EVIDENCE_DDL: tuple[str, ...] = (
+    _DDL_FINDING_EVIDENCE, *_DDL_FINDING_EVIDENCE_INDEXES)
 
 _DDL_JOB = f"""
 CREATE TABLE IF NOT EXISTS job (
@@ -656,8 +735,14 @@ ALL_DDL: tuple[str, ...] = (
     _DDL_EVENT_ASSIGNMENT,
     _DDL_DOSSIER,          # before edge (edge FKs dossier)
     _DDL_DOSSIER_SECTION,
+    _DDL_QUESTION,         # FKs dossier; dossier's FK back is name-resolved
+    *_DDL_QUESTION_INDEXES,
     _DDL_EDGE,
     *_DDL_EDGE_INDEXES,
+    _DDL_FINDING,          # FKs dossier + question + edge
+    *_DDL_FINDING_INDEXES,
+    _DDL_FINDING_EVIDENCE,
+    *_DDL_FINDING_EVIDENCE_INDEXES,
     _DDL_CLAIM_SIGHTING,
     *_DDL_CLAIM_SIGHTING_INDEXES,
     _DDL_VERDICT_HISTORY,

@@ -14,6 +14,7 @@ import { DocumentTable } from "@/components/documents/DocumentTable";
 import { DeltaBanner } from "@/components/entities/DeltaBanner";
 import { EntityPill, EntityTypeChip } from "@/components/entities/EntityPill";
 import { EventTimeline } from "@/components/events/EventTimeline";
+import { InvestigateButton } from "@/components/investigation/InvestigateButton";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { Paginator } from "@/components/shared/Paginator";
 import { QueryError } from "@/components/shared/QueryError";
@@ -259,7 +260,10 @@ export default function EntityPage({
                 </p>
               ) : null}
             </div>
-            <WatchButton entityId={entityId} name={entity.data.entity.name} />
+            <div className="flex shrink-0 items-center gap-2">
+              <InvestigateButton seed={{ entity_id: entityId }} />
+              <WatchButton entityId={entityId} name={entity.data.entity.name} />
+            </div>
           </div>
 
           <StatLine detail={entity.data} />

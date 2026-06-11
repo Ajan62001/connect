@@ -89,6 +89,18 @@ class Settings(BaseSettings):
     # K — max NEW web documents fetched per claim (options can override)
     analysis_max_evidence: int = 6
 
+    # investigation mode (v8) — SEPARATE daily envelope, never the $2 general
+    # governor (ledger purposes investigation/investigation_t1/
+    # investigation_synthesis)
+    investigation_daily_budget_usd: float = 10.0
+    # per-run default cap + the slice held back for the DEEP synthesis call
+    investigation_budget_usd: float = 1.00
+    investigation_synthesis_reserve_usd: float = 0.20
+    # 'deep' normally; over-reserve runs fall back to 'balanced' regardless
+    investigation_synthesis_tier: str = "deep"
+    investigation_max_iterations: int = 14
+    investigation_max_web_fetches: int = 8
+
     # link extraction & selective follow (Phase 0.5)
     link_follow_enabled: bool = True
     link_follow_max_per_doc: int = 5

@@ -14,7 +14,7 @@ import {
 } from "@tanstack/react-query";
 
 import * as api from "@/lib/api";
-import { ANALYSIS_EVENT_NAMES } from "@/lib/api";
+import { ANALYSIS_EVENT_NAMES, INVESTIGATION_EVENT_NAMES } from "@/lib/api";
 import type {
   AnalysisCreate,
   AnalysisDetail,
@@ -30,6 +30,10 @@ import type {
   FeedParams,
   IngestResult,
   IngestText,
+  InvestigationCreate,
+  InvestigationDetail,
+  InvestigationEvent,
+  InvestigationListParams,
   SearchKind,
   SourceCreate,
   SourceTestRequest,
@@ -71,6 +75,10 @@ export const queryKeys = {
     ["contradictions", "list", params] as const,
   contradiction: (id: number) => ["contradictions", "detail", id] as const,
   contradictionOpenCount: ["contradictions", "open-count"] as const,
+  investigations: ["investigations"] as const,
+  investigationList: (params: InvestigationListParams) =>
+    ["investigations", "list", params] as const,
+  investigation: (id: number) => ["investigations", "detail", id] as const,
 };
 
 // --------------------------------------------------------------------------
@@ -801,3 +809,361 @@ export function useDismissContradiction() {
     },
   });
 }
+
+// --------------------------------------------------------------------------
+// Investigations (Phase 4)
+// --------------------------------------------------------------------------
+
+export function useInvestigations(params: InvestigationListParams) {
+  return useQuery({
+    queryKey: queryKeys.investigationList(params),
+    queryFn: () => api.listInvestigations(params),
+    placeholderData: keepPreviousData,
+    // Keep list rows fresh while any visible investigation is in flight.
+    refetchInterval: (query) =>
+      query.state.data?.items.some(
+        (item) => item.status === "pending" || item.status === "running",
+      )
+        ? 5_000
+        : false,
+  });
+}
+
+export function useCreateInvestigation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: InvestigationCreate) =>
+      api.createInvestigation(payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.investigations });
+    },
+  });
+}
+
+export function useCancelInvestigation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.cancelInvestigation(id),
+    onSuccess: (_void, id) => {
+      // 202 — cancellation is async; refetch so the status flips when it lands.
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.investigation(id),
+      });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.investigations });
+    },
+  });
+}
+
+/**
+ * Manual question recursion. `parentInvestigationId` lets the hook refresh
+ * the parent snapshot so the question row picks up its spawned_dossier_id.
+ */
+export function useInvestigateQuestion() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ questionId }: { questionId: number; parentInvestigationId?: number }) =>
+      api.investigateQuestion(questionId),
+    onSuccess: (_accepted, { parentInvestigationId }) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.investigations });
+      if (parentInvestigationId !== undefined) {
+        void queryClient.invalidateQueries({
+          queryKey: queryKeys.investigation(parentInvestigationId),
+        });
+      }
+    },
+  });
+}
+
+/** One activity line for the investigation rail (ring buffer, never cached). */
+export interface InvestigationActivityLine {
+  seq: number;
+  message: string;
+}
+
+/**
+ * Human one-liner for the ActivityLog. Returns null for events that carry no
+ * useful progress text (they still hit the reducer / refetch path).
+ */
+function investigationActivityMessage(event: InvestigationEvent): string | null {
+  switch (event.type) {
+    case "stage_progress":
+      return event.message;
+    case "iteration": {
+      const tools =
+        event.tools && event.tools.length > 0
+          ? event.tools.join(", ")
+          : "thinking";
+      const cost =
+        typeof event.cost_so_far === "number"
+          ? ` · $${event.cost_so_far.toFixed(2)}`
+          : "";
+      return `#${event.n} ${tools}${cost}`;
+    }
+    case "finding_recorded": {
+      const kind = event.kind ? ` (${event.kind}` : "";
+      const spec = event.kind ? `${event.speculation ? ", hypothesis" : ""})` : "";
+      return `finding f${event.finding_id} recorded${kind}${spec}`;
+    }
+    case "question_raised":
+      return `question raised: ${event.text ?? event.qtype ?? `#${event.question_id}`}`;
+    case "question_resolved":
+      return `question #${event.question_id} ${event.status ?? "resolved"}`;
+    case "doc_ingested":
+      return `ingested: ${event.title ?? `document #${event.document_id}`}`;
+    case "section_completed":
+      return `section ready: ${event.section.replace(/_/g, " ")}`;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Pure reducer applying one SSE event to the cached snapshot. Only fields the
+ * thin event payloads can authoritatively patch are touched (stage statuses,
+ * cost ticker, question status flips, terminal status); everything else
+ * arrives via the coalesced snapshot refetch.
+ */
+function applyInvestigationEvent(
+  detail: InvestigationDetail,
+  event: InvestigationEvent,
+): InvestigationDetail {
+  const now = new Date().toISOString();
+  switch (event.type) {
+    case "stage_started": {
+      const known = detail.stages.some((s) => s.stage === event.stage);
+      const stages = known
+        ? detail.stages.map((s) =>
+            s.stage === event.stage
+              ? { ...s, status: "running" as const, started_at: s.started_at ?? now }
+              : s,
+          )
+        : [
+            ...detail.stages,
+            {
+              stage: event.stage,
+              status: "running" as const,
+              summary: null,
+              started_at: now,
+              finished_at: null,
+            },
+          ];
+      return { ...detail, status: "running", stages };
+    }
+    case "stage_completed":
+      return {
+        ...detail,
+        stages: detail.stages.map((s) =>
+          s.stage === event.stage
+            ? {
+                ...s,
+                status: "completed" as const,
+                summary: event.summary ?? s.summary,
+                finished_at: s.finished_at ?? now,
+              }
+            : s,
+        ),
+      };
+    case "iteration":
+      return typeof event.cost_so_far === "number"
+        ? { ...detail, cost_usd: event.cost_so_far }
+        : detail;
+    case "question_resolved":
+      return event.status
+        ? {
+            ...detail,
+            questions: detail.questions.map((q) =>
+              q.id === event.question_id ? { ...q, status: event.status! } : q,
+            ),
+          }
+        : detail;
+    case "done":
+      return {
+        ...detail,
+        status: "completed",
+        finished_at: detail.finished_at ?? now,
+      };
+    case "error":
+      return {
+        ...detail,
+        status: "failed",
+        error: event.message,
+        finished_at: detail.finished_at ?? now,
+      };
+    default:
+      // finding_recorded / question_raised / doc_ingested / section_completed
+      // / stage_progress: persisted rows arrive with the snapshot refetch.
+      return detail;
+  }
+}
+
+/** Events whose payloads are thinner than the rows they announce. */
+const INVESTIGATION_REFETCH_EVENTS: ReadonlySet<InvestigationEvent["type"]> =
+  new Set([
+    "finding_recorded",
+    "question_raised",
+    "question_resolved",
+    "doc_ingested",
+    "section_completed",
+    "stage_completed",
+  ]);
+
+/**
+ * Live investigation hook — a clone of useAnalysis's snapshot+SSE reducer
+ * against the investigation contract:
+ *
+ * - Snapshot via GET /api/investigations/{id}; while pending/running, opens
+ *   `GET /api/investigations/{id}/events?after=<last_seq>`.
+ * - Iteration lines (tool briefs + cost ticker), stage_progress, and row
+ *   announcements feed an in-hook ring buffer (last 200) returned as
+ *   `activity`; they never enter the query cache.
+ * - Data-bearing events schedule a coalesced snapshot refetch (the payloads
+ *   are thin); stage/cost/status fields are patched optimistically.
+ * - Out-of-order/duplicate guard on job_event.seq; transport errors close the
+ *   stream, refetch the snapshot, and resume after last_seq with backoff.
+ */
+export function useInvestigation(id: number) {
+  const queryClient = useQueryClient();
+  const query = useQuery({
+    queryKey: queryKeys.investigation(id),
+    queryFn: () => api.getInvestigation(id),
+    enabled: Number.isFinite(id),
+  });
+
+  const status = query.data?.status;
+  const isLive = status === "pending" || status === "running";
+
+  // Highest seq applied (snapshot or event) — resume cursor + order guard.
+  const seqRef = useRef({ id, seq: 0 });
+  const snapshotSeq = query.data?.last_seq ?? 0;
+  useEffect(() => {
+    if (seqRef.current.id !== id) seqRef.current = { id, seq: 0 };
+    seqRef.current.seq = Math.max(seqRef.current.seq, snapshotSeq);
+  }, [id, snapshotSeq]);
+
+  const [activityState, setActivityState] = useState<{
+    id: number;
+    lines: InvestigationActivityLine[];
+  }>({ id, lines: [] });
+  const activity =
+    activityState.id === id ? activityState.lines : NO_INVESTIGATION_ACTIVITY;
+
+  useEffect(() => {
+    if (!isLive || !Number.isFinite(id)) return;
+
+    let disposed = false;
+    let source: EventSource | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let refetchTimer: ReturnType<typeof setTimeout> | undefined;
+    let backoffMs = 1_000;
+
+    const invalidateSnapshot = () =>
+      queryClient.invalidateQueries({ queryKey: queryKeys.investigation(id) });
+
+    /** Coalesces refetches across a burst of finding/question events. */
+    const scheduleSnapshotRefetch = () => {
+      if (refetchTimer !== undefined) return;
+      refetchTimer = setTimeout(() => {
+        refetchTimer = undefined;
+        void invalidateSnapshot();
+      }, 400);
+    };
+
+    const handleEvent = (raw: MessageEvent<string>) => {
+      const seq = Number(raw.lastEventId);
+      if (Number.isFinite(seq) && seq > 0) {
+        if (seq <= seqRef.current.seq) return; // duplicate / out of order
+        seqRef.current.seq = seq;
+      }
+      let payload: Record<string, unknown> = {};
+      if (raw.data) {
+        try {
+          payload = JSON.parse(raw.data) as Record<string, unknown>;
+        } catch {
+          return; // malformed frame — the next snapshot refetch covers it
+        }
+      }
+      const event = { ...payload, type: raw.type } as InvestigationEvent;
+
+      const message = investigationActivityMessage(event);
+      if (message !== null) {
+        const line: InvestigationActivityLine = {
+          seq: Number.isFinite(seq) ? seq : 0,
+          message,
+        };
+        setActivityState((prev) => ({
+          id,
+          lines:
+            prev.id === id
+              ? [...prev.lines, line].slice(-ACTIVITY_BUFFER_SIZE)
+              : [line],
+        }));
+      }
+
+      queryClient.setQueryData<InvestigationDetail>(
+        queryKeys.investigation(id),
+        (old) => (old ? applyInvestigationEvent(old, event) : old),
+      );
+      if (INVESTIGATION_REFETCH_EVENTS.has(event.type)) {
+        scheduleSnapshotRefetch();
+      }
+      if (event.type === "done" || event.type === "error") {
+        source?.close();
+        source = null;
+        void invalidateSnapshot();
+        // A finished run also updates the list rows (counts, cost, status).
+        void queryClient.invalidateQueries({
+          queryKey: queryKeys.investigations,
+        });
+      }
+    };
+
+    const open = () => {
+      if (disposed) return;
+      const es = new EventSource(
+        api.investigationEventsUrl(id, seqRef.current.seq),
+      );
+      source = es;
+      es.onopen = () => {
+        backoffMs = 1_000;
+      };
+      for (const name of INVESTIGATION_EVENT_NAMES) {
+        if (name === "error") continue; // handled below (transport collision)
+        es.addEventListener(name, (raw) =>
+          handleEvent(raw as MessageEvent<string>),
+        );
+      }
+      // "error" is both our terminal server event AND the EventSource
+      // transport-failure event; a `data` payload distinguishes them.
+      es.addEventListener("error", (raw) => {
+        if (isServerEvent(raw)) {
+          handleEvent(raw);
+          return;
+        }
+        // Transport drop: close, refetch the snapshot, resume after last_seq.
+        es.close();
+        if (source === es) source = null;
+        if (disposed) return;
+        const delay = backoffMs;
+        backoffMs = Math.min(backoffMs * 2, 15_000);
+        reconnectTimer = setTimeout(() => {
+          void invalidateSnapshot().finally(() => {
+            if (!disposed) open();
+          });
+        }, delay);
+      });
+    };
+
+    open();
+    return () => {
+      disposed = true;
+      source?.close();
+      if (reconnectTimer !== undefined) clearTimeout(reconnectTimer);
+      if (refetchTimer !== undefined) clearTimeout(refetchTimer);
+    };
+  }, [id, isLive, queryClient]);
+
+  return { query, activity, isLive };
+}
+
+/** Stable empty buffer returned while activity state belongs to another id. */
+const NO_INVESTIGATION_ACTIVITY: InvestigationActivityLine[] = [];

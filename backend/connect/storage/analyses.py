@@ -38,10 +38,12 @@ def _content(row: sqlite3.Row) -> dict[str, Any]:
 
 def list_page(conn: sqlite3.Connection, *, page: int = 1,
               page_size: int = 20) -> AnalysisPage:
-    total = conn.execute("SELECT COUNT(*) FROM dossier").fetchone()[0]
+    total = conn.execute("SELECT COUNT(*) FROM dossier"
+                         " WHERE kind = 'analysis'").fetchone()[0]
     rows = conn.execute(
         "SELECT id, status, input_text, created_at, finished_at"
-        " FROM dossier ORDER BY id DESC LIMIT ? OFFSET ?",
+        " FROM dossier WHERE kind = 'analysis'"
+        " ORDER BY id DESC LIMIT ? OFFSET ?",
         (page_size, (page - 1) * page_size)).fetchall()
     items = [AnalysisListItem(
         id=r["id"], status=r["status"], input_text=r["input_text"],
@@ -72,7 +74,8 @@ def get_detail(conn: sqlite3.Connection,
                dossier_id: int) -> AnalysisDetail | None:
     dossier = conn.execute(
         "SELECT id, status, input_text, error, created_at, started_at,"
-        " finished_at FROM dossier WHERE id = ?", (dossier_id,)).fetchone()
+        " finished_at FROM dossier WHERE id = ? AND kind = 'analysis'",
+        (dossier_id,)).fetchone()
     if dossier is None:
         return None
     sections = conn.execute(

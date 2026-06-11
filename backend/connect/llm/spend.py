@@ -35,6 +35,12 @@ FALLBACK_PRICE: tuple[float, float] = (5.0, 25.0)
 BATCH_DISCOUNT = 0.5      # Message Batches: 50% off all token usage
 CACHE_READ_FACTOR = 0.1   # cache reads ~0.1x the input rate
 
+# v8: investigation spend lives in its OWN daily envelope. These ledger
+# purposes are summed by the investigation governor and EXCLUDED from the
+# general governor — neither budget gates or charges the other.
+INVESTIGATION_PURPOSES: tuple[str, ...] = (
+    "investigation", "investigation_t1", "investigation_synthesis")
+
 # T1 cost-projection assumptions (design doc: ~2.2K prompt+content in,
 # ~300 structured out per item on the FAST tier).
 EST_T1_INPUT_TOKENS = 2200
@@ -83,11 +89,22 @@ def record_call(conn: sqlite3.Connection, *, purpose: str, model: str,
     return int(cur.lastrowid)  # type: ignore[arg-type]
 
 
-def spent_on(conn: sqlite3.Connection, day: str) -> float:
-    """Total ledgered USD for one 'YYYY-MM-DD' UTC day."""
-    row = conn.execute(
-        "SELECT COALESCE(SUM(cost_estimate), 0) FROM llm_call"
-        " WHERE substr(created_at, 1, 10) = ?", (day,)).fetchone()
+def spent_on(conn: sqlite3.Connection, day: str, *,
+             purposes: tuple[str, ...] | None = None,
+             exclude_purposes: tuple[str, ...] = ()) -> float:
+    """Total ledgered USD for one 'YYYY-MM-DD' UTC day, optionally scoped
+    to (or excluding) a purpose set — the two-governor split is a WHERE
+    clause, never a second ledger."""
+    sql = ("SELECT COALESCE(SUM(cost_estimate), 0) FROM llm_call"
+           " WHERE substr(created_at, 1, 10) = ?")
+    params: list = [day]
+    if purposes is not None:
+        sql += f" AND purpose IN ({','.join('?' * len(purposes))})"
+        params.extend(purposes)
+    if exclude_purposes:
+        sql += f" AND purpose NOT IN ({','.join('?' * len(exclude_purposes))})"
+        params.extend(exclude_purposes)
+    row = conn.execute(sql, params).fetchone()
     return float(row[0])
 
 
@@ -95,8 +112,11 @@ def today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def spent_today(conn: sqlite3.Connection) -> float:
-    return spent_on(conn, today_utc())
+def spent_today(conn: sqlite3.Connection, *,
+                purposes: tuple[str, ...] | None = None,
+                exclude_purposes: tuple[str, ...] = ()) -> float:
+    return spent_on(conn, today_utc(), purposes=purposes,
+                    exclude_purposes=exclude_purposes)
 
 
 def daily_breakdown(conn: sqlite3.Connection, days: int) -> list[dict]:
@@ -132,14 +152,27 @@ class BudgetExceeded(RuntimeError):
 
 
 class Governor:
-    """check() raises BudgetExceeded when ledger + projection > budget."""
+    """check() raises BudgetExceeded when ledger + projection > budget.
 
-    def __init__(self, conn: sqlite3.Connection, daily_budget_usd: float):
+    ``purposes`` scopes the governor to those ledger purposes only (the
+    investigation governor); ``exclude_purposes`` carves purposes OUT of an
+    otherwise-global governor (the general governor excludes investigation
+    spend). Defaults preserve the original whole-ledger behavior."""
+
+    def __init__(self, conn: sqlite3.Connection, daily_budget_usd: float, *,
+                 purposes: tuple[str, ...] | None = None,
+                 exclude_purposes: tuple[str, ...] = ()):
         self.conn = conn
         self.daily_budget_usd = daily_budget_usd
+        self.purposes = purposes
+        self.exclude_purposes = exclude_purposes
+
+    def spent_today(self) -> float:
+        return spent_today(self.conn, purposes=self.purposes,
+                           exclude_purposes=self.exclude_purposes)
 
     def check(self, projected_usd: float = 0.0) -> None:
-        spent = spent_today(self.conn)
+        spent = self.spent_today()
         if spent + projected_usd > self.daily_budget_usd:
             raise BudgetExceeded(
                 f"daily LLM budget exceeded: spent ${spent:.4f} + projected "

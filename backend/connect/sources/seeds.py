@@ -146,7 +146,20 @@ SEED_SOURCES: tuple[dict, ...] = (
         "notes": "Ministry of Information & Broadcasting channel via the "
                  "free t.me/s public preview.",
     },
+    {
+        # v8 (investigation mode): every web doc an investigation fetches
+        # attaches here at tier 4 (unverified) until manually promoted.
+        # type='search' is not pollable — the row only provides provenance.
+        "name": "Web (investigation)",
+        "type": "search",
+        "config": {},
+        "credibility_tier": 4,
+        "notes": "Investigation-fetched web documents (tier 4 until a "
+                 "domain is promoted into the source registry).",
+    },
 )
+
+WEB_INVESTIGATION_SOURCE = "Web (investigation)"
 
 
 def seed_sources(conn: sqlite3.Connection) -> int:

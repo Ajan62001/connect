@@ -10,17 +10,37 @@ from __future__ import annotations
 
 from typing import Any, Callable, Sequence
 
+from itertools import count
+
 from connect.llm.batch_runner import BatchItem, BatchResult, BatchRunner
 from connect.llm.provider import (
     Completion,
     LLMProvider,
     StructuredCompletion,
     TModel,
+    ToolCall,
+    ToolDef,
+    ToolTurn,
     Usage,
 )
 from connect.llm.tiers import DEFAULT_TIER_MODELS, ModelTier
 
 DEFAULT_USAGE = Usage(input_tokens=2200, output_tokens=300)
+
+_tool_ids = count(1)
+
+
+def tool_turn(*calls: tuple[str, dict], text: str = "",
+              usage: Usage = DEFAULT_USAGE,
+              model: str = "claude-sonnet-4-6") -> ToolTurn:
+    """Scripted tool turn: ``tool_turn(("search_corpus", {"query": "x"}))``.
+    No calls = an end_turn text reply."""
+    tool_calls = [ToolCall(id=f"toolu_{next(_tool_ids)}", name=name,
+                           input=dict(args)) for name, args in calls]
+    return ToolTurn(
+        text=text, tool_calls=tool_calls,
+        stop_reason="tool_use" if tool_calls else "end_turn",
+        raw_content=[], model=model, usage=usage)
 
 
 class MockProvider(LLMProvider):
@@ -33,12 +53,17 @@ class MockProvider(LLMProvider):
 
     def __init__(self, respond: Any = None, *, usage: Usage = DEFAULT_USAGE,
                  text: str = "ok",
-                 respond_by_schema: dict[type, Any] | None = None):
+                 respond_by_schema: dict[type, Any] | None = None,
+                 tool_turns: Any = None):
         self.respond = respond
         self.respond_by_schema = respond_by_schema or {}
         self.usage = usage
         self.text = text
         self.calls: list[dict[str, Any]] = []
+        # scripted tool turns: a list (played in order; exhausted -> plain
+        # end_turn) or a callable (call_record) -> ToolTurn for turns that
+        # must react to tool_choice / prior tool_results.
+        self.tool_turns = tool_turns
 
     def model_for(self, tier: ModelTier) -> str:
         return DEFAULT_TIER_MODELS[tier]
@@ -67,6 +92,31 @@ class MockProvider(LLMProvider):
             f"MockProvider.respond not configured for {schema.__name__}"
         return StructuredCompletion[schema](  # type: ignore[valid-type]
             output=out, model=self.model_for(tier), usage=self.usage)
+
+    async def complete_with_tools(self, *, system: str | None,
+                                  messages: Sequence[dict[str, Any]],
+                                  tools: Sequence[ToolDef],
+                                  tier: ModelTier, max_tokens: int,
+                                  cache: bool = True,
+                                  tool_choice: str | None = None,
+                                  ) -> ToolTurn:
+        record = {"kind": "tools", "system": system,
+                  "messages": [dict(m) for m in messages],
+                  "tools": list(tools), "tier": tier,
+                  "max_tokens": max_tokens, "cache": cache,
+                  "tool_choice": tool_choice}
+        self.calls.append(record)
+        src = self.tool_turns
+        if callable(src):
+            turn = src(record)
+        elif isinstance(src, list):
+            turn = src.pop(0) if src else None
+        else:
+            turn = src
+        if turn is None:  # script exhausted -> plain end_turn reply
+            turn = tool_turn(text=self.text, usage=self.usage,
+                             model=self.model_for(tier))
+        return turn
 
 
 class MockBatchRunner(BatchRunner):

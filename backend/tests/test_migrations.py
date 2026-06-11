@@ -88,8 +88,8 @@ def test_migrate_v1_to_v3(tmp_path):
     conn = db_mod.connect(db_path)
     assert migrations.read_version(conn) == 1
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 7
-    assert migrations.read_version(conn) == 7
+    assert version == SCHEMA_VERSION == 8
+    assert migrations.read_version(conn) == 8
 
     # document_link exists, matching the fresh-create schema (same DDL)
     tables = {r[0] for r in conn.execute(
@@ -141,8 +141,8 @@ def test_migrate_v2_to_v3(tmp_path):
     conn.rollback()  # the failed INSERT left an implicit transaction open
 
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 7
-    assert migrations.read_version(conn) == 7
+    assert version == SCHEMA_VERSION == 8
+    assert migrations.read_version(conn) == 8
 
     # old data intact across the rebuild (rowids preserved)
     row = conn.execute(
@@ -243,7 +243,7 @@ def test_migrate_copy_of_live_db(tmp_path):
                         " name='document_link'").fetchone() else None
 
     version = db_mod.init_db(conn)  # migrates if the copy is still v1/v2
-    assert version == SCHEMA_VERSION == 7
+    assert version == SCHEMA_VERSION == 8
 
     assert conn.execute("SELECT COUNT(*) FROM document").fetchone()[0] \
         == docs_before
@@ -318,8 +318,8 @@ def test_migrate_v3_to_v4(tmp_path):
     conn.rollback()
 
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 7
-    assert migrations.read_version(conn) == 7
+    assert version == SCHEMA_VERSION == 8
+    assert migrations.read_version(conn) == 8
 
     # the new table exists, byte-identical to fresh-create
     fresh = db_mod.connect(tmp_path / "fresh.db")
@@ -424,8 +424,8 @@ def test_migrate_v4_to_v5(tmp_path):
     conn.rollback()  # the failed INSERT left an implicit transaction open
 
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 7
-    assert migrations.read_version(conn) == 7
+    assert version == SCHEMA_VERSION == 8
+    assert migrations.read_version(conn) == 8
 
     # old data intact across the rebuild (rowids preserved, FK child intact)
     row = conn.execute(
@@ -533,8 +533,8 @@ def test_migrate_v5_to_v6(tmp_path):
     conn = db_mod.connect(db_path)
     assert migrations.read_version(conn) == 5
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 7
-    assert migrations.read_version(conn) == 7
+    assert version == SCHEMA_VERSION == 8
+    assert migrations.read_version(conn) == 8
 
     # new table + rebuilt table are byte-identical to fresh-create
     fresh = db_mod.connect(tmp_path / "fresh6.db")
@@ -577,4 +577,173 @@ def test_migrate_v5_to_v6(tmp_path):
         conn.execute(
             "INSERT INTO event_embedding (event_id, model, dim, vector)"
             " VALUES (?, 'centroid', 2, x'0000803f00000040')", (event_id,))
+    conn.close()
+
+
+# --- v7 -> v8 (investigation mode) ---------------------------------------------
+
+# The v7 DDL strings, derived from the current ones by removing the v8
+# deltas — each replace is guarded so a future change can't silently no-op.
+_INVESTIGATION_STAGES_SQL = (
+    ", 'scope', 'investigate', 'synthesize', 'timeline',"
+    " 'causal_narrative', 'actors', 'alternatives', 'open_questions',"
+    " 'watch_next')")
+_V7_DOSSIER_DDL = (
+    schema.DOSSIER_TABLE_DDL
+    .replace("    kind               TEXT NOT NULL DEFAULT 'analysis'\n"
+             "                       CHECK (kind IN ('analysis',"
+             " 'investigation')),\n", "")
+    .replace("    parent_question_id INTEGER REFERENCES question(id),\n",
+             "")
+    .replace("    budget_usd         REAL,\n", "")
+    .replace(", 'topic', 'entity', 'story')", ")")
+    .replace(_INVESTIGATION_STAGES_SQL, ")"))
+assert _V7_DOSSIER_DDL != schema.DOSSIER_TABLE_DDL
+assert "kind" not in _V7_DOSSIER_DDL and "scope" not in _V7_DOSSIER_DDL
+
+_V7_SECTION_DDL = schema.DOSSIER_SECTION_TABLE_DDL.replace(
+    _INVESTIGATION_STAGES_SQL, ")")
+assert _V7_SECTION_DDL != schema.DOSSIER_SECTION_TABLE_DDL
+
+_V7_JOB_DDL = schema.JOB_TABLE_DDL.replace(", 'investigation')", ")")
+assert _V7_JOB_DDL != schema.JOB_TABLE_DDL
+
+
+def _make_v7_db(path) -> None:
+    """Recreate a v7 database: current schema minus question/finding/
+    finding_evidence, with the v7 dossier/dossier_section/job shapes."""
+    conn = db_mod.connect(path)
+    db_mod.init_db(conn)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    with conn:
+        conn.execute("BEGIN")
+        conn.execute("DROP TABLE finding_evidence")
+        conn.execute("DROP TABLE finding")
+        conn.execute("DROP TABLE question")
+        conn.execute("DROP TABLE dossier")
+        conn.execute(_V7_DOSSIER_DDL)
+        conn.execute("DROP TABLE dossier_section")
+        conn.execute(_V7_SECTION_DDL)
+        conn.execute("DROP TABLE job")
+        conn.execute(_V7_JOB_DDL)
+        conn.execute("UPDATE meta SET value='7' WHERE key='schema_version'")
+        # v7-era data that must survive: an analysis dossier with a
+        # section, plus a job with a job_event child
+        conn.execute(
+            "INSERT INTO dossier (input_text, input_type, status,"
+            " current_stage, created_at) VALUES ('old claim', 'claim',"
+            " 'completed', 'assemble', '2026-06-01T00:00:00Z')")
+        conn.execute(
+            "INSERT INTO dossier_section (dossier_id, stage, status,"
+            " content, created_at) VALUES (1, 'verify', 'completed',"
+            " '{\"summary\":\"s\"}', '2026-06-01T00:00:00Z')")
+        conn.execute(
+            "INSERT INTO job (kind, payload, dossier_id, status,"
+            " created_at) VALUES ('analysis', '{}', 1, 'done',"
+            " '2026-06-01T00:00:00Z')")
+        conn.execute(
+            "INSERT INTO job_event (job_id, ts, type) VALUES"
+            " (1, '2026-06-01T00:00:01Z', 'done')")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.close()
+
+
+def test_migrate_v7_to_v8(tmp_path):
+    db_path = tmp_path / "v7.db"
+    _make_v7_db(db_path)
+
+    conn = db_mod.connect(db_path)
+    assert migrations.read_version(conn) == 7
+    # the v7 vocab really was in force before migrating
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO job (kind, status, created_at) VALUES"
+            " ('investigation', 'queued', '2026-06-11T00:00:00Z')")
+    conn.rollback()
+    with pytest.raises(sqlite3.OperationalError):  # no kind column yet
+        conn.execute("SELECT kind FROM dossier")
+
+    version = db_mod.init_db(conn)
+    assert version == SCHEMA_VERSION == 8
+    assert migrations.read_version(conn) == 8
+
+    # rebuilt + new tables byte-identical to fresh-create
+    fresh = db_mod.connect(tmp_path / "fresh8.db")
+    db_mod.init_db(fresh)
+
+    def ddl(c, name):
+        return c.execute("SELECT sql FROM sqlite_master WHERE name=?",
+                         (name,)).fetchone()[0]
+
+    for table in ("dossier", "dossier_section", "job", "question",
+                  "finding", "finding_evidence"):
+        assert ddl(conn, table) == ddl(fresh, table), table
+    indexes = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index'")}
+    for index in ("idx_question_dossier", "idx_question_about",
+                  "idx_finding_dossier", "idx_finding_evidence_finding"):
+        assert index in indexes
+    fresh.close()
+
+    # old rows intact (rowids preserved); new columns took their defaults
+    row = conn.execute("SELECT * FROM dossier WHERE id=1").fetchone()
+    assert (row["input_text"], row["status"], row["current_stage"]) == (
+        "old claim", "completed", "assemble")
+    assert row["kind"] == "analysis"
+    assert row["parent_question_id"] is None
+    assert row["budget_usd"] is None
+    section = conn.execute(
+        "SELECT stage, status, content FROM dossier_section"
+        " WHERE dossier_id=1").fetchone()
+    assert (section["stage"], section["status"]) == ("verify", "completed")
+    job = conn.execute("SELECT id, kind, dossier_id FROM job").fetchone()
+    assert (job["id"], job["kind"], job["dossier_id"]) == (1, "analysis", 1)
+    assert conn.execute("SELECT job_id FROM job_event").fetchone()[0] == 1
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert not {t for t in tables if t.startswith("_mig_")}
+
+    # the new vocabularies + tables are live...
+    with conn:
+        conn.execute(
+            "INSERT INTO dossier (kind, input_text, input_type,"
+            " budget_usd, status, current_stage, created_at) VALUES"
+            " ('investigation', 'digital rupee', 'topic', 1.0, 'running',"
+            " 'scope', '2026-06-11T00:00:00Z')")
+        conn.execute(
+            "INSERT INTO dossier_section (dossier_id, stage, status,"
+            " created_at) VALUES (2, 'causal_narrative', 'completed',"
+            " '2026-06-11T00:00:00Z')")
+        conn.execute(
+            "INSERT INTO job (kind, status, created_at) VALUES"
+            " ('investigation', 'queued', '2026-06-11T00:00:00Z')")
+        conn.execute(
+            "INSERT INTO question (dossier_id, qtype, text, created_at)"
+            " VALUES (2, 'why_now', 'Why now?', '2026-06-11T00:00:00Z')")
+        conn.execute(
+            "INSERT INTO finding (dossier_id, kind, text, question_id,"
+            " created_at) VALUES (2, 'timing', 'f', 1,"
+            " '2026-06-11T00:00:00Z')")
+        conn.execute(
+            "INSERT INTO document (fetched_at, media_type, content_text,"
+            " content_hash) VALUES ('2026-06-11T00:00:00Z', 'text',"
+            " 'body', 'h-v8')")
+        doc_id = conn.execute("SELECT id FROM document WHERE"
+                              " content_hash='h-v8'").fetchone()[0]
+        conn.execute(
+            "INSERT INTO finding_evidence (finding_id, document_id, quote)"
+            " VALUES (1, ?, 'body')", (doc_id,))
+    # ...and the CHECKs still reject garbage
+    for bad in (
+            "INSERT INTO dossier (kind, input_text, status, created_at)"
+            " VALUES ('hunch', 'x', 'pending', '2026-06-11T00:00:00Z')",
+            "INSERT INTO question (dossier_id, qtype, text, created_at)"
+            " VALUES (2, 'why_bogus', 'x', '2026-06-11T00:00:00Z')",
+            "INSERT INTO finding (dossier_id, kind, text, created_at)"
+            " VALUES (2, 'bogus', 'x', '2026-06-11T00:00:00Z')",
+            "INSERT INTO job (kind, status, created_at) VALUES"
+            " ('bogus_kind', 'queued', '2026-06-11T00:00:00Z')"):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(bad)
+        conn.rollback()
     conn.close()

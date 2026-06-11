@@ -3,18 +3,27 @@
 import { useEffect, useRef } from "react";
 
 import { Skeleton } from "@/components/ui/skeleton";
-import type { AnalysisActivityLine } from "@/lib/queries";
 
 /**
- * The stage_progress tail rendered inside the currently running stage of the
- * StageTimeline. Lines come from useAnalysis's in-hook ring buffer (last 200,
+ * Minimum a log line needs. Both AnalysisActivityLine and
+ * InvestigationActivityLine satisfy this structurally.
+ */
+export interface ActivityLogLine {
+  seq: number;
+  message: string;
+}
+
+/**
+ * The progress tail rendered inside the currently running stage of a
+ * StageTimeline (analysis stage_progress lines, investigation iteration
+ * briefs). Lines come from the live hook's in-hook ring buffer (last 200,
  * never the query cache); shows a skeleton shimmer until the first line lands.
  */
 export function ActivityLog({
   lines,
   maxLines = 8,
 }: {
-  lines: AnalysisActivityLine[];
+  lines: ActivityLogLine[];
   maxLines?: number;
 }) {
   const endRef = useRef<HTMLDivElement>(null);

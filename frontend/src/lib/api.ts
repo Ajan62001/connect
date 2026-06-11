@@ -559,6 +559,326 @@ export interface Page<T> {
   page_size: number;
 }
 
+// --- Phase 4: investigations (Investigation Mode, schema v8) -----------------
+
+/** Investigations ride the same dossier/job lifecycle as analyses. */
+export type InvestigationStatus = AnalysisStatus;
+
+/** The three investigation stages, in execution order. */
+export type InvestigationStageName = "scope" | "investigate" | "synthesize";
+
+export const INVESTIGATION_STAGES: InvestigationStageName[] = [
+  "scope",
+  "investigate",
+  "synthesize",
+];
+
+export type InvestigationInputType = "topic" | "entity" | "event" | "story";
+
+/** Mirrors QUESTION_TYPES in the backend (design doc §3.1). */
+export type QuestionType =
+  | "why_now"
+  | "why_this_design"
+  | "why_not_alternative"
+  | "who_pushed"
+  | "what_triggered"
+  | "why_silent"
+  | "who_benefits"
+  | "what_next";
+
+export type QuestionStatus = "open" | "partial" | "answered" | "dropped";
+
+/** Mirrors FINDING_KINDS in the backend (design doc §2.2 record_finding). */
+export type FindingKind =
+  | "reaction"
+  | "trigger"
+  | "alternative"
+  | "actor_motive"
+  | "timing"
+  | "context"
+  | "consequence";
+
+export interface InvestigationCounts {
+  findings: number;
+  questions_open: number;
+  questions_answered: number;
+  docs_added: number;
+}
+
+export interface InvestigationListItem {
+  id: number;
+  status: InvestigationStatus;
+  input_type: InvestigationInputType;
+  /** Display title — the topic text or the resolved seed object's name. */
+  title: string | null;
+  created_at: string;
+  finished_at: string | null;
+  cost_usd: number | null;
+  /** Null-tolerant: rows render without chips when the backend omits counts. */
+  counts: InvestigationCounts | null;
+}
+
+export interface InvestigationStageRun {
+  stage: InvestigationStageName;
+  status: InvestigationStatus;
+  summary: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+/** One verbatim quote backing a finding (finding_evidence row). */
+export interface FindingEvidence {
+  id: number;
+  document_id: number;
+  quote: string;
+  title?: string | null;
+  source_name?: string | null;
+  url?: string | null;
+}
+
+export interface InvestigationFinding {
+  id: number;
+  kind: FindingKind;
+  text: string;
+  /** True = hypothesis (dashed styling everywhere it surfaces). */
+  speculation: boolean;
+  confidence: number | null;
+  question_id: number | null;
+  /** Causal edge written by the grounding gate; joins timeline causal chips. */
+  edge_id: number | null;
+  evidence: FindingEvidence[];
+  created_at?: string;
+}
+
+export interface InvestigationQuestion {
+  id: number;
+  qtype: QuestionType;
+  text: string;
+  status: QuestionStatus;
+  priority: number;
+  about_type?: "entity" | "event" | "claim" | "document" | "dossier" | null;
+  about_id?: number | null;
+  answer_summary: string | null;
+  answer_finding_ids: number[];
+  /** Set by manual recursion (POST /api/questions/{id}/investigate). */
+  spawned_dossier_id: number | null;
+}
+
+// Section payloads (design doc §5) — all code/DEEP-produced JSON.
+
+export interface TimelineCausalChip {
+  edge_id: number;
+  relation: string;
+  other_id: number;
+  other_title: string | null;
+  speculation: boolean;
+}
+
+export interface TimelineSectionItem {
+  event_id?: number | null;
+  document_id?: number | null;
+  date: string | null;
+  title: string;
+  event_type?: string | null;
+  doc_count?: number | null;
+  causal: TimelineCausalChip[];
+}
+
+export interface TimelineSection {
+  items: TimelineSectionItem[];
+}
+
+export interface ChainStep {
+  node_type: string; // 'event' | 'entity' | 'document'
+  node_id: number;
+  title: string;
+  relation_to_next?: string | null;
+  speculation: boolean;
+  finding_id?: number | null;
+}
+
+export interface CausalChain {
+  steps: ChainStep[];
+}
+
+export interface CausalNarrativeSection {
+  /** Markdown with [[f#]] citation markers into the findings table. */
+  narrative_md: string;
+  chains: CausalChain[];
+}
+
+export interface ActorsSectionActor {
+  entity_id: number | null;
+  name: string;
+  role: string | null;
+  motive_md: string | null;
+  finding_ids: number[];
+  speculation: boolean;
+}
+
+export interface ActorsSection {
+  actors: ActorsSectionActor[];
+}
+
+export interface AlternativeItem {
+  title: string;
+  description: string | null;
+  finding_ids: number[];
+  by_whom_entity_id?: number | null;
+}
+
+export interface AlternativesSection {
+  items: AlternativeItem[];
+  /** Alternatives nobody documented — the open-question surface. */
+  unanswered_question_ids: number[];
+}
+
+export interface OpenQuestionsSectionItem {
+  question_id: number;
+  qtype: QuestionType;
+  text: string;
+  status: QuestionStatus;
+  priority: number;
+  spawned_dossier_id?: number | null;
+}
+
+export interface OpenQuestionsSection {
+  items: OpenQuestionsSectionItem[];
+}
+
+export interface WatchNextItem {
+  text: string;
+  question_id?: number | null;
+  calendar_event_id?: number | null;
+  /** Pre-filled watch payload; +Watch posts it to the existing watch CRUD. */
+  watch_suggestion?: Partial<WatchCreate> | null;
+}
+
+export interface WatchNextSection {
+  items: WatchNextItem[];
+}
+
+export type InvestigationSectionKey =
+  | "timeline"
+  | "causal_narrative"
+  | "actors"
+  | "alternatives"
+  | "open_questions"
+  | "watch_next";
+
+export const INVESTIGATION_SECTION_KEYS: InvestigationSectionKey[] = [
+  "timeline",
+  "causal_narrative",
+  "actors",
+  "alternatives",
+  "open_questions",
+  "watch_next",
+];
+
+/** Sections appear as their stages complete; absent = not produced yet. */
+export interface InvestigationSections {
+  timeline?: TimelineSection | null;
+  causal_narrative?: CausalNarrativeSection | null;
+  actors?: ActorsSection | null;
+  alternatives?: AlternativesSection | null;
+  open_questions?: OpenQuestionsSection | null;
+  watch_next?: WatchNextSection | null;
+}
+
+export interface InvestigationDetail {
+  id: number;
+  status: InvestigationStatus;
+  input_type: InvestigationInputType;
+  title: string | null;
+  created_at: string;
+  started_at?: string | null;
+  finished_at: string | null;
+  error: string | null;
+  budget_usd: number | null;
+  cost_usd: number | null;
+  /** Set when this investigation was spawned from an open question. */
+  parent_question_id?: number | null;
+  stages: InvestigationStageRun[];
+  sections: InvestigationSections;
+  questions: InvestigationQuestion[];
+  findings: InvestigationFinding[];
+  /** Highest job_event.seq included in this snapshot; SSE resumes after it. */
+  last_seq: number;
+}
+
+/**
+ * Exactly one of topic/entity_id/event_id/story_id/question_id must be set
+ * (mirrors InvestigationSeed's validator).
+ */
+export interface InvestigationCreate {
+  topic?: string;
+  entity_id?: number;
+  event_id?: number;
+  story_id?: number;
+  question_id?: number;
+  options?: {
+    budget_usd?: number;
+    max_iterations?: number;
+    max_web_fetches?: number;
+  };
+}
+
+/** 202 from POST /api/investigations and POST /api/questions/{id}/investigate. */
+export interface InvestigationAccepted {
+  investigation_id: number;
+  job_id: number;
+}
+
+export interface InvestigationListParams {
+  page?: number;
+  page_size?: number;
+}
+
+/**
+ * SSE payloads on GET /api/investigations/{id}/events — same wire contract as
+ * analyses (`id:` = job_event.seq, `?after=` resume). Thin payloads: events
+ * that carry persisted data (findings, questions, sections) trigger a
+ * coalesced snapshot refetch instead of patching the cache.
+ */
+export type InvestigationEvent =
+  | { type: "stage_started"; stage: InvestigationStageName }
+  | { type: "stage_progress"; stage: InvestigationStageName; message: string }
+  | { type: "stage_completed"; stage: InvestigationStageName; summary?: string | null }
+  | { type: "iteration"; n: number; tools?: string[]; cost_so_far?: number }
+  | {
+      type: "finding_recorded";
+      finding_id: number;
+      kind?: FindingKind;
+      speculation?: boolean;
+      text?: string;
+    }
+  | { type: "question_raised"; question_id: number; qtype?: QuestionType; text?: string }
+  | { type: "question_resolved"; question_id: number; status?: QuestionStatus }
+  | { type: "doc_ingested"; document_id: number; title?: string | null }
+  | { type: "section_completed"; section: InvestigationSectionKey }
+  | { type: "done" }
+  | { type: "error"; message: string };
+
+/** Wire-format event names (the SSE `event:` field), minus `type`. */
+export const INVESTIGATION_EVENT_NAMES = [
+  "stage_started",
+  "stage_progress",
+  "stage_completed",
+  "iteration",
+  "finding_recorded",
+  "question_raised",
+  "question_resolved",
+  "doc_ingested",
+  "section_completed",
+  "done",
+  "error",
+] as const;
+
+/** EventSource URL for an investigation, resuming after `afterSeq`. */
+export function investigationEventsUrl(id: number, afterSeq: number): string {
+  return `${ANALYSIS_EVENTS_BASE}/api/investigations/${id}/events${qs({ after: afterSeq })}`;
+}
+
 export type SearchKind = "all" | "documents" | "entities";
 
 export interface SearchResult {
@@ -970,4 +1290,89 @@ export function dismissContradiction(id: number): Promise<ContradictionListItem>
   return request<ContradictionListItem>(`/api/contradictions/${id}/dismiss`, {
     method: "POST",
   });
+}
+
+// ---------------------------------------------------------------------------
+// Investigations (Phase 4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Defensive section normalizer: the canonical contract is a keyed object, but
+ * a dossier_section-row backend may ship `[{section, content}]` instead. Both
+ * shapes (and anything else) normalize to InvestigationSections; unknown keys
+ * are dropped.
+ */
+function normalizeInvestigationSections(raw: unknown): InvestigationSections {
+  const sections: Record<string, unknown> = {};
+  if (Array.isArray(raw)) {
+    for (const row of raw) {
+      if (typeof row !== "object" || row === null) continue;
+      const record = row as Record<string, unknown>;
+      const key = record.section ?? record.stage ?? record.key;
+      const content = record.content ?? record.payload;
+      if (typeof key === "string") sections[key] = content;
+    }
+  } else if (typeof raw === "object" && raw !== null) {
+    Object.assign(sections, raw as Record<string, unknown>);
+  }
+  const out: InvestigationSections = {};
+  for (const key of INVESTIGATION_SECTION_KEYS) {
+    const value = sections[key];
+    if (value !== undefined && value !== null && typeof value === "object") {
+      out[key] = value as never;
+    }
+  }
+  return out;
+}
+
+/** 202 — the investigation runs as a background job; follow it via SSE. */
+export function createInvestigation(
+  payload: InvestigationCreate,
+): Promise<InvestigationAccepted> {
+  return request<InvestigationAccepted>(
+    "/api/investigations",
+    jsonInit("POST", payload),
+  );
+}
+
+export function listInvestigations(
+  params: InvestigationListParams = {},
+): Promise<Page<InvestigationListItem>> {
+  return request<Page<InvestigationListItem>>(
+    `/api/investigations${qs({ ...params })}`,
+  );
+}
+
+/** Snapshot, normalized so consumers always see canonical arrays/sections. */
+export async function getInvestigation(id: number): Promise<InvestigationDetail> {
+  const raw = await request<InvestigationDetail>(`/api/investigations/${id}`);
+  return {
+    ...raw,
+    stages: raw.stages ?? [],
+    sections: normalizeInvestigationSections(raw.sections),
+    questions: raw.questions ?? [],
+    findings: (raw.findings ?? []).map((finding) => ({
+      ...finding,
+      evidence: finding.evidence ?? [],
+    })),
+    last_seq: raw.last_seq ?? 0,
+  };
+}
+
+/** 202 — cancellation is asynchronous; the snapshot flips when it lands. */
+export function cancelInvestigation(id: number): Promise<void> {
+  return request<void>(`/api/investigations/${id}/cancel`, { method: "POST" });
+}
+
+/**
+ * 202 — manual recursion: spawns a child investigation seeded from an open
+ * question (sets question.spawned_dossier_id + child.parent_question_id).
+ */
+export function investigateQuestion(
+  questionId: number,
+): Promise<InvestigationAccepted> {
+  return request<InvestigationAccepted>(
+    `/api/questions/${questionId}/investigate`,
+    { method: "POST" },
+  );
 }

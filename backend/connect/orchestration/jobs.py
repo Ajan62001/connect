@@ -37,6 +37,18 @@ class JobRunner:
         task.add_done_callback(self._tasks.discard)
         return job_id
 
+    def cancel_job(self, job_id: int) -> bool:
+        """Cancel one job's in-flight task (Phase 3 analysis cancel).
+        Returns False when no live task carries the id (already finished
+        or never scheduled in this process)."""
+        prefix = f"job-{job_id}-"
+        found = False
+        for task in list(self._tasks):
+            if task.get_name().startswith(prefix) and not task.done():
+                task.cancel()
+                found = True
+        return found
+
     async def _run(self, job_id: int,
                    runner: Callable[[], Awaitable[Any]]) -> None:
         async with self._semaphore:

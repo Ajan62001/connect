@@ -14,19 +14,27 @@ polls, and results are ingested through the SAME persist path as sync.
 The fast path (watch-hit / fact-checker docs straight after ingest) is
 ``enrich_document`` — a single-doc sync enrichment submitted as an
 'enrich_t1_sync' job by the composition root.
+
+Phase 2: T2 (event clustering + story threading) is appended to BOTH
+delivery paths — after a successful T1 persist the promotion triggers are
+evaluated and, when any fires, t2.process_document runs (its LLM calls are
+governor-checked individually; its deterministic paths are free). A T2
+failure never fails the T1 result.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sqlite3
 from typing import Any
 
 import pydantic
 
-from connect.knowledge.enrichment import persist, t1
+from connect.knowledge.enrichment import persist, promotion, t1, t2
+from connect.knowledge.enrichment.promotion import (  # noqa: F401 — re-export
+    is_fact_checker_source,
+)
 from connect.knowledge.enrichment.prompts import T1_PROMPT_VERSION
 from connect.llm import spend
 from connect.llm.batch_runner import BatchItem, BatchRunner, BatchResult
@@ -49,27 +57,6 @@ WHERE d.enrichment_status = 'pending'
 ORDER BY d.id
 LIMIT ?
 """
-
-
-def is_fact_checker_source(conn: sqlite3.Connection,
-                           source_id: int | None) -> bool:
-    """Fact-checker sources fast-path to T1 (their items carry verdicts).
-    Marked by config {"fact_checker": true} or a 'fact-check' note (the
-    seeded Alt News / BOOM / PIB Fact Check rows match the latter)."""
-    if source_id is None:
-        return False
-    row = conn.execute(
-        "SELECT config, notes FROM source WHERE id = ?", (source_id,)
-    ).fetchone()
-    if row is None:
-        return False
-    try:
-        if json.loads(row["config"] or "{}").get("fact_checker"):
-            return True
-    except (ValueError, TypeError):
-        pass
-    notes = (row["notes"] or "").lower()
-    return "fact-check" in notes or "fact check" in notes
 
 
 class EnrichmentService:
@@ -111,6 +98,26 @@ class EnrichmentService:
         stats = await self._enrich_one(provider, row)
         return f"done: {stats}" if stats is not None else "failed"
 
+    async def promote_document(self, document_id: int) -> str:
+        """Manual T2 promotion (POST /api/documents/{id}/promote, run as an
+        'enrich_t2' job). Ensures T1 first (governor-checked), then runs T2
+        with the 'manual' trigger. Returns a short status string."""
+        row = self.conn.execute(
+            "SELECT id FROM document WHERE id = ?", (document_id,)).fetchone()
+        if row is None:
+            return f"document {document_id} not found"
+        has_t1 = self.conn.execute(
+            "SELECT 1 FROM document_enrichment WHERE document_id = ?",
+            (document_id,)).fetchone() is not None
+        if not has_t1:
+            if self.provider is None:
+                return "skipped: ANTHROPIC_API_KEY not set (T1 required)"
+            t1_status = await self.enrich_document(document_id)
+            if not t1_status.startswith("done"):
+                return f"t1 {t1_status}"
+        stats = await self._maybe_t2(document_id, manual=True)
+        return f"promoted: {stats}"
+
     async def run_sync(self, limit: int | None = None) -> dict[str, Any]:
         """Inline sweep: one FAST call per eligible doc, stopping cleanly on
         BudgetExceeded (remainder stays 'pending')."""
@@ -139,7 +146,8 @@ class EnrichmentService:
 
     async def _enrich_one(self, provider: LLMProvider,
                           row: sqlite3.Row) -> dict[str, Any] | None:
-        """Extract + ledger + persist one document; None on failure."""
+        """Extract + ledger + persist one document; None on failure.
+        Promoted docs get T2 appended (never fatal to the T1 result)."""
         try:
             completion = await t1.extract(
                 provider, title=row["title"], content_text=row["content_text"])
@@ -151,13 +159,34 @@ class EnrichmentService:
         spend.record_call(self.conn, purpose=PURPOSE_T1,
                           model=completion.model, usage=completion.usage)
         try:
-            return persist.persist_t1(
+            stats = persist.persist_t1(
                 self.conn, document_id=row["id"], result=completion.output,
                 model=completion.model)
         except sqlite3.Error:
             log.exception("T1 persistence failed for document %s", row["id"])
             persist.mark_failed(self.conn, row["id"])
             return None
+        t2_stats = await self._maybe_t2(row["id"])
+        if t2_stats is not None:
+            stats["t2"] = t2_stats
+        return stats
+
+    async def _maybe_t2(self, document_id: int, *,
+                        manual: bool = False) -> dict[str, Any] | None:
+        """Evaluate promotion triggers; run T2 when any fires. Never raises
+        — a T2 failure is logged and the T1 result stands."""
+        try:
+            triggers = promotion.evaluate(self.conn, document_id,
+                                          manual=manual)
+            if not triggers:
+                return None
+            return await t2.process_document(
+                self.conn, self.provider, self.governor, document_id,
+                triggers=triggers)
+        except Exception:  # noqa: BLE001 — T2 must never fail T1
+            log.exception("T2 processing failed for document %s",
+                          document_id)
+            return {"document_id": document_id, "error": "t2_failed"}
 
     # -- batch ----------------------------------------------------------------------
 
@@ -202,8 +231,8 @@ class EnrichmentService:
             await asyncio.sleep(self.batch_poll_seconds)
 
         results = await runner.results(batch_id)
-        stats = self._ingest_batch_results(results, model=model,
-                                           batch_id=batch_id)
+        stats = await self._ingest_batch_results(results, model=model,
+                                                 batch_id=batch_id)
         # anything still 'queued' got no result row back — release it
         leftover = [
             r[0] for r in self.conn.execute(
@@ -215,9 +244,10 @@ class EnrichmentService:
                 "submitted": len(items), "batch_id": batch_id,
                 "released_pending": len(leftover), **stats}
 
-    def _ingest_batch_results(self, results: list[BatchResult], *,
-                              model: str, batch_id: str) -> dict[str, int]:
-        done = failed = 0
+    async def _ingest_batch_results(self, results: list[BatchResult], *,
+                                    model: str,
+                                    batch_id: str) -> dict[str, int]:
+        done = failed = promoted = 0
         for result in results:
             try:
                 document_id = int(result.custom_id.split("-", 1)[1])
@@ -246,7 +276,9 @@ class EnrichmentService:
                                result=parsed, model=model,
                                prompt_version=T1_PROMPT_VERSION)
             done += 1
-        return {"done": done, "failed": failed}
+            if await self._maybe_t2(document_id) is not None:
+                promoted += 1
+        return {"done": done, "failed": failed, "promoted_t2": promoted}
 
     # -- internals --------------------------------------------------------------------
 

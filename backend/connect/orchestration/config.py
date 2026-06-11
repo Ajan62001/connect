@@ -83,6 +83,12 @@ class Settings(BaseSettings):
     # how often an enrich_t1_batch job polls the Message Batch status
     batch_poll_seconds: float = 30.0
 
+    # analysis pipeline (Phase 3)
+    # per-analysis USD cap: degrade evidence K, then abort-with-partial
+    analysis_budget_usd: float = 0.75
+    # K — max NEW web documents fetched per claim (options can override)
+    analysis_max_evidence: int = 6
+
     # link extraction & selective follow (Phase 0.5)
     link_follow_enabled: bool = True
     link_follow_max_per_doc: int = 5

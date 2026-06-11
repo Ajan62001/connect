@@ -1,20 +1,13 @@
-import { SunriseIcon } from "lucide-react";
+"use client";
 
-import { EmptyState } from "@/components/shared/EmptyState";
-import { PageHeader } from "@/components/shared/PageHeader";
+import { BriefView } from "@/components/brief/BriefView";
+import { useBriefToday } from "@/lib/queries";
 
+/**
+ * The daily brief — five SQL-rendered sections, generated lazily on the
+ * first request of the day and stable until midnight.
+ */
 export default function TodayPage() {
-  return (
-    <>
-      <PageHeader
-        title="Today"
-        description="Your morning brief: watch developments, story threads that moved, new contradictions."
-      />
-      <EmptyState
-        icon={SunriseIcon}
-        title="The Today brief arrives in Phase 2"
-        description="Once events and story threads land, this page becomes a daily, SQL-rendered brief of what changed in your corpus — no LLM required to read it."
-      />
-    </>
-  );
+  const brief = useBriefToday();
+  return <BriefView query={brief} />;
 }

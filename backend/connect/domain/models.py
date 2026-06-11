@@ -13,6 +13,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from connect.domain.enums import (
+    BriefObjectType,
+    BriefSection,
     EnrichmentStatus,
     LinkStatus,
     MediaType,
@@ -171,6 +173,12 @@ class DocumentEnrichment(_Frozen):
     created_at: str
 
 
+class DocumentEventRef(_Frozen):
+    """The event a document is clustered into (Phase 2 T2)."""
+    id: int
+    title: str
+
+
 class Document(DocumentListItem):
     author: str | None = None
     language: str | None = None
@@ -179,6 +187,7 @@ class Document(DocumentListItem):
     links: list[DocumentLink] = Field(default_factory=list)
     linked_from: list[LinkedFrom] = Field(default_factory=list)
     enrichment: DocumentEnrichment | None = None
+    event: DocumentEventRef | None = None
 
 
 class LinkFetchResult(_Frozen):
@@ -233,6 +242,21 @@ class CoOccurringEntity(_Frozen):
     lift: float
 
 
+class EntityEventRef(_Frozen):
+    """One recent event involving the entity (Phase 2)."""
+    id: int
+    title: str
+    event_type: str
+    occurred_on: str | None = None
+
+
+class EntityDelta(_Frozen):
+    """New-since-cursor counts (view_cursor surface='entity')."""
+    events: int = 0
+    documents: int = 0
+    claims: int = 0
+
+
 class EntityDetail(_Frozen):
     entity: EntityInfo
     mention_count: int = 0
@@ -242,6 +266,8 @@ class EntityDetail(_Frozen):
     topics: list[TopicCount] = Field(default_factory=list)
     co_occurring: list[CoOccurringEntity] = Field(default_factory=list)
     documents: list[DocumentListItem] = Field(default_factory=list)
+    events: list[EntityEventRef] = Field(default_factory=list)
+    delta: EntityDelta | None = None
 
 
 # --- enrichment sweep ------------------------------------------------------------
@@ -341,3 +367,210 @@ class Job(_Frozen):
 
 class JobAccepted(_Frozen):
     job_id: int
+
+
+# --- events / story threads (Phase 2) -----------------------------------------
+
+class EventInfo(_Frozen):
+    id: int
+    title: str
+    summary: str | None = None
+    event_type: str
+    occurred_on: str | None = None
+    doc_count: int = 0
+    story_id: int | None = None
+    geo_scope: str | None = None
+
+
+class EventDetail(_Frozen):
+    event: EventInfo
+    documents: list[DocumentListItem] = Field(default_factory=list)
+    entities: list[EnrichmentEntityRef] = Field(default_factory=list)
+
+
+class ThreadEventRef(_Frozen):
+    id: int
+    title: str
+    event_type: str
+    occurred_on: str | None = None
+    doc_count: int = 0
+
+
+class StoryInfo(_Frozen):
+    id: int
+    title: str | None = None
+    status: str
+    doc_count: int = 0
+    updated_at: str | None = None
+
+
+class ThreadDetail(_Frozen):
+    story: StoryInfo
+    events: list[ThreadEventRef] = Field(default_factory=list)
+    entities: list[EnrichmentEntityRef] = Field(default_factory=list)
+    summary: str | None = None
+
+
+# --- Today brief (Phase 2) ------------------------------------------------------
+
+class BriefItem(_Frozen):
+    id: int
+    section: BriefSection
+    rank: int
+    object_type: BriefObjectType
+    object_id: int
+    # template-rendered from score components at generation time — NEVER LLM
+    reason: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    seen: bool = False
+
+
+class BriefSections(_Frozen):
+    """All five keys always present (empty until their phase fills them)."""
+    watch_dev: list[BriefItem] = Field(default_factory=list)
+    thread_move: list[BriefItem] = Field(default_factory=list)
+    contradiction: list[BriefItem] = Field(default_factory=list)
+    trending_claim: list[BriefItem] = Field(default_factory=list)
+    suggestion: list[BriefItem] = Field(default_factory=list)
+
+
+class BriefInfo(_Frozen):
+    id: int
+    brief_date: str
+    generated_at: str
+
+
+class BriefResponse(_Frozen):
+    brief: BriefInfo
+    sections: BriefSections
+
+
+# --- analyses (Phase 3 verification slice) ---------------------------------------
+
+AnalysisStatus = Literal["pending", "running", "completed", "failed",
+                         "cancelled"]
+
+
+class AnalysisOptions(_Frozen):
+    max_evidence_per_claim: int | None = Field(default=None, ge=1, le=20)
+
+
+class AnalysisCreate(_Frozen):
+    input_text: str
+    options: AnalysisOptions = Field(default_factory=AnalysisOptions)
+
+
+class AnalysisAccepted(_Frozen):
+    analysis_id: int
+    job_id: int
+
+
+class AnalysisVerdictSummary(_Frozen):
+    supported: int = 0
+    refuted: int = 0
+    mixed: int = 0
+    unverified: int = 0
+
+
+class AnalysisListItem(_Frozen):
+    id: int
+    status: AnalysisStatus
+    input_text: str
+    created_at: str
+    finished_at: str | None = None
+    verdict_summary: AnalysisVerdictSummary | None = None
+
+
+class AnalysisPage(_Frozen):
+    items: list[AnalysisListItem]
+    total: int
+    page: int
+    page_size: int
+
+
+class AnalysisStageInfo(_Frozen):
+    stage: Literal["normalize", "verify", "assemble"]
+    status: str
+    summary: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
+class AnalysisEvidenceItem(_Frozen):
+    id: int                       # evidence table row id
+    document_id: int
+    source_name: str | None = None
+    credibility_tier: int | None = None
+    stance: str
+    confidence: float | None = None
+    quote: str | None = None
+    url: str | None = None
+    title: str | None = None
+
+
+class AnalysisClaimItem(_Frozen):
+    id: int                       # canonical claim row id (reconciled)
+    text: str
+    kind: str
+    checkable: bool
+    verdict: Literal["supported", "refuted", "mixed", "unverified"] | None \
+        = None
+    confidence: float | None = None
+    reasoning: str | None = None
+    evidence: list[AnalysisEvidenceItem] = Field(default_factory=list)
+
+
+class AnalysisDetail(_Frozen):
+    id: int
+    status: AnalysisStatus
+    input_text: str
+    created_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    error: str | None = None
+    stages: list[AnalysisStageInfo] = Field(default_factory=list)
+    claims: list[AnalysisClaimItem] = Field(default_factory=list)
+    last_seq: int = 0
+
+
+# --- contradictions (Phase 3) ------------------------------------------------------
+
+
+class ContradictionClaimRef(_Frozen):
+    id: int
+    text: str
+    verdict: str
+
+
+class ContradictionItem(_Frozen):
+    id: int
+    claim: ContradictionClaimRef
+    n_support: int
+    n_refute: int
+    best_tier_support: int | None = None
+    best_tier_refute: int | None = None
+    status: Literal["open", "dismissed", "resolved"]
+    detected_at: str
+
+
+class ContradictionPage(_Frozen):
+    items: list[ContradictionItem]
+    total: int
+    page: int
+    page_size: int
+
+
+# --- view cursors / calendar (Phase 2) ------------------------------------------
+
+class CursorCreate(_Frozen):
+    surface: str
+    ref_id: int
+
+
+class CalendarEntry(_Frozen):
+    id: int
+    kind: str
+    scope: str | None = None
+    occurs_on: str
+    ends_on: str | None = None
+    label: str

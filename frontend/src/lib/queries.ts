@@ -5,6 +5,7 @@
  * to these hooks; mutations invalidate the query keys they affect.
  */
 
+import { useEffect, useRef, useState } from "react";
 import {
   keepPreviousData,
   useMutation,
@@ -13,7 +14,17 @@ import {
 } from "@tanstack/react-query";
 
 import * as api from "@/lib/api";
+import { ANALYSIS_EVENT_NAMES } from "@/lib/api";
 import type {
+  AnalysisCreate,
+  AnalysisDetail,
+  AnalysisEvent,
+  AnalysisListParams,
+  AnalysisStageName,
+  Brief,
+  BriefSectionKey,
+  ContradictionListParams,
+  CursorCreate,
   DocumentListParams,
   EntityListParams,
   FeedParams,
@@ -45,6 +56,21 @@ export const queryKeys = {
     ["entities", "detail", id, "documents", params] as const,
   search: (q: string, kind: SearchKind) => ["search", kind, q] as const,
   spend: (days: number) => ["spend", days] as const,
+  briefs: ["brief"] as const,
+  /** `date` is 'today' or 'YYYY-MM-DD'. */
+  brief: (date: string) => ["brief", date] as const,
+  event: (id: number) => ["events", "detail", id] as const,
+  thread: (id: number) => ["threads", "detail", id] as const,
+  calendar: (days: number) => ["calendar", days] as const,
+  analyses: ["analyses"] as const,
+  analysisList: (params: AnalysisListParams) =>
+    ["analyses", "list", params] as const,
+  analysis: (id: number) => ["analyses", "detail", id] as const,
+  contradictions: ["contradictions"] as const,
+  contradictionList: (params: ContradictionListParams) =>
+    ["contradictions", "list", params] as const,
+  contradiction: (id: number) => ["contradictions", "detail", id] as const,
+  contradictionOpenCount: ["contradictions", "open-count"] as const,
 };
 
 // --------------------------------------------------------------------------
@@ -270,6 +296,119 @@ export function useEnrichmentSweep() {
 }
 
 // --------------------------------------------------------------------------
+// Briefs / events / threads / cursors / calendar (Phase 2)
+// --------------------------------------------------------------------------
+
+/**
+ * Today's brief — generated lazily server-side on the first fetch of the day,
+ * then stable. Shared by the Today page and the sidebar unseen dot; refetches
+ * on window focus (overriding the global default) so a brief left open
+ * overnight rolls over without a manual reload.
+ */
+export function useBriefToday() {
+  return useQuery({
+    queryKey: queryKeys.brief("today"),
+    queryFn: api.getBriefToday,
+    refetchOnWindowFocus: true,
+    staleTime: 60_000,
+  });
+}
+
+/** One historical day's brief ('YYYY-MM-DD') — immutable once generated. */
+export function useBrief(date: string, enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.brief(date),
+    queryFn: () => api.getBrief(date),
+    staleTime: 5 * 60_000,
+    enabled,
+  });
+}
+
+function withItemSeen(brief: Brief, itemId: number): Brief {
+  const sections = { ...brief.sections };
+  for (const key of Object.keys(sections) as BriefSectionKey[]) {
+    sections[key] = (sections[key] ?? []).map((item) =>
+      item.id === itemId ? { ...item, seen: true } : item,
+    );
+  }
+  return { ...brief, sections };
+}
+
+/**
+ * Marks one brief item seen. Optimistic: flips `seen` in every cached brief
+ * immediately, rolling back on error; the server answers 204, so success
+ * needs no invalidation.
+ */
+export function useMarkBriefItemSeen() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (itemId: number) => api.markBriefItemSeen(itemId),
+    onMutate: async (itemId) => {
+      await queryClient.cancelQueries({ queryKey: queryKeys.briefs });
+      const previous = queryClient.getQueriesData<Brief>({
+        queryKey: queryKeys.briefs,
+      });
+      queryClient.setQueriesData<Brief>({ queryKey: queryKeys.briefs }, (old) =>
+        old ? withItemSeen(old, itemId) : old,
+      );
+      return { previous };
+    },
+    onError: (_error, _itemId, context) => {
+      for (const [key, data] of context?.previous ?? []) {
+        queryClient.setQueryData(key, data);
+      }
+    },
+  });
+}
+
+export function useEvent(id: number, enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.event(id),
+    queryFn: () => api.getEvent(id),
+    enabled: enabled && Number.isFinite(id),
+  });
+}
+
+export function useThread(id: number) {
+  return useQuery({
+    queryKey: queryKeys.thread(id),
+    queryFn: () => api.getThread(id),
+    enabled: Number.isFinite(id),
+  });
+}
+
+export function useCalendar(days = 120) {
+  return useQuery({
+    queryKey: queryKeys.calendar(days),
+    queryFn: () => api.getCalendar(days),
+  });
+}
+
+/**
+ * Upserts a view cursor (fire-and-forget on surface mount). Deliberately does
+ * NOT invalidate the surface's detail query: the delta the user is reading
+ * was computed against the previous cursor and should survive the visit.
+ */
+export function usePostCursor() {
+  return useMutation({
+    mutationFn: (payload: CursorCreate) => api.postCursor(payload),
+  });
+}
+
+/** Manual T2 promotion of a document into an event (202 + job id). */
+export function usePromoteDocument() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.promoteDocument(id),
+    onSuccess: (_job, id) => {
+      // The job is async; refresh the document so the event chip appears
+      // once promotion lands and the user refetches.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.document(id) });
+    },
+  });
+}
+
+// --------------------------------------------------------------------------
 // Watches
 // --------------------------------------------------------------------------
 
@@ -322,5 +461,343 @@ export function useMarkWatchSeen() {
   return useMutation({
     mutationFn: (id: number) => api.markWatchSeen(id),
     onSuccess: invalidate,
+  });
+}
+
+// --------------------------------------------------------------------------
+// Analyses (Phase 3)
+// --------------------------------------------------------------------------
+
+export function useAnalyses(params: AnalysisListParams) {
+  return useQuery({
+    queryKey: queryKeys.analysisList(params),
+    queryFn: () => api.listAnalyses(params),
+    placeholderData: keepPreviousData,
+    // Keep list rows fresh while any visible analysis is still in flight.
+    refetchInterval: (query) =>
+      query.state.data?.items.some(
+        (item) => item.status === "pending" || item.status === "running",
+      )
+        ? 5_000
+        : false,
+  });
+}
+
+export function useCreateAnalysis() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: AnalysisCreate) => api.createAnalysis(payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.analyses });
+    },
+  });
+}
+
+export function useCancelAnalysis() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.cancelAnalysis(id),
+    onSuccess: (_void, id) => {
+      // 202 — cancellation is async; refetch so the status flips when it lands.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.analysis(id) });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.analyses });
+    },
+  });
+}
+
+/** One `stage_progress` line, kept out of the query cache (ActivityLog only). */
+export interface AnalysisActivityLine {
+  seq: number;
+  stage: AnalysisStageName;
+  message: string;
+}
+
+/** stage_progress ring buffer size — old lines fall off the front. */
+const ACTIVITY_BUFFER_SIZE = 200;
+
+/** Stable empty buffer returned while activity state belongs to another id. */
+const NO_ACTIVITY: AnalysisActivityLine[] = [];
+
+/**
+ * Pure reducer applying one SSE event to the cached snapshot. Timestamps set
+ * here are client-side approximations; the next snapshot refetch corrects
+ * them with server values.
+ */
+function applyAnalysisEvent(
+  detail: AnalysisDetail,
+  event: AnalysisEvent,
+): AnalysisDetail {
+  const now = new Date().toISOString();
+  switch (event.type) {
+    case "stage_started": {
+      const known = detail.stages.some((s) => s.stage === event.stage);
+      const stages = known
+        ? detail.stages.map((s) =>
+            s.stage === event.stage
+              ? { ...s, status: "running" as const, started_at: s.started_at ?? now }
+              : s,
+          )
+        : [
+            ...detail.stages,
+            {
+              stage: event.stage,
+              status: "running" as const,
+              summary: null,
+              started_at: now,
+              finished_at: null,
+            },
+          ];
+      return { ...detail, status: "running", stages };
+    }
+    case "stage_completed":
+      return {
+        ...detail,
+        stages: detail.stages.map((s) =>
+          s.stage === event.stage
+            ? {
+                ...s,
+                status: "completed" as const,
+                summary: event.summary,
+                finished_at: s.finished_at ?? now,
+              }
+            : s,
+        ),
+      };
+    case "claim_verified":
+      return {
+        ...detail,
+        claims: detail.claims.map((claim) =>
+          claim.id === event.claim_id
+            ? { ...claim, verdict: event.verdict }
+            : claim,
+        ),
+      };
+    case "done":
+      return {
+        ...detail,
+        status: "completed",
+        finished_at: detail.finished_at ?? now,
+      };
+    case "error":
+      return {
+        ...detail,
+        status: "failed",
+        error: event.message,
+        finished_at: detail.finished_at ?? now,
+      };
+    case "stage_progress":
+      // Progress lines live in the hook's ring buffer, never the cache.
+      return detail;
+  }
+}
+
+/** A server-sent message (has `data`) vs an EventSource transport error. */
+function isServerEvent(event: Event): event is MessageEvent<string> {
+  return typeof (event as MessageEvent).data === "string";
+}
+
+/**
+ * Live analysis hook: TanStack snapshot + SSE merge.
+ *
+ * - Fetches the snapshot; while status is pending/running, opens
+ *   `GET /api/analyses/{id}/events?after=<last_seq>` (see ANALYSIS_EVENTS_BASE
+ *   in api.ts for the rewrite-vs-direct base).
+ * - Events mutate the cached snapshot via a pure reducer; `claim_verified`
+ *   additionally schedules a coalesced snapshot refetch because the event
+ *   payload carries no evidence rows.
+ * - `stage_progress` lines go to an in-hook ring buffer (last 200) returned
+ *   as `activity` — they are display-only and never enter the cache.
+ * - Out-of-order/duplicate guard: every event id is job_event.seq; events at
+ *   or below the highest applied seq are dropped.
+ * - Transport error: close, refetch snapshot, reopen after its `last_seq`
+ *   (exponential backoff, 1s -> 15s). Terminal events close the stream and
+ *   trigger one final refetch.
+ */
+export function useAnalysis(id: number) {
+  const queryClient = useQueryClient();
+  const query = useQuery({
+    queryKey: queryKeys.analysis(id),
+    queryFn: () => api.getAnalysis(id),
+    enabled: Number.isFinite(id),
+  });
+
+  const status = query.data?.status;
+  const isLive = status === "pending" || status === "running";
+
+  // Highest seq applied (snapshot or event) — the resume cursor + order
+  // guard. Keyed by analysis id so navigating between analyses resets it.
+  const seqRef = useRef({ id, seq: 0 });
+  const snapshotSeq = query.data?.last_seq ?? 0;
+  // Declared before the SSE effect so a fresh snapshot bumps the cursor first.
+  useEffect(() => {
+    if (seqRef.current.id !== id) seqRef.current = { id, seq: 0 };
+    seqRef.current.seq = Math.max(seqRef.current.seq, snapshotSeq);
+  }, [id, snapshotSeq]);
+
+  // stage_progress ring buffer, keyed by id: lines from a previous analysis
+  // are dropped on navigation without needing a reset effect.
+  const [activityState, setActivityState] = useState<{
+    id: number;
+    lines: AnalysisActivityLine[];
+  }>({ id, lines: [] });
+  const activity = activityState.id === id ? activityState.lines : NO_ACTIVITY;
+
+  useEffect(() => {
+    if (!isLive || !Number.isFinite(id)) return;
+
+    let disposed = false;
+    let source: EventSource | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let refetchTimer: ReturnType<typeof setTimeout> | undefined;
+    let backoffMs = 1_000;
+
+    const invalidateSnapshot = () =>
+      queryClient.invalidateQueries({ queryKey: queryKeys.analysis(id) });
+
+    /** Coalesces refetches across a burst of claim_verified events. */
+    const scheduleSnapshotRefetch = () => {
+      if (refetchTimer !== undefined) return;
+      refetchTimer = setTimeout(() => {
+        refetchTimer = undefined;
+        void invalidateSnapshot();
+      }, 400);
+    };
+
+    const handleEvent = (raw: MessageEvent<string>) => {
+      const seq = Number(raw.lastEventId);
+      if (Number.isFinite(seq) && seq > 0) {
+        if (seq <= seqRef.current.seq) return; // duplicate / out of order
+        seqRef.current.seq = seq;
+      }
+      let payload: Record<string, unknown> = {};
+      if (raw.data) {
+        try {
+          payload = JSON.parse(raw.data) as Record<string, unknown>;
+        } catch {
+          return; // malformed frame — the next snapshot refetch covers it
+        }
+      }
+      const event = { ...payload, type: raw.type } as AnalysisEvent;
+
+      if (event.type === "stage_progress") {
+        const line: AnalysisActivityLine = {
+          seq: Number.isFinite(seq) ? seq : 0,
+          stage: event.stage,
+          message: event.message,
+        };
+        setActivityState((prev) => ({
+          id,
+          lines:
+            prev.id === id
+              ? [...prev.lines, line].slice(-ACTIVITY_BUFFER_SIZE)
+              : [line],
+        }));
+        return;
+      }
+
+      queryClient.setQueryData<AnalysisDetail>(queryKeys.analysis(id), (old) =>
+        old ? applyAnalysisEvent(old, event) : old,
+      );
+      if (event.type === "claim_verified") {
+        // The event carries claim_id + verdict only; evidence + reasoning
+        // arrive with the snapshot.
+        scheduleSnapshotRefetch();
+      }
+      if (event.type === "done" || event.type === "error") {
+        source?.close();
+        source = null;
+        void invalidateSnapshot();
+      }
+    };
+
+    const open = () => {
+      if (disposed) return;
+      const es = new EventSource(api.analysisEventsUrl(id, seqRef.current.seq));
+      source = es;
+      es.onopen = () => {
+        backoffMs = 1_000;
+      };
+      for (const name of ANALYSIS_EVENT_NAMES) {
+        if (name === "error") continue; // handled below (transport collision)
+        es.addEventListener(name, (raw) => handleEvent(raw as MessageEvent<string>));
+      }
+      // "error" is both our terminal server event AND the EventSource
+      // transport-failure event; a `data` payload distinguishes them.
+      es.addEventListener("error", (raw) => {
+        if (isServerEvent(raw)) {
+          handleEvent(raw);
+          return;
+        }
+        // Transport drop: close, refetch the snapshot, resume after last_seq.
+        es.close();
+        if (source === es) source = null;
+        if (disposed) return;
+        const delay = backoffMs;
+        backoffMs = Math.min(backoffMs * 2, 15_000);
+        reconnectTimer = setTimeout(() => {
+          void invalidateSnapshot().finally(() => {
+            if (!disposed) open();
+          });
+        }, delay);
+      });
+    };
+
+    open();
+    return () => {
+      disposed = true;
+      source?.close();
+      if (reconnectTimer !== undefined) clearTimeout(reconnectTimer);
+      if (refetchTimer !== undefined) clearTimeout(refetchTimer);
+    };
+  }, [id, isLive, queryClient]);
+
+  return { query, activity, isLive };
+}
+
+// --------------------------------------------------------------------------
+// Contradictions (Phase 3)
+// --------------------------------------------------------------------------
+
+export function useContradictions(params: ContradictionListParams) {
+  return useQuery({
+    queryKey: queryKeys.contradictionList(params),
+    queryFn: () => api.listContradictions(params),
+    placeholderData: keepPreviousData,
+  });
+}
+
+/**
+ * Row-expand evidence detail. `retry: false` because a backend that hasn't
+ * shipped the detail endpoint yet should degrade immediately, not after
+ * retries; the row falls back to counts-only.
+ */
+export function useContradiction(id: number, enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.contradiction(id),
+    queryFn: () => api.getContradiction(id),
+    enabled: enabled && Number.isFinite(id),
+    retry: false,
+  });
+}
+
+/** Open-contradiction count for the sidebar badge; errors just mean no badge. */
+export function useOpenContradictionCount() {
+  return useQuery({
+    queryKey: queryKeys.contradictionOpenCount,
+    queryFn: () => api.listContradictions({ status: "open", page: 1, page_size: 1 }),
+    select: (page) => page.total,
+    refetchInterval: 60_000,
+    retry: false,
+  });
+}
+
+export function useDismissContradiction() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.dismissContradiction(id),
+    onSuccess: () => {
+      // Covers every list filter, the expanded detail, and the badge count.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.contradictions });
+    },
   });
 }

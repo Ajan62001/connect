@@ -50,7 +50,8 @@ EDGE_STATUSES = ("active", "superseded", "retracted")
 # edge.relation is free TEXT in the DDL (the closed menu would force a table
 # rebuild every time a phase adds a relation); the vocabulary is enforced in
 # Python by storage/edges.py. Grows phase by phase.
-EDGE_RELATIONS = ("links_to",)
+# 'follows' (Phase 2): event -> event story threading.
+EDGE_RELATIONS = ("links_to", "follows")
 
 # --- document links (Phase 0.5: in-content link extraction & follow) --------
 
@@ -90,6 +91,10 @@ WATCH_HIT_OBJECT_TYPES = ("document", "event", "claim", "contradiction")
 
 BRIEF_SECTIONS = (
     "watch_dev", "thread_move", "contradiction", "trending_claim", "suggestion")
+BriefSection = Literal[
+    "watch_dev", "thread_move", "contradiction", "trending_claim", "suggestion"]
+BRIEF_OBJECT_TYPES = ("event", "document", "claim", "contradiction", "thread")
+BriefObjectType = Literal["event", "document", "claim", "contradiction", "thread"]
 CONTRADICTION_STATUSES = ("open", "dismissed", "resolved")
 CALENDAR_KINDS = ("election", "budget", "parliament_session", "rbi_mpc", "other")
 TOPIC_SOURCES = ("rule", "t1")

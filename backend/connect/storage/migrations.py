@@ -17,11 +17,15 @@ import sqlite3
 from typing import Callable
 
 from connect.storage.schema import (
+    BRIEF_ITEM_INDEX_DDL,
+    BRIEF_ITEM_TABLE_DDL,
+    CLAIM_EMBEDDING_DDL,
     DOCUMENT_ENRICHMENT_DDL,
     DOCUMENT_FTS_TRIGGER_DDL,
     DOCUMENT_INDEX_DDL,
     DOCUMENT_LINK_DDL,
     DOCUMENT_TABLE_DDL,
+    EVENT_EMBEDDING_DDL,
     JOB_TABLE_DDL,
     SCHEMA_VERSION,
     SOURCE_TABLE_DDL,
@@ -117,12 +121,52 @@ def _migrate_4_to_5(conn: sqlite3.Connection) -> None:
         conn.execute(ddl)
 
 
+def _migrate_5_to_6(conn: sqlite3.Connection) -> None:
+    """v6 (Phase 2: events/threads/brief): event_embedding table (event
+    centroid vectors for clustering) + brief_item.payload column
+    (denormalized display fields frozen at brief generation).
+
+    brief_item is rebuilt with the EXACT fresh-create DDL string (the
+    v2 -> v3 pattern) so migrated and fresh DBs declare byte-identical
+    tables; the copy-back lists the v5 columns explicitly — the new payload
+    column takes its DDL default. The brief_item index (dropped with the
+    table) is recreated after the copy. apply() runs with foreign_keys OFF.
+    """
+    for ddl in EVENT_EMBEDDING_DDL:
+        conn.execute(ddl)
+    backup = "_mig_brief_item"
+    conn.execute(f"DROP TABLE IF EXISTS {backup}")
+    conn.execute(f"CREATE TABLE {backup} AS SELECT * FROM brief_item")
+    conn.execute("DROP TABLE brief_item")
+    conn.execute(BRIEF_ITEM_TABLE_DDL)
+    conn.execute(
+        "INSERT INTO brief_item (id, brief_id, section, rank, object_type,"
+        " object_id, reason_json, seen)"
+        " SELECT id, brief_id, section, rank, object_type, object_id,"
+        f" reason_json, seen FROM {backup}")
+    conn.execute(f"DROP TABLE {backup}")
+    for ddl in BRIEF_ITEM_INDEX_DDL:
+        conn.execute(ddl)
+
+
+def _migrate_6_to_7(conn: sqlite3.Connection) -> None:
+    """v7 (Phase 3: verification slice): claim_embedding table (claim text
+    vectors for reconciliation). Additive only — every other Phase 3 table
+    (dossier, dossier_section, evidence, verdict_history, contradiction,
+    claim_sighting) already shipped in schema v1.
+    """
+    for ddl in CLAIM_EMBEDDING_DDL:
+        conn.execute(ddl)
+
+
 # Registry: version N -> function taking N's schema to N+1's. Forward-only.
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_1_to_2,
     2: _migrate_2_to_3,
     3: _migrate_3_to_4,
     4: _migrate_4_to_5,
+    5: _migrate_5_to_6,
+    6: _migrate_6_to_7,
 }
 
 

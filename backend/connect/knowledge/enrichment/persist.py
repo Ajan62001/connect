@@ -1,8 +1,9 @@
 """Persist one T1 result — GROUNDING DISCIPLINE STARTS HERE.
 
 - quoted_span must be a verbatim substring of the document's content_text
-  (whitespace-normalized comparison); claims that fail the check are DROPPED
-  and counted — an invented quote never becomes knowledge.
+  (whitespace-normalized comparison, the shared analysis/grounding.py
+  verifier); claims that fail the check are DROPPED and counted — an
+  invented quote never becomes knowledge.
 - entities are get-or-create by normalized alias-exact match (lowercase,
   collapsed whitespace) over entity.name + aliases; a novel surface form is
   appended to the matched entity's aliases (the alias table grows, which
@@ -19,10 +20,12 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from typing import Any
 
+from connect.analysis.grounding import find_span as _find_span
+from connect.analysis.grounding import norm_ws as _norm_ws
+from connect.analysis.grounding import span_is_verbatim  # noqa: F401 — re-export
 from connect.domain.enums import ENTITY_TYPES, T1_TOPICS
 from connect.knowledge.enrichment.prompts import T1_PROMPT_VERSION
 from connect.knowledge.enrichment.t1 import EnrichmentT1
@@ -31,33 +34,10 @@ from connect.storage.db import utc_now
 
 CLAIM_MIN_WORTHINESS = 0.6
 
-_WS_RE = re.compile(r"\s+")
-
-
-def _norm_ws(text: str) -> str:
-    """Whitespace-normalize (the verbatim-span comparison form)."""
-    return _WS_RE.sub(" ", text).strip()
-
 
 def _norm_alias(text: str) -> str:
     """Entity-matching normal form: lowercase + collapsed whitespace."""
     return _norm_ws(text).lower()
-
-
-def span_is_verbatim(span: str, content_text: str) -> bool:
-    """Is ``span`` a verbatim substring of the document text, modulo
-    whitespace? Empty spans never ground a claim."""
-    span_n = _norm_ws(span)
-    return bool(span_n) and span_n in _norm_ws(content_text)
-
-
-def _find_span(needle: str, haystack: str) -> tuple[int | None, int | None]:
-    """Char offsets of the first case-insensitive occurrence (None if the
-    surface only matches after whitespace normalization)."""
-    idx = haystack.lower().find(needle.lower())
-    if idx < 0:
-        return None, None
-    return idx, idx + len(needle)
 
 
 def _entity_index(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:

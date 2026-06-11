@@ -11,7 +11,9 @@ import {
 import { toast } from "sonner";
 
 import { DocumentTable } from "@/components/documents/DocumentTable";
+import { DeltaBanner } from "@/components/entities/DeltaBanner";
 import { EntityPill, EntityTypeChip } from "@/components/entities/EntityPill";
+import { EventTimeline } from "@/components/events/EventTimeline";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { Paginator } from "@/components/shared/Paginator";
 import { QueryError } from "@/components/shared/QueryError";
@@ -261,6 +263,22 @@ export default function EntityPage({
           </div>
 
           <StatLine detail={entity.data} />
+
+          {/* `?? null` tolerates a backend that predates Phase 2 deltas. */}
+          <DeltaBanner
+            surface="entity"
+            refId={entityId}
+            delta={entity.data.delta ?? null}
+          />
+
+          {(entity.data.events ?? []).length > 0 ? (
+            <section className="space-y-2">
+              <h2 className="text-sm font-semibold tracking-tight">
+                Recent events
+              </h2>
+              <EventTimeline events={entity.data.events} />
+            </section>
+          ) : null}
 
           {entity.data.topics.length > 0 ? (
             <section className="space-y-2">

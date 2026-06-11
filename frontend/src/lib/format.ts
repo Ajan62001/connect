@@ -30,6 +30,27 @@ export function absoluteTime(value: string | null | undefined): string {
   return format(date, "d MMM yyyy, HH:mm");
 }
 
+/**
+ * Date-only values ('YYYY-MM-DD' — event.occurred_on, brief_date) must parse
+ * in local time: routing them through `parseTimestamp` would append a Z and
+ * produce an invalid date. Falls back to timestamp parsing for safety.
+ */
+export function parseDateOnly(value: string): Date | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
+  if (m) {
+    const date = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    return isValid(date) ? date : null;
+  }
+  return parseTimestamp(value);
+}
+
+/** "11 Jun 2026" — for occurred_on / brief_date style fields. */
+export function formatDay(value: string | null | undefined): string {
+  if (!value) return "";
+  const date = parseDateOnly(value);
+  return date ? format(date, "d MMM yyyy") : value;
+}
+
 /** First 12 hex chars of a content hash, for compact display. */
 export function shortHash(hash: string): string {
   return hash.length > 12 ? `${hash.slice(0, 12)}…` : hash;

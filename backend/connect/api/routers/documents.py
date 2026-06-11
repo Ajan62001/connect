@@ -6,12 +6,18 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from connect.api.deps import get_container
-from connect.domain.models import Document, DocumentPage, IngestResult
+from connect.domain.models import (
+    Document,
+    DocumentPage,
+    IngestResult,
+    JobAccepted,
+)
 from connect.ingestion.extract_html import ExtractionError
 from connect.ingestion.fetcher import FetchDisallowed, FetchError
 from connect.orchestration.container import Container
 from connect.storage import documents as doc_dao
 from connect.storage import enrichment as enrichment_dao
+from connect.storage import events as event_dao
 from connect.storage import fts as fts_dao
 from connect.storage import links as link_dao
 
@@ -101,4 +107,24 @@ async def get_document(doc_id: int,
         "links": link_dao.list_for_document(container.db, doc_id),
         "linked_from": link_dao.linked_from(container.db, doc_id),
         "enrichment": enrichment_dao.get_for_document(container.db, doc_id),
+        "event": event_dao.event_for_document(container.db, doc_id),
     })
+
+
+@router.post("/{doc_id}/promote", response_model=JobAccepted,
+             status_code=202)
+async def promote_document(doc_id: int,
+                           container: Container = Depends(get_container)):
+    """Queue a manual T2 promotion (event clustering + story threading;
+    runs T1 first when the document hasn't been enriched yet)."""
+    service = container.enrichment
+    jobs = container.jobs
+    assert service is not None and jobs is not None
+    if doc_dao.get(container.db, doc_id) is None:
+        raise HTTPException(status_code=404, detail="document not found")
+
+    async def _run():
+        return await service.promote_document(doc_id)
+
+    job_id = jobs.submit("enrich_t2", {"document_id": doc_id}, _run)
+    return JobAccepted(job_id=job_id)

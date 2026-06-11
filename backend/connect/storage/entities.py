@@ -15,11 +15,14 @@ import sqlite3
 from connect.domain.models import (
     CoOccurringEntity,
     DocumentListItem,
+    EntityDelta,
     EntityDetail,
     EntityInfo,
     EntityListItem,
     TopicCount,
 )
+from connect.storage import cursors as cursor_dao
+from connect.storage import events as event_dao
 from connect.storage.documents import _LIST_COLS, _to_list_item
 
 # Shared per-entity stat aggregates (joined onto entity as 'st').
@@ -113,7 +116,39 @@ def get_detail(conn: sqlite3.Connection, entity_id: int, *,
                                   limit=co_occurring_limit),
         documents=documents_for(conn, entity_id, page=1,
                                 page_size=documents_limit)[0],
+        events=event_dao.events_for_entity(conn, entity_id, limit=10),
+        delta=delta_since_cursor(conn, entity_id),
     )
+
+
+def delta_since_cursor(conn: sqlite3.Connection,
+                       entity_id: int) -> EntityDelta | None:
+    """New events / documents / claims for the entity since its view_cursor
+    (surface='entity'); None when the page has never been visited.
+
+    "New" means when the KNOWLEDGE arrived (each row's created_at), not the
+    document's publication date — the DeltaBanner answers "what did the KB
+    learn since I last looked"."""
+    cursor = cursor_dao.get(conn, "entity", entity_id)
+    if cursor is None:
+        return None
+    documents = conn.execute(
+        "SELECT COUNT(DISTINCT document_id) FROM entity_mention"
+        " WHERE entity_id = ? AND created_at > ?",
+        (entity_id, cursor)).fetchone()[0]
+    events = conn.execute(
+        "SELECT COUNT(DISTINCT ea.event_id) FROM event_assignment ea"
+        " WHERE ea.event_id IS NOT NULL AND ea.created_at > ?"
+        " AND ea.document_id IN"
+        "   (SELECT document_id FROM entity_mention WHERE entity_id = ?)",
+        (cursor, entity_id)).fetchone()[0]
+    claims = conn.execute(
+        "SELECT COUNT(DISTINCT cs.claim_id) FROM claim_sighting cs"
+        " WHERE cs.created_at > ? AND cs.document_id IN"
+        "   (SELECT document_id FROM entity_mention WHERE entity_id = ?)",
+        (cursor, entity_id)).fetchone()[0]
+    return EntityDelta(events=int(events), documents=int(documents),
+                       claims=int(claims))
 
 
 def topics_for(conn: sqlite3.Connection, entity_id: int) -> list[TopicCount]:

@@ -18,7 +18,7 @@ def conn(tmp_path):
 
 def test_fresh_db_creates_full_schema(conn):
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 5
+    assert version == SCHEMA_VERSION == 7
 
     tables = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
@@ -29,7 +29,7 @@ def test_fresh_db_creates_full_schema(conn):
         "edge", "story", "claim_sighting", "verdict_history", "contradiction",
         "dossier", "dossier_section", "job", "job_event", "watch", "watch_hit",
         "brief", "brief_item", "view_cursor", "calendar_event", "llm_call",
-        "source_stats", "document_embedding",
+        "source_stats", "document_embedding", "event_embedding",
     }
     missing = expected - tables
     assert not missing, f"missing tables: {missing}"

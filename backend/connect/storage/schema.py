@@ -22,7 +22,7 @@ import sqlite3
 
 from connect.domain import enums as E
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 
 # --- error hierarchy ---------------------------------------------------------
@@ -515,6 +515,8 @@ CREATE TABLE IF NOT EXISTS brief (
     gloss_model  TEXT
 )"""
 
+# v6 adds payload: denormalized display fields (title/date/source/counts)
+# frozen at generation time so the brief is stable all day.
 _DDL_BRIEF_ITEM = f"""
 CREATE TABLE IF NOT EXISTS brief_item (
     id          INTEGER PRIMARY KEY,
@@ -524,12 +526,18 @@ CREATE TABLE IF NOT EXISTS brief_item (
     object_type TEXT NOT NULL,
     object_id   INTEGER NOT NULL,
     reason_json TEXT NOT NULL DEFAULT '{{}}',
+    payload     TEXT NOT NULL DEFAULT '{{}}',
     seen        INTEGER NOT NULL DEFAULT 0
 )"""
 
 _DDL_BRIEF_ITEM_INDEX = (
     "CREATE INDEX IF NOT EXISTS idx_brief_item_brief ON brief_item(brief_id)",
 )
+
+# Exported for migrations.py (migrate_5_to_6 rebuilds brief_item with the
+# EXACT fresh-create DDL string — the v6 payload column).
+BRIEF_ITEM_TABLE_DDL: str = _DDL_BRIEF_ITEM
+BRIEF_ITEM_INDEX_DDL: tuple[str, ...] = _DDL_BRIEF_ITEM_INDEX
 
 _DDL_VIEW_CURSOR = """
 CREATE TABLE IF NOT EXISTS view_cursor (
@@ -585,6 +593,36 @@ CREATE TABLE IF NOT EXISTS document_embedding (
     vector      BLOB NOT NULL
 )"""
 
+# v6: event centroid vectors (running mean over member-doc embeddings).
+# Plain BLOB table — events number in the hundreds at this corpus scale, so
+# brute-force cosine within the candidate window is always sufficient and
+# works identically under both vector backends.
+_DDL_EVENT_EMBEDDING = """
+CREATE TABLE IF NOT EXISTS event_embedding (
+    event_id INTEGER PRIMARY KEY REFERENCES event(id) ON DELETE CASCADE,
+    model    TEXT NOT NULL,
+    dim      INTEGER NOT NULL,
+    vector   BLOB NOT NULL
+)"""
+
+# Exported for migrations.py (migrate_5_to_6 creates the same table).
+EVENT_EMBEDDING_DDL: tuple[str, ...] = (_DDL_EVENT_EMBEDDING,)
+
+# v7 (Phase 3 verification): claim text vectors for claim reconciliation
+# (vec >= 0.92 auto-merge / 0.80-0.92 adjudication). Plain BLOB table —
+# claims number in the thousands at this scale, brute-force cosine is fine
+# and works identically under both vector backends.
+_DDL_CLAIM_EMBEDDING = """
+CREATE TABLE IF NOT EXISTS claim_embedding (
+    claim_id INTEGER PRIMARY KEY REFERENCES claim(id) ON DELETE CASCADE,
+    model    TEXT NOT NULL,
+    dim      INTEGER NOT NULL,
+    vector   BLOB NOT NULL
+)"""
+
+# Exported for migrations.py (migrate_6_to_7 creates the same table).
+CLAIM_EMBEDDING_DDL: tuple[str, ...] = (_DDL_CLAIM_EMBEDDING,)
+
 # sqlite-vec virtual table — executed by knowledge/vector.py ONLY when the
 # extension loads; kept here because schema.py owns all DDL text.
 VEC_DOCUMENT_DDL = """
@@ -638,6 +676,8 @@ ALL_DDL: tuple[str, ...] = (
     _DDL_LLM_CALL,
     _DDL_SOURCE_STATS,
     _DDL_DOCUMENT_EMBEDDING,
+    _DDL_EVENT_EMBEDDING,
+    _DDL_CLAIM_EMBEDDING,
 )
 
 

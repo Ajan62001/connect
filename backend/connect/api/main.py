@@ -13,15 +13,22 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from connect.api.routers import (
+    analyses,
+    brief,
+    calendar,
+    contradictions,
+    cursors,
     document_links,
     documents,
     enrichment,
     entities,
+    events,
     feed,
     health,
     search,
     sources,
     spend,
+    threads,
     watches,
 )
 from connect.orchestration.config import Settings
@@ -55,6 +62,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(entities.router, prefix="/api")
     app.include_router(enrichment.router, prefix="/api")
     app.include_router(spend.router, prefix="/api")
+    app.include_router(brief.router, prefix="/api")
+    app.include_router(events.router, prefix="/api")
+    app.include_router(threads.router, prefix="/api")
+    app.include_router(cursors.router, prefix="/api")
+    app.include_router(calendar.router, prefix="/api")
+    app.include_router(analyses.router, prefix="/api")
+    app.include_router(contradictions.router, prefix="/api")
     return app
 
 

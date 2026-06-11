@@ -88,8 +88,8 @@ def test_migrate_v1_to_v3(tmp_path):
     conn = db_mod.connect(db_path)
     assert migrations.read_version(conn) == 1
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 5
-    assert migrations.read_version(conn) == 5
+    assert version == SCHEMA_VERSION == 7
+    assert migrations.read_version(conn) == 7
 
     # document_link exists, matching the fresh-create schema (same DDL)
     tables = {r[0] for r in conn.execute(
@@ -141,8 +141,8 @@ def test_migrate_v2_to_v3(tmp_path):
     conn.rollback()  # the failed INSERT left an implicit transaction open
 
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 5
-    assert migrations.read_version(conn) == 5
+    assert version == SCHEMA_VERSION == 7
+    assert migrations.read_version(conn) == 7
 
     # old data intact across the rebuild (rowids preserved)
     row = conn.execute(
@@ -243,7 +243,7 @@ def test_migrate_copy_of_live_db(tmp_path):
                         " name='document_link'").fetchone() else None
 
     version = db_mod.init_db(conn)  # migrates if the copy is still v1/v2
-    assert version == SCHEMA_VERSION == 5
+    assert version == SCHEMA_VERSION == 7
 
     assert conn.execute("SELECT COUNT(*) FROM document").fetchone()[0] \
         == docs_before
@@ -318,8 +318,8 @@ def test_migrate_v3_to_v4(tmp_path):
     conn.rollback()
 
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 5
-    assert migrations.read_version(conn) == 5
+    assert version == SCHEMA_VERSION == 7
+    assert migrations.read_version(conn) == 7
 
     # the new table exists, byte-identical to fresh-create
     fresh = db_mod.connect(tmp_path / "fresh.db")
@@ -424,8 +424,8 @@ def test_migrate_v4_to_v5(tmp_path):
     conn.rollback()  # the failed INSERT left an implicit transaction open
 
     version = db_mod.init_db(conn)
-    assert version == SCHEMA_VERSION == 5
-    assert migrations.read_version(conn) == 5
+    assert version == SCHEMA_VERSION == 7
+    assert migrations.read_version(conn) == 7
 
     # old data intact across the rebuild (rowids preserved, FK child intact)
     row = conn.execute(
@@ -490,3 +490,91 @@ def test_migrated_v4_matches_fresh_schema(tmp_path):
     assert any(name == "document" for name, _ in migrated_rows)
     conn_m.close()
     conn_f.close()
+
+
+# --- v5 -> v6 (Phase 2: event_embedding + brief_item.payload) ------------------
+
+# The v5 brief_item DDL, derived from the current DDL by removing the v6
+# payload column — guarded so a future column change can't silently no-op.
+_V5_BRIEF_ITEM_DDL = schema.BRIEF_ITEM_TABLE_DDL.replace(
+    "    payload     TEXT NOT NULL DEFAULT '{}',\n", "")
+assert _V5_BRIEF_ITEM_DDL != schema.BRIEF_ITEM_TABLE_DDL
+
+
+def _make_v5_db(path) -> None:
+    """Recreate a v5 database: current schema minus event_embedding, with
+    the payload-less brief_item."""
+    conn = db_mod.connect(path)
+    db_mod.init_db(conn)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    with conn:
+        conn.execute("BEGIN")
+        conn.execute("DROP TABLE event_embedding")
+        conn.execute("DROP TABLE brief_item")  # drops its index too
+        conn.execute(_V5_BRIEF_ITEM_DDL)
+        conn.execute(schema.BRIEF_ITEM_INDEX_DDL[0])
+        conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
+        # v5-era data that must survive
+        conn.execute(
+            "INSERT INTO brief (brief_date, generated_at) VALUES"
+            " ('2026-06-01', '2026-06-01T06:00:00Z')")
+        conn.execute(
+            "INSERT INTO brief_item (brief_id, section, rank, object_type,"
+            " object_id, reason_json, seen) VALUES"
+            " (1, 'watch_dev', 1, 'document', 7, '{\"reason\":\"r\"}', 1)")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.close()
+
+
+def test_migrate_v5_to_v6(tmp_path):
+    db_path = tmp_path / "v5.db"
+    _make_v5_db(db_path)
+
+    conn = db_mod.connect(db_path)
+    assert migrations.read_version(conn) == 5
+    version = db_mod.init_db(conn)
+    assert version == SCHEMA_VERSION == 7
+    assert migrations.read_version(conn) == 7
+
+    # new table + rebuilt table are byte-identical to fresh-create
+    fresh = db_mod.connect(tmp_path / "fresh6.db")
+    db_mod.init_db(fresh)
+
+    def ddl(c, name):
+        return c.execute("SELECT sql FROM sqlite_master WHERE name=?",
+                         (name,)).fetchone()[0]
+
+    for table in ("event_embedding", "brief_item"):
+        assert ddl(conn, table) == ddl(fresh, table)
+    fresh.close()
+
+    # old brief_item row intact; payload took its default
+    row = conn.execute("SELECT * FROM brief_item WHERE id=1").fetchone()
+    assert (row["section"], row["rank"], row["object_type"], row["object_id"],
+            row["seen"]) == ("watch_dev", 1, "document", 7, 1)
+    assert row["reason_json"] == '{"reason":"r"}'
+    assert row["payload"] == "{}"
+    # the index was recreated and scratch tables are gone
+    indexes = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index'"
+        " AND tbl_name='brief_item'")}
+    assert "idx_brief_item_brief" in indexes
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert not {t for t in tables if t.startswith("_mig_")}
+    assert "event_embedding" in tables
+
+    # both new structures are usable
+    with conn:
+        conn.execute(
+            "INSERT INTO brief_item (brief_id, section, rank, object_type,"
+            " object_id, payload) VALUES (1, 'thread_move', 1, 'thread', 3,"
+            " '{\"title\":\"t\"}')")
+        conn.execute(
+            "INSERT INTO event (title, event_type, doc_count, created_at)"
+            " VALUES ('E', 'other', 1, '2026-06-11T00:00:00Z')")
+        event_id = conn.execute("SELECT id FROM event").fetchone()[0]
+        conn.execute(
+            "INSERT INTO event_embedding (event_id, model, dim, vector)"
+            " VALUES (?, 'centroid', 2, x'0000803f00000040')", (event_id,))
+    conn.close()

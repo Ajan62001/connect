@@ -5,12 +5,15 @@ import { usePathname } from "next/navigation";
 import {
   DatabaseIcon,
   EyeIcon,
+  FlaskConicalIcon,
   LibraryBigIcon,
   RssIcon,
+  ScaleIcon,
   SearchIcon,
   SunIcon,
 } from "lucide-react";
 
+import { useBriefToday, useOpenContradictionCount } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 
 const NAV_ITEMS = [
@@ -18,12 +21,26 @@ const NAV_ITEMS = [
   { href: "/feed", label: "Feed", icon: RssIcon },
   { href: "/library", label: "Library", icon: LibraryBigIcon },
   { href: "/search", label: "Search", icon: SearchIcon },
+  { href: "/analyze", label: "Analyze", icon: FlaskConicalIcon },
+  { href: "/contradictions", label: "Contradictions", icon: ScaleIcon },
   { href: "/sources", label: "Sources", icon: DatabaseIcon },
   { href: "/watchlist", label: "Watchlist", icon: EyeIcon },
 ] as const;
 
 export function Sidebar() {
   const pathname = usePathname();
+
+  // Shared with the Today page (same query key); errors just mean no dot.
+  const brief = useBriefToday();
+  const hasUnseenBriefItems =
+    brief.data !== undefined &&
+    Object.values(brief.data.sections).some((items) =>
+      (items ?? []).some((item) => !item.seen),
+    );
+
+  // Cheap count (page_size=1, total only); errors just mean no badge.
+  const openContradictions = useOpenContradictionCount();
+  const contradictionCount = openContradictions.data ?? 0;
 
   return (
     <aside className="flex w-52 shrink-0 flex-col border-r bg-sidebar">
@@ -38,7 +55,12 @@ export function Sidebar() {
             pathname === href ||
             pathname.startsWith(`${href}/`) ||
             (href === "/library" && pathname.startsWith("/documents")) ||
-            (href === "/search" && pathname.startsWith("/entity"));
+            (href === "/search" && pathname.startsWith("/entity")) ||
+            (href === "/analyze" && pathname.startsWith("/analysis")) ||
+            (href === "/today" &&
+              (pathname.startsWith("/brief") ||
+                pathname.startsWith("/thread") ||
+                pathname.startsWith("/event/")));
           return (
             <Link
               key={href}
@@ -52,12 +74,27 @@ export function Sidebar() {
             >
               <Icon className="size-4" aria-hidden />
               {label}
+              {href === "/today" && hasUnseenBriefItems ? (
+                <span
+                  className="ml-auto size-2 rounded-full bg-primary"
+                  title="Unseen brief items"
+                  aria-label="Unseen brief items"
+                />
+              ) : null}
+              {href === "/contradictions" && contradictionCount > 0 ? (
+                <span
+                  className="ml-auto inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-primary px-1.5 text-[11px] font-semibold tabular-nums text-primary-foreground"
+                  title={`${contradictionCount} open contradiction${contradictionCount === 1 ? "" : "s"}`}
+                >
+                  {contradictionCount > 99 ? "99+" : contradictionCount}
+                </span>
+              ) : null}
             </Link>
           );
         })}
       </nav>
       <div className="border-t p-3 text-xs text-muted-foreground">
-        Phase 1 · entities &amp; enrichment
+        Phase 3 · analysis &amp; verification
       </div>
     </aside>
   );

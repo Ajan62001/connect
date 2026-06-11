@@ -25,11 +25,17 @@ DEFAULT_USAGE = Usage(input_tokens=2200, output_tokens=300)
 
 class MockProvider(LLMProvider):
     """``respond`` is either a fixed BaseModel instance (always returned) or
-    a callable (user_text) -> BaseModel."""
+    a callable (user_text) -> BaseModel. ``respond_by_schema`` maps a
+    requested schema class to its own responder (instance or callable) —
+    Phase 2 flows mix schemas (T1 extraction, clustering adjudications,
+    event summaries, follow-up judgments) in one run; unmapped schemas fall
+    back to ``respond``."""
 
     def __init__(self, respond: Any = None, *, usage: Usage = DEFAULT_USAGE,
-                 text: str = "ok"):
+                 text: str = "ok",
+                 respond_by_schema: dict[type, Any] | None = None):
         self.respond = respond
+        self.respond_by_schema = respond_by_schema or {}
         self.usage = usage
         self.text = text
         self.calls: list[dict[str, Any]] = []
@@ -55,9 +61,10 @@ class MockProvider(LLMProvider):
         self.calls.append({"kind": "structured", "system": system,
                            "user_text": user_text, "schema": schema,
                            "tier": tier, "max_tokens": max_tokens})
-        out = self.respond(user_text) if callable(self.respond) \
-            else self.respond
-        assert out is not None, "MockProvider.respond not configured"
+        responder = self.respond_by_schema.get(schema, self.respond)
+        out = responder(user_text) if callable(responder) else responder
+        assert out is not None, \
+            f"MockProvider.respond not configured for {schema.__name__}"
         return StructuredCompletion[schema](  # type: ignore[valid-type]
             output=out, model=self.model_for(tier), usage=self.usage)
 

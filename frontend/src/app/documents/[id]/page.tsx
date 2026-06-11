@@ -300,6 +300,17 @@ function MetadataSidebar({ document }: { document: Document }) {
     <aside className="w-full shrink-0 lg:w-64">
       <dl className="space-y-4 rounded-xl border bg-card p-4">
         <MetaRow label="Source">{document.source_name ?? "Manual ingest"}</MetaRow>
+        {document.event ? (
+          <MetaRow label="Event">
+            <Badge
+              variant="secondary"
+              render={<Link href={`/event/${document.event.id}`} />}
+              className="max-w-full"
+            >
+              <span className="truncate">{document.event.title}</span>
+            </Badge>
+          </MetaRow>
+        ) : null}
         {document.url ? (
           <MetaRow label="URL">
             <a

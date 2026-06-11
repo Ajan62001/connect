@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 
+from connect.analysis.pipeline import AnalysisService
 from connect.ingestion.blobs import BlobStore
 from connect.ingestion.fetcher import Fetcher
 from connect.ingestion.pipeline import IngestionPipeline
@@ -21,6 +22,7 @@ from connect.knowledge.enrichment.sweep import (
     EnrichmentService,
     is_fact_checker_source,
 )
+from connect.knowledge.calendar import seed_calendar_events
 from connect.knowledge.taxonomy import seed_event_types
 from connect.knowledge.vector import VectorIndex, create_vector_index
 from connect.llm.anthropic_provider import AnthropicProvider
@@ -30,6 +32,7 @@ from connect.llm.spend import Governor
 from connect.llm.tiers import tier_models
 from connect.orchestration.config import Settings
 from connect.orchestration.jobs import JobRunner
+from connect.retrieval.search_client import SearchClient, create_search_client
 from connect.sources.adapters.twitter import TwitterAdapter
 from connect.sources.registry import POLLABLE_TYPES, SOURCE_ADAPTERS
 from connect.sources.seeds import seed_sources
@@ -73,6 +76,11 @@ class Container:
                 settings.anthropic_api_key)
         self.governor: Governor | None = None
         self.enrichment: EnrichmentService | None = None
+        # Phase 3: web search seam (NullSearchClient when keyless —
+        # verification degrades to corpus-only) + the analysis service.
+        self.search_client: SearchClient = create_search_client(
+            settings.tavily_api_key)
+        self.analysis: AnalysisService | None = None
 
     # -- lifecycle --------------------------------------------------------------
 
@@ -82,6 +90,7 @@ class Container:
         self.schema_version = db_mod.init_db(self.conn)
         seed_sources(self.conn)
         seed_event_types(self.conn)
+        seed_calendar_events(self.conn)
         self.governor = Governor(
             self.conn, self.settings.daily_llm_budget_usd)
         self.enrichment = EnrichmentService(
@@ -122,6 +131,18 @@ class Container:
         )
         self.jobs = JobRunner(self.conn, self.settings.job_concurrency)
         self.jobs.reconcile_orphans()
+        self.analysis = AnalysisService(
+            self.conn,
+            jobs=self.jobs,
+            provider=self.llm,
+            governor=self.governor,
+            search=self.search_client,
+            ingest=self.pipeline,
+            embedder=self.embedder,
+            vectors=self.vectors,
+            budget_usd=self.settings.analysis_budget_usd,
+            default_max_evidence=self.settings.analysis_max_evidence,
+        )
         log.info("container up: db=%s schema=v%s vectors=%s",
                  self.settings.db_path, self.schema_version,
                  self.vectors.backend)
@@ -137,6 +158,7 @@ class Container:
         if self.jobs is not None:
             await self.jobs.shutdown()
         await self.fetcher.aclose()
+        await self.search_client.aclose()
         twitter = self.adapters.get("twitter")
         if twitter is not None and hasattr(twitter, "aclose"):
             await twitter.aclose()

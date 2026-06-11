@@ -12,7 +12,7 @@ TEXT = (
 def test_health(client):
     body = client.get("/api/health").json()
     assert body["ok"] is True
-    assert body["schema_version"] == 5
+    assert body["schema_version"] == 7
     assert body["vector_backend"] == "disabled"  # embeddings off in tests
     assert body["db_path"].endswith("connect.db")
 

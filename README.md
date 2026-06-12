@@ -95,6 +95,64 @@ On first boot the backend migrates the schema and seeds the India source registr
 (RBI / PIB / Alt News / BOOM Live / ET / LiveMint / Scroll / Google News / X / Telegram);
 workers poll sources and embed every ingested document locally (fastembed BGE-small).
 
+## Authentication (v0.2 Phase B)
+
+The whole `/api` surface sits behind cookie auth (server-side sessions in Postgres;
+opaque `connect_session` httpOnly cookie; `/api/health` and `/api/auth/*` are the only
+open routes). Sign-in is Google OAuth (authlib code flow) with an **invite gate**: the
+first user to ever sign in becomes the admin; everyone after that must be invited by an
+admin (`POST /api/admin/invites`) or listed in `CONNECT_ADMIN_EMAILS`. Uninvited Google
+identities get a friendly "ask the admin for an invite" page and no account. Private
+work stays private — admins manage users, not content.
+
+### Google Cloud Console setup (one time)
+
+1. Open <https://console.cloud.google.com/> → create (or pick) a project.
+2. **APIs & Services → OAuth consent screen** (*Google Auth Platform → Branding*):
+   set the app name + support email. Audience **External** is fine; while the app is
+   in *Testing* you must add each Google account under **Test users** (or publish the
+   app — no verification is needed for plain `openid email profile` scopes).
+3. **APIs & Services → Credentials → Create credentials → OAuth client ID** →
+   Application type **Web application**.
+4. Under **Authorized redirect URIs** add the callback for every way you serve the API
+   (the URI must match *exactly*, scheme + host + port + path):
+   - Docker/Caddy on this machine: `https://localhost:8443/api/auth/callback`
+   - VPS with a real domain: `https://connect.example.com/api/auth/callback`
+   - Split-port local dev (uvicorn on :8001): `http://localhost:8001/api/auth/callback`
+   (No "Authorized JavaScript origins" needed — this is a server-side code flow.)
+5. Copy the client ID + secret into `.env` (compose) or `backend/.env` (no-docker dev):
+
+   ```
+   GOOGLE_OAUTH_CLIENT_ID=...apps.googleusercontent.com
+   GOOGLE_OAUTH_CLIENT_SECRET=...
+   CONNECT_SESSION_SECRET=<python3 -c "import secrets; print(secrets.token_urlsafe(32))">
+   ```
+
+Behind Caddy the callback URL is derived from the request automatically (uvicorn runs
+`--proxy-headers`). In **split-port dev** (frontend `:3000` proxying to api `:8001`)
+also set, in `backend/.env`:
+
+```
+CONNECT_OAUTH_REDIRECT_URI=http://localhost:8001/api/auth/callback   # what you registered
+CONNECT_FRONTEND_ORIGIN=http://localhost:3000                        # land back on Next
+```
+
+Cookies are host-scoped (ports don't matter), so a callback on `localhost:8001` signs
+you in for `localhost:3000` too.
+
+### Dev login (no Google credentials yet)
+
+Until OAuth credentials exist the system stays fully usable via an **env-gated dev
+hatch**: set `CONNECT_DEV_LOGIN_EMAIL=dev@example.com` and the signin page grows a
+"Continue as dev@example.com" button (`POST /api/auth/dev-login`) that creates/signs in
+exactly that user — first user ever still becomes admin. The endpoint takes no input
+and refuses to exist (404) when the variable is unset. **Dev-only: never set it on a
+production deployment** — it is plaintext sign-in as whoever controls the env.
+
+CSRF posture: `SameSite=Lax` cookies plus an Origin-check middleware on state-changing
+methods; the allowlist for the dev rewrite's cross-port Origin is
+`CONNECT_ALLOWED_ORIGINS` (defaults cover `localhost:3000`).
+
 ### Environment variables
 
 `.env.example` documents every deployment knob — database DSN, domain/ports, provider
@@ -104,6 +162,36 @@ the admin-editable `app_setting` table), and `CONNECT_GLOBAL_DAILY_BUDGET_USD` �
 deployment-wide backstop that caps the actual API bill. The full list with defaults
 lives in `backend/connect/orchestration/config.py` (env prefix `CONNECT_`); commonly
 toggled in dev: `CONNECT_POLLER_ENABLED=false`, `CONNECT_EMBEDDINGS_ENABLED=false`.
+
+## Budgets, limits & admin (v0.2 Phase D)
+
+Every LLM call is ledgered with the acting user (`llm_call.user_id`; jobs carry
+`job.owner_id` and the worker attributes all spend inside a job to its owner —
+system work stays unattributed). Three budget layers gate every call, checked
+in order: the **global backstop** (`global_daily_budget_usd`, locked $10/day —
+the cap on the actual API bill), the **purpose envelope** (general vs
+investigation, the v0.1 governors), and the **per-user ceiling** (admin-set
+override on the user, else the member defaults — $0.50 general / $2.00
+investigation; admins get the whole envelope). All five budget values live in
+the admin-editable `app_setting` table (env values are first-boot seeds) and
+are read per check — admin changes apply immediately, no restart.
+
+Over-limit requests get a friendly `429` with the remaining budget. Two more
+backpressure valves: per-user in-flight interactive jobs
+(`CONNECT_USER_MAX_INTERACTIVE`, default 2) + global interactive queue depth
+(`CONNECT_INTERACTIVE_QUEUE_LIMIT`), and per-user request rate limits
+(120/min reads, 10/min ingest, 5/min analysis/investigation creation;
+in-memory, SSE exempt).
+
+Admin surface (all `require_admin`): `GET/PATCH /api/admin/users[/{id}]`
+(role, disable — revokes sessions instantly —, budget overrides; explicit
+`null` clears an override), `GET/POST/DELETE /api/admin/invites`,
+`GET/PATCH /api/admin/settings` (the five budget globals),
+`GET /api/admin/spend` (system totals + per-user/day breakdown), and
+`GET /api/metrics` (Prometheus text). `GET /api/spend` now returns "my spend"
+(`mine`: effective caps + my ledger) alongside the global context; `GET
+/api/health?deep=1` adds queue depth, beat liveness, poll staleness, blob
+writability and budget state (open endpoint — numbers only, never secrets).
 
 ## Phase status
 

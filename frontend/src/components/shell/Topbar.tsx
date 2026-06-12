@@ -5,7 +5,9 @@ import { PlusIcon } from "lucide-react";
 
 import { IngestDialog } from "@/components/ingest/IngestDialog";
 import { SpendBadge } from "@/components/shell/SpendBadge";
+import { UserMenu } from "@/components/shell/UserMenu";
 import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
 import { useHealth } from "@/lib/queries";
 
@@ -44,6 +46,8 @@ export function Topbar() {
           <PlusIcon data-icon="inline-start" />
           Add to corpus
         </Button>
+        <Separator orientation="vertical" className="h-6" />
+        <UserMenu />
       </div>
       <IngestDialog open={ingestOpen} onOpenChange={setIngestOpen} />
     </header>

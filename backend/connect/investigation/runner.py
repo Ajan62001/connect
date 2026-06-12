@@ -105,24 +105,40 @@ class InvestigationService:
             max_web_fetches=self.default_max_web_fetches)
 
     async def start(self, seed: InvestigationSeed,
-                    options: InvestigationOptions | None = None,
-                    ) -> tuple[int, int]:
+                    options: InvestigationOptions | None = None, *,
+                    owner_id: int,
+                    visibility: str | None = None) -> tuple[int, int]:
         """Create dossier(kind='investigation') + enqueue the job (the
         payload is self-describing: the registered handler reconstructs
         seed + options from it); returns (investigation_id, job_id).
-        Raises LookupError when the seed references a missing row."""
+        Raises LookupError when the seed references a missing row.
+
+        Visibility (design §1): None -> 'shared' (community compounding),
+        EXCEPT when the seed is a question of a PRIVATE dossier — the
+        child inherits 'private' (its scope descends from private work)."""
         opts = options or self.default_options()
         async with self.pool.connection() as conn:
             input_text, input_type, parent_question_id = \
                 await scoping.resolve_seed(conn, seed)
+            if visibility is None:
+                visibility = "shared"
+                if parent_question_id is not None:
+                    cur = await conn.execute(
+                        "SELECT d.visibility FROM question q"
+                        " JOIN dossier d ON d.id = q.dossier_id"
+                        " WHERE q.id = %s", (parent_question_id,))
+                    parent = await cur.fetchone()
+                    if parent is not None:
+                        visibility = parent["visibility"]
             async with conn.transaction():
                 cur = await conn.execute(
                     "INSERT INTO dossier (kind, input_text, input_type,"
-                    " parent_question_id, budget_usd, status, created_at)"
+                    " parent_question_id, budget_usd, status, created_at,"
+                    " owner_id, visibility)"
                     " VALUES ('investigation', %s, %s, %s, %s, 'pending',"
-                    " %s) RETURNING id",
+                    " %s, %s, %s) RETURNING id",
                     (input_text, input_type, parent_question_id,
-                     opts.budget_usd, utc_now()))
+                     opts.budget_usd, utc_now(), owner_id, visibility))
                 dossier_id = int((await cur.fetchone())["id"])
                 if parent_question_id is not None:
                     await conn.execute(
@@ -133,7 +149,7 @@ class InvestigationService:
             "investigation",
             {"dossier_id": dossier_id, "seed": seed.model_dump(),
              "options": opts.model_dump()},
-            dossier_id=dossier_id)
+            dossier_id=dossier_id, owner_id=owner_id)
         return dossier_id, job_id
 
     async def job_for(self, dossier_id: int) -> int | None:
@@ -218,13 +234,14 @@ class InvestigationService:
                            emit) -> ScopePack:
         await self._section_start(conn, dossier_id, "scope")
         cur = await conn.execute(
-            "SELECT input_text, input_type FROM dossier WHERE id = %s",
+            "SELECT input_text, input_type, owner_id FROM dossier"
+            " WHERE id = %s",
             (dossier_id,))
         row = await cur.fetchone()
         pack = await scoping.build_scope_pack(
             conn, embedder=self.embedder, vectors=self.vectors,
             input_text=row["input_text"], input_type=row["input_type"],
-            seed=seed)
+            seed=seed, viewer=row["owner_id"])
         summary = (f"{len(pack.documents)} docs, {len(pack.anchors)}"
                    f" anchors, {len(pack.timeline)} timeline items,"
                    f" {len(pack.reaction_candidates)} reaction candidates,"
@@ -252,12 +269,16 @@ class InvestigationService:
 
         state = InvestigationState(
             dossier_id=dossier_id, max_web_fetches=opts.max_web_fetches)
+        cur = await conn.execute(
+            "SELECT owner_id FROM dossier WHERE id = %s", (dossier_id,))
+        owner_row = await cur.fetchone()
         executor = ToolExecutor(
             conn, pipeline=self.ingest, search=self.search,
             embedder=self.embedder, vectors=self.vectors, scope_pack=pack,
             state=state, emit=emit,
             web_source_id=await self._web_source_id(conn),
-            t1_enrich=self._make_t1_enricher(conn, budget))
+            t1_enrich=self._make_t1_enricher(conn, budget),
+            viewer=owner_row["owner_id"] if owner_row else None)
 
         model = self.provider.model_for(ModelTier.BALANCED)
         turn_proj = spend.cost_usd(model, input_tokens=EST_LOOP_IN,
@@ -392,11 +413,15 @@ class InvestigationService:
             if provider is None:
                 return False
             cur = await conn.execute(
-                "SELECT id, title, content_text FROM document"
+                "SELECT id, title, content_text, visibility FROM document"
                 " WHERE id = %s",
                 (document_id,))
             row = await cur.fetchone()
             if row is None:
+                return False
+            if row["visibility"] != "shared":
+                # I1 gate 1: T1 persistence writes shared-KB rows; fetched
+                # docs are always shared, this guards the dedup edge cases
                 return False
             model = provider.model_for(ModelTier.FAST)
             projected = spend.estimated_t1_cost(model, batch=False)

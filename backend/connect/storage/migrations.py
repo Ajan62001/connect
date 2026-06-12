@@ -69,11 +69,49 @@ async def pg_migrate_1_to_2(conn: "psycopg.AsyncConnection") -> None:
         await conn.execute(ddl)
 
 
+async def pg_migrate_2_to_3(conn: "psycopg.AsyncConnection") -> None:
+    """v3 — Phase C tenancy (v02-tenancy-auth.md §2 deferred tightening):
+    the per-user surfaces become NOT NULL. Pre-tenancy NULL rows (single-
+    user era / ETL'd data) are backfilled to the FIRST ADMIN — exactly the
+    design §7 single-user migration rule; with no rows to backfill (fresh
+    deployments) the ALTERs are trivially satisfiable. view_cursor's PK
+    swaps to (user_id, surface, ref_id). A deployment that somehow has
+    orphan rows but no admin fails loudly (SET NOT NULL) rather than
+    guessing an owner."""
+    cur = await conn.execute(
+        "SELECT id FROM app_user WHERE role = 'admin' AND NOT disabled"
+        " ORDER BY id LIMIT 1")
+    row = await cur.fetchone()
+    admin_id = None if row is None else _scalar(row)
+    if admin_id is not None:
+        await conn.execute(
+            "UPDATE dossier SET owner_id = %s WHERE owner_id IS NULL",
+            (admin_id,))
+        for table in ("watch", "brief", "view_cursor"):
+            await conn.execute(
+                f"UPDATE {table} SET user_id = %s WHERE user_id IS NULL",
+                (admin_id,))
+    await conn.execute(
+        "ALTER TABLE dossier ALTER COLUMN owner_id SET NOT NULL")
+    await conn.execute(
+        "ALTER TABLE watch ALTER COLUMN user_id SET NOT NULL")
+    await conn.execute(
+        "ALTER TABLE brief ALTER COLUMN user_id SET NOT NULL")
+    await conn.execute(
+        "ALTER TABLE view_cursor ALTER COLUMN user_id SET NOT NULL")
+    await conn.execute(
+        "ALTER TABLE view_cursor DROP CONSTRAINT view_cursor_pkey")
+    await conn.execute(
+        "ALTER TABLE view_cursor"
+        " ADD PRIMARY KEY (user_id, surface, ref_id)")
+
+
 # Registry: version N -> async function taking N's schema to N+1's.
 # Forward-only.
 PG_MIGRATIONS: dict[
     int, Callable[["psycopg.AsyncConnection"], Awaitable[None]]] = {
     1: pg_migrate_1_to_2,
+    2: pg_migrate_2_to_3,
 }
 
 

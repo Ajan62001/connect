@@ -45,6 +45,12 @@ class AnalysisContext:
     emit: Callable[[str, dict[str, Any]], Awaitable[Any]]  # job_event writer
     normalized: NormalizedInput | None = None
     stage_summaries: dict[str, str] = field(default_factory=dict)
+    # tenancy (design §1 gate 2): shared=False suppresses ALL writes to the
+    # shared KB (claim/evidence/verdict_history) — results live only in the
+    # dossier-scoped section content. viewer = the dossier owner; it scopes
+    # corpus retrieval so evidence gathering sees shared + own-private docs.
+    shared: bool = True
+    viewer: int | None = None
 
     def projected_cost(self, tier: ModelTier, est_in: int,
                        est_out: int) -> float:

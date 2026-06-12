@@ -8,6 +8,7 @@ import {
   FileQuestionIcon,
   Loader2Icon,
   QuoteIcon,
+  Share2Icon,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -23,13 +24,15 @@ import {
 } from "@/components/documents/DocumentSheet";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { QueryError } from "@/components/shared/QueryError";
+import { ShareDossierDialog } from "@/components/shared/ShareDialog";
+import { OwnerByline, VisibilityBadge } from "@/components/shared/Visibility";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { AnalysisClaim, AnalysisDetail } from "@/lib/api";
 import { relativeTime } from "@/lib/format";
-import { useAnalysis, useCancelAnalysis } from "@/lib/queries";
+import { useAnalysis, useCancelAnalysis, useMe } from "@/lib/queries";
 
 function ClaimCard({
   claim,
@@ -154,7 +157,16 @@ export default function AnalysisPage({
   const analysisId = Number(id);
   const { query, activity, isLive } = useAnalysis(analysisId);
   const cancel = useCancelAnalysis();
+  const me = useMe();
   const [sheetTarget, setSheetTarget] = useState<DocumentSheetTarget | null>(null);
+  const [shareOpen, setShareOpen] = useState(false);
+
+  // Owner-only share affordance (admins can't even read others' private work
+  // — private is absolute), shown only while the dossier is still private.
+  const canShare =
+    query.data?.visibility === "private" &&
+    query.data.owner_id != null &&
+    query.data.owner_id === me.data?.id;
 
   if (!Number.isFinite(analysisId)) {
     return (
@@ -192,12 +204,30 @@ export default function AnalysisPage({
                 Analysis #{query.data.id}
               </h1>
               <AnalysisStatusChip status={query.data.status} />
+              <VisibilityBadge visibility={query.data.visibility} showShared />
+              {query.data.visibility === "shared" ? (
+                <OwnerByline
+                  ownerId={query.data.owner_id}
+                  ownerName={query.data.owner_name}
+                />
+              ) : null}
               <span className="text-xs text-muted-foreground">
                 started {relativeTime(query.data.created_at)}
                 {query.data.finished_at
                   ? ` · finished ${relativeTime(query.data.finished_at)}`
                   : ""}
               </span>
+              {canShare ? (
+                <Button
+                  variant="outline"
+                  size="xs"
+                  className="ml-auto"
+                  onClick={() => setShareOpen(true)}
+                >
+                  <Share2Icon data-icon="inline-start" />
+                  Share
+                </Button>
+              ) : null}
             </div>
             <p className="max-w-prose text-sm leading-6 text-muted-foreground">
               {query.data.input_text}
@@ -234,6 +264,13 @@ export default function AnalysisPage({
           </div>
         </>
       )}
+
+      <ShareDossierDialog
+        kind="analysis"
+        id={analysisId}
+        open={shareOpen}
+        onOpenChange={setShareOpen}
+      />
 
       <DocumentSheet
         target={sheetTarget}

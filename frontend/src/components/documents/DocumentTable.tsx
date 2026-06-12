@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 
 import { StatusChip, WatchHitChip } from "@/components/shared/StatusChip";
+import { VisibilityBadge } from "@/components/shared/Visibility";
 import {
   Table,
   TableBody,
@@ -64,6 +65,8 @@ export function DocumentTable({ items }: { items: DocumentListItem[] }) {
               <TableCell>
                 <span className="flex items-center gap-1.5">
                   <StatusChip status={item.enrichment_status} />
+                  {/* Tenancy chip — renders only for private docs (Phase C). */}
+                  <VisibilityBadge visibility={item.visibility} />
                   {item.watch_hit ? <WatchHitChip /> : null}
                 </span>
               </TableCell>

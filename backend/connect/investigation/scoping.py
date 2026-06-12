@@ -231,11 +231,16 @@ async def build_scope_pack(conn: psycopg.AsyncConnection, *,
                            embedder: Embedder,
                            vectors: VectorIndex | None,
                            input_text: str, input_type: str,
-                           seed: InvestigationSeed) -> ScopePack:
-    anchors = await _resolve_anchors(conn, input_text, seed)
+                           seed: InvestigationSeed,
+                           viewer: int | None = None) -> ScopePack:
+    """``viewer`` = the dossier owner (tenancy design §5): the corpus
+    slice sees shared docs + the owner's own private docs. Derived rows
+    (mentions/events/edges) are I1-safe without predicates."""
+    anchors = await _resolve_anchors(conn, input_text, seed, viewer=viewer)
     doc_ids = await _corpus_slice(conn, embedder, vectors, input_text,
-                                  [a.entity_id for a in anchors])
-    documents = await _load_docs(conn, doc_ids)
+                                  [a.entity_id for a in anchors],
+                                  viewer=viewer)
+    documents = await _load_docs(conn, doc_ids, viewer=viewer)
     event_ids, stories = await _thread_membership(conn, doc_ids)
     edges = await _graph_expansion(conn, [a.entity_id for a in anchors],
                                    event_ids)
@@ -253,7 +258,8 @@ async def build_scope_pack(conn: psycopg.AsyncConnection, *,
 
 
 async def _resolve_anchors(conn: psycopg.AsyncConnection, text: str,
-                           seed: InvestigationSeed) -> list[AnchorEntity]:
+                           seed: InvestigationSeed, *,
+                           viewer: int | None = None) -> list[AnchorEntity]:
     """Alias-exact matches in the input text + top mentioned entities of
     the FTS doc hits; explicit entity/event/story seeds contribute their
     own entities. Capped at 6."""
@@ -301,7 +307,8 @@ async def _resolve_anchors(conn: psycopg.AsyncConnection, text: str,
 
     if len(found) < MAX_ANCHORS:
         try:
-            doc_ids = await fts_dao.rank_documents(conn, text, limit=10)
+            doc_ids = await fts_dao.rank_documents(conn, text, limit=10,
+                                                   viewer=viewer)
         except psycopg.Error:
             doc_ids = []
         for doc_id in doc_ids:
@@ -316,12 +323,13 @@ async def _resolve_anchors(conn: psycopg.AsyncConnection, text: str,
 
 async def _corpus_slice(conn: psycopg.AsyncConnection, embedder: Embedder,
                         vectors: VectorIndex | None, text: str,
-                        anchor_ids: list[int]) -> list[int]:
+                        anchor_ids: list[int], *,
+                        viewer: int | None = None) -> list[int]:
     # the shared hybrid path (retrieval layer): lexical + vector under RRF;
     # either leg degrades to empty and fusion of one list is that list
     fused = await hybrid_document_ids(
         conn, text, embedder=embedder, vectors=vectors,
-        lexical_k=FTS_TOP_K, vector_k=VEC_TOP_K)
+        lexical_k=FTS_TOP_K, vector_k=VEC_TOP_K, viewer=viewer)
 
     anchor_docs: list[int] = []
     if anchor_ids:
@@ -357,16 +365,20 @@ async def _corpus_slice(conn: psycopg.AsyncConnection, embedder: Embedder,
 
 
 async def _load_docs(conn: psycopg.AsyncConnection,
-                     doc_ids: list[int]) -> list[ScopeDoc]:
+                     doc_ids: list[int], *,
+                     viewer: int | None = None) -> list[ScopeDoc]:
     docs: list[ScopeDoc] = []
     for doc_id in doc_ids:
         cur = await conn.execute(
             "SELECT d.id, d.title, d.published_at, d.url,"
+            " d.visibility, d.owner_id,"
             " s.name AS source_name, s.credibility_tier"
             " FROM document d LEFT JOIN source s ON s.id = d.source_id"
             " WHERE d.id = %s", (doc_id,))
         row = await cur.fetchone()
-        if row is not None:
+        if row is not None and (viewer is None
+                                or row["visibility"] == "shared"
+                                or row["owner_id"] == viewer):
             docs.append(ScopeDoc(
                 document_id=row["id"], title=row["title"],
                 source_name=row["source_name"],

@@ -15,12 +15,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from connect.domain.enums import (
     BriefObjectType,
     BriefSection,
+    DocumentOrigin,
     EnrichmentStatus,
     LinkStatus,
     MediaType,
     PositionShiftStatus,
+    Role,
     SourceType,
     VectorBackend,
+    Visibility,
     WatchKind,
 )
 
@@ -29,13 +32,167 @@ class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True)
 
 
+# --- auth / tenancy (v0.2 Phase B) --------------------------------------------
+
+class CurrentUser(_Frozen):
+    """The authenticated requester — what GET /api/me serves and what
+    get_current_user hands every router."""
+    id: int
+    email: str
+    name: str | None = None
+    avatar_url: str | None = None
+    role: Role
+    created_at: str
+    last_login_at: str | None = None
+
+
+class AuthMethods(_Frozen):
+    """GET /api/auth/methods — which sign-in paths this deployment offers."""
+    google: bool
+    dev: bool
+
+
+class Invite(_Frozen):
+    email: str
+    invited_by: int | None = None
+    note: str | None = None
+    created_at: str
+
+
+class InviteCreate(_Frozen):
+    email: str
+    note: str | None = None
+
+
+# --- admin surface (v0.2 Phase D — tenancy design §5) ---------------------------
+
+class AdminUser(_Frozen):
+    """GET /api/admin/users row — app_user incl. the budget-override
+    columns (NULL override = role default: members from app_setting,
+    admins the purpose envelope)."""
+    id: int
+    email: str
+    name: str | None = None
+    avatar_url: str | None = None
+    role: Role
+    disabled: bool = False
+    daily_budget_usd: float | None = None
+    investigation_daily_budget_usd: float | None = None
+    created_at: str
+    last_login_at: str | None = None
+
+
+class AdminUserUpdate(_Frozen):
+    """PATCH /api/admin/users/{id} — absent fields are untouched; an
+    EXPLICIT null budget clears the override back to the role default
+    (model_fields_set distinguishes the two)."""
+    role: Role | None = None
+    disabled: bool | None = None
+    daily_budget_usd: float | None = Field(default=None, ge=0)
+    investigation_daily_budget_usd: float | None = Field(default=None,
+                                                         ge=0)
+
+
+class AdminSettings(_Frozen):
+    """GET/PATCH /api/admin/settings — the admin-editable budget globals,
+    EFFECTIVE values (app_setting when present, env default otherwise)."""
+    global_daily_budget_usd: float
+    daily_llm_budget_usd: float
+    investigation_daily_budget_usd: float
+    member_daily_budget_usd: float
+    member_investigation_daily_budget_usd: float
+
+
+class AdminSettingsUpdate(_Frozen):
+    """PATCH body — provided keys are upserted into app_setting (the only
+    writer besides first-boot seeding; design §9)."""
+    global_daily_budget_usd: float | None = Field(default=None, ge=0)
+    daily_llm_budget_usd: float | None = Field(default=None, ge=0)
+    investigation_daily_budget_usd: float | None = Field(default=None,
+                                                         ge=0)
+    member_daily_budget_usd: float | None = Field(default=None, ge=0)
+    member_investigation_daily_budget_usd: float | None = Field(
+        default=None, ge=0)
+
+
+# AdminSpend / AdminSpendUser live next to SpendDay below (definition
+# order keeps the forward references resolvable at class-build time).
+
+
+# --- visibility / sharing (v0.2 Phase C tenancy) -------------------------------
+
+class DocumentVisibilityUpdate(_Frozen):
+    """PATCH /api/documents/{id} — owner-only visibility flip."""
+    visibility: Visibility
+
+
+class DossierVisibilityUpdate(_Frozen):
+    """PATCH /api/analyses/{id} | /api/investigations/{id}.
+
+    private->shared runs the share cascade (design §1): cited private
+    documents the owner owns are auto-shared — but only once the caller
+    confirms (confirm_documents=true); the unconfirmed call answers 409
+    with the confirmation list. shared->private is always 409 (writeback
+    has compounded into the shared graph)."""
+    visibility: Visibility
+    confirm_documents: bool = False
+
+
+class ShareDocumentRef(_Frozen):
+    """One private document the share cascade would flip to shared."""
+    id: int
+    title: str | None = None
+
+
+class DossierVisibilityResult(_Frozen):
+    id: int
+    visibility: Visibility
+    # documents the cascade flipped to shared alongside the dossier
+    shared_document_ids: list[int] = Field(default_factory=list)
+
+
 # --- health ------------------------------------------------------------------
+
+class QueueDepth(_Frozen):
+    kind: str
+    status: str
+    count: int
+
+
+class SourcePollHealth(_Frozen):
+    id: int
+    name: str
+    last_polled_at: str | None = None
+    last_poll_status: str | None = None
+
+
+class BudgetHealth(_Frozen):
+    """Spend today vs the effective global backstop — numbers only, never
+    secrets (health is unauthenticated)."""
+    global_cap_usd: float
+    today_usd: float
+    general_today_usd: float
+    investigation_today_usd: float
+
+
+class HealthDeep(_Frozen):
+    """GET /api/health?deep=1 (runtime design §8): queue depth, beat
+    liveness, poll staleness, blob writability, budget state."""
+    pg_ok: bool = True
+    queue: list[QueueDepth] = Field(default_factory=list)
+    queue_oldest_seconds: float | None = None
+    beat_runs: dict[str, str] = Field(default_factory=dict)
+    sources: list[SourcePollHealth] = Field(default_factory=list)
+    blob_dir_writable: bool = True
+    budget: BudgetHealth | None = None
+
 
 class Health(_Frozen):
     ok: bool = True
     schema_version: int
     db_path: str
     vector_backend: VectorBackend
+    deep: HealthDeep | None = None
 
 
 # --- sources -------------------------------------------------------------------
@@ -128,6 +285,10 @@ class DocumentListItem(_Frozen):
     watch_hit: bool = False
     canonical_document_id: int | None = None
     snippet: str | None = None
+    # tenancy (v0.2 Phase C): owner NULL = system (polled / public web)
+    owner_id: int | None = None
+    visibility: Visibility = "shared"
+    origin: DocumentOrigin = "polled"
 
 
 class DocumentLink(_Frozen):
@@ -371,10 +532,46 @@ class SpendDay(_Frozen):
     cost_usd: float
 
 
+class SpendSlice(_Frozen):
+    """One ledger slice (mine, or the whole deployment): today's total
+    across ALL purposes, the general + investigation caps, daily rollups."""
+    today_usd: float
+    cap_usd: float | None = None
+    investigation_cap_usd: float | None = None
+    days: list[SpendDay] = Field(default_factory=list)
+
+
 class SpendReport(_Frozen):
+    """GET /api/spend. The v0.1 global fields stay frozen; Phase D adds
+    the per-user view (``mine``) and the deployment context (``global``,
+    serialized under that name — ``global`` is a Python keyword)."""
     daily_cap_usd: float
     today_spent_usd: float
     days: list[SpendDay] = Field(default_factory=list)
+    mine: SpendSlice | None = None
+    global_: SpendSlice | None = Field(default=None,
+                                       serialization_alias="global")
+
+
+class AdminSpendUser(_Frozen):
+    """One per-user row of GET /api/admin/spend; user_id None = system
+    jobs (polls, nightly sweeps). Caps are the EFFECTIVE ceilings."""
+    user_id: int | None = None
+    email: str | None = None
+    name: str | None = None
+    today_usd: float = 0.0
+    cap_usd: float | None = None
+    investigation_cap_usd: float | None = None
+    days: list[SpendDay] = Field(default_factory=list)
+
+
+class AdminSpend(_Frozen):
+    """GET /api/admin/spend — system totals + per-user/day breakdown
+    (tenancy design §4: GROUP BY user_id over the one ledger)."""
+    global_cap_usd: float
+    global_today_usd: float
+    days: list[SpendDay] = Field(default_factory=list)
+    users: list[AdminSpendUser] = Field(default_factory=list)
 
 
 class SearchResult(_Frozen):
@@ -417,6 +614,7 @@ class Watch(_Frozen):
     muted: bool = False
     last_seen_at: str | None = None
     created_at: str
+    user_id: int | None = None
 
 
 class WatchCreate(_Frozen):
@@ -543,6 +741,9 @@ class AnalysisOptions(_Frozen):
 class AnalysisCreate(_Frozen):
     input_text: str
     options: AnalysisOptions = Field(default_factory=AnalysisOptions)
+    # None -> the design §1 default: 'shared' (community compounding);
+    # 'private' is the explicit opt-in toggle at creation.
+    visibility: Visibility | None = None
 
 
 class AnalysisAccepted(_Frozen):
@@ -564,6 +765,9 @@ class AnalysisListItem(_Frozen):
     created_at: str
     finished_at: str | None = None
     verdict_summary: AnalysisVerdictSummary | None = None
+    visibility: Visibility = "shared"
+    owner_id: int | None = None
+    owner_name: str | None = None
 
 
 class AnalysisPage(_Frozen):
@@ -616,6 +820,9 @@ class AnalysisDetail(_Frozen):
     stages: list[AnalysisStageInfo] = Field(default_factory=list)
     claims: list[AnalysisClaimItem] = Field(default_factory=list)
     last_seq: int = 0
+    visibility: Visibility = "shared"
+    owner_id: int | None = None
+    owner_name: str | None = None
 
 
 # --- contradictions (Phase 3) ------------------------------------------------------

@@ -203,7 +203,8 @@ class Worker:
             return False
         job_id, kind = int(row["id"]), row["kind"]
         task = asyncio.create_task(self._run_job(job_id, kind,
-                                                 row["payload"] or {}),
+                                                 row["payload"] or {},
+                                                 row["owner_id"]),
                                    name=f"job-{job_id}-{kind}")
         self._running[job_id] = task
         self._running_kinds[kind] += 1
@@ -218,7 +219,8 @@ class Worker:
         self._wake.set()  # capacity freed — claim again now
 
     async def _run_job(self, job_id: int, kind: str,
-                       payload: dict[str, Any]) -> None:
+                       payload: dict[str, Any],
+                       owner_id: int | None = None) -> None:
         async with self.pool.connection() as conn:  # THE job's connection
             slot: int | None = None
             cap = self.cluster_caps.get(kind)
@@ -231,7 +233,7 @@ class Worker:
             self.heartbeater.add(job_id)
             try:
                 await execute_job(conn, self.services, job_id, kind,
-                                  payload)
+                                  payload, owner_id=owner_id)
             except asyncio.CancelledError:
                 pass  # terminal state already written by execute_job
             finally:

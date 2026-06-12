@@ -7,10 +7,12 @@ from fastapi.responses import JSONResponse
 
 import psycopg
 
-from connect.api.deps import get_container, get_db
+from connect.api.deps import get_container, get_current_user, get_db
 from connect.domain.models import (
+    CurrentUser,
     Document,
     DocumentPage,
+    DocumentVisibilityUpdate,
     IngestResult,
     JobAccepted,
 )
@@ -39,9 +41,15 @@ def _ingest_response(result: IngestResult) -> JSONResponse:
 @router.post("", response_model=Document, status_code=201)
 async def ingest_document(request: Request,
                           container: Container = Depends(get_container),
-                          db: psycopg.AsyncConnection = Depends(get_db)):
+                          db: psycopg.AsyncConnection = Depends(get_db),
+                          user: CurrentUser = Depends(get_current_user)):
     """Three request forms: multipart file upload (field 'file');
-    JSON {url}; JSON {text, title?}."""
+    JSON {url}; JSON {text, title?}.
+
+    Tenancy defaults (design §1): uploads and pasted text are the caller's
+    PRIVATE documents (origin user_upload/user_text, owner=:me, share
+    action available); URL ingests are public web content — shared,
+    system-owned, origin user_url."""
     pipeline = container.pipeline
     assert pipeline is not None
     content_type = request.headers.get("content-type", "")
@@ -55,7 +63,8 @@ async def ingest_document(request: Request,
                                     detail="multipart field 'file' is required")
             data = await upload.read()
             result = await pipeline.ingest_file(
-                db, upload.filename or "upload", data, upload.content_type)
+                db, upload.filename or "upload", data, upload.content_type,
+                owner_id=user.id, visibility="private")
             return _ingest_response(result)
 
         try:
@@ -66,11 +75,13 @@ async def ingest_document(request: Request,
             raise HTTPException(status_code=422, detail="JSON object expected")
 
         if body.get("url"):
-            result = await pipeline.ingest_url(db, str(body["url"]))
+            result = await pipeline.ingest_url(db, str(body["url"]),
+                                               origin="user_url")
             return _ingest_response(result)
         if body.get("text"):
             result = await pipeline.ingest_text(
-                db, str(body["text"]), title=body.get("title"))
+                db, str(body["text"]), title=body.get("title"),
+                owner_id=user.id, visibility="private")
             return _ingest_response(result)
         raise HTTPException(
             status_code=422,
@@ -89,27 +100,31 @@ async def list_documents(q: str | None = Query(default=None),
                          page: int = Query(default=1, ge=1),
                          page_size: int = Query(default=20, ge=1,
                                                 le=MAX_PAGE_SIZE),
-                         db: psycopg.AsyncConnection = Depends(get_db)):
+                         db: psycopg.AsyncConnection = Depends(get_db),
+                         user: CurrentUser = Depends(get_current_user)):
     if q:
         items, total = await fts_dao.search_documents(
             db, q, page=page, page_size=page_size,
-            source_id=source_id)
+            source_id=source_id, viewer=user.id)
     else:
         items, total = await doc_dao.list_page(
-            db, page=page, page_size=page_size, source_id=source_id)
+            db, page=page, page_size=page_size, source_id=source_id,
+            viewer=user.id)
     return DocumentPage(items=items, total=total, page=page,
                         page_size=page_size)
 
 
 @router.get("/{doc_id}", response_model=Document)
 async def get_document(doc_id: int,
-                       db: psycopg.AsyncConnection = Depends(get_db)):
-    document = await doc_dao.get(db, doc_id)
+                       db: psycopg.AsyncConnection = Depends(get_db),
+                       user: CurrentUser = Depends(get_current_user)):
+    document = await doc_dao.get(db, doc_id, viewer=user.id)
     if document is None:
         raise HTTPException(status_code=404, detail="document not found")
     return document.model_copy(update={
         "links": await link_dao.list_for_document(db, doc_id),
-        "linked_from": await link_dao.linked_from(db, doc_id),
+        "linked_from": await link_dao.linked_from(db, doc_id,
+                                                  viewer=user.id),
         "enrichment": await enrichment_dao.get_for_document(db, doc_id),
         "event": await event_dao.event_for_document(db, doc_id),
         "statements": await statement_dao.statements_for_document(
@@ -117,16 +132,53 @@ async def get_document(doc_id: int,
     })
 
 
+@router.patch("/{doc_id}", response_model=Document)
+async def patch_document(doc_id: int, body: DocumentVisibilityUpdate,
+                         db: psycopg.AsyncConnection = Depends(get_db),
+                         user: CurrentUser = Depends(get_current_user)):
+    """Owner-only visibility flip. private->shared requires no cascade —
+    the next enrichment sweep picks the doc up (design §1). shared->
+    private is 409 once the doc has compounded into the shared KB
+    (mentions/claims/statements would violate I1 retroactively)."""
+    document = await doc_dao.get(db, doc_id, viewer=user.id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    if document.owner_id != user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="only the document owner may change its visibility")
+    if body.visibility != document.visibility:
+        if body.visibility == "private" \
+                and await doc_dao.has_shared_derivatives(db, doc_id):
+            raise HTTPException(status_code=409, detail=(
+                "this document has already been enriched into the shared"
+                " knowledge base and cannot be made private"))
+        await doc_dao.set_visibility(db, doc_id, body.visibility)
+        document = await doc_dao.get(db, doc_id, viewer=user.id)
+        assert document is not None
+    return document
+
+
 @router.post("/{doc_id}/promote", response_model=JobAccepted,
              status_code=202)
 async def promote_document(doc_id: int,
                            container: Container = Depends(get_container),
-                           db: psycopg.AsyncConnection = Depends(get_db)):
+                           db: psycopg.AsyncConnection = Depends(get_db),
+                           user: CurrentUser = Depends(get_current_user)):
     """Queue a manual T2 promotion (event clustering + story threading;
     runs T1 first when the document hasn't been enriched yet)."""
     jobs = container.jobs
     assert container.enrichment is not None and jobs is not None
-    if await doc_dao.get(db, doc_id) is None:
+    document = await doc_dao.get(db, doc_id, viewer=user.id)
+    if document is None:
         raise HTTPException(status_code=404, detail="document not found")
-    job_id = await jobs.enqueue("enrich_t2", {"document_id": doc_id})
+    if document.visibility != "shared":
+        # I1 gate 1: promotion writes events/edges into the shared KB
+        raise HTTPException(status_code=409, detail=(
+            "a private document cannot be promoted into the shared"
+            " knowledge base — share it first"))
+    # manual promote charges the REQUESTING user (tenancy design §4):
+    # the job owner becomes the ambient spend user for the T1+T2 calls
+    job_id = await jobs.enqueue("enrich_t2", {"document_id": doc_id},
+                                owner_id=user.id)
     return JobAccepted(job_id=job_id)

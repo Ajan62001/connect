@@ -28,7 +28,11 @@ import html
 import psycopg
 
 from connect.domain.models import DocumentListItem
-from connect.storage.documents import _LIST_COLS, _to_list_item  # shared row mapping
+from connect.storage.documents import (  # shared row mapping + predicate
+    _LIST_COLS,
+    _to_list_item,
+    VISIBLE_SQL,
+)
 
 # Control-char markers so we can HTML-escape the document text *after*
 # ts_headline runs, then swap in the real <mark> tags — the client renders
@@ -50,12 +54,17 @@ def _escape_snippet(snip: str) -> str:
 
 
 async def count_documents(conn: psycopg.AsyncConnection, q: str, *,
-                          source_id: int | None = None) -> int:
-    """Corpus-wide lexical match count for the query."""
+                          source_id: int | None = None,
+                          viewer: int | None = None) -> int:
+    """Corpus-wide lexical match count for the query. ``viewer`` (a user
+    id) applies the tenancy visibility predicate; None = system view."""
     extra, params = "", [q]
     if source_id is not None:
-        extra = " AND d.source_id = %s"
+        extra += " AND d.source_id = %s"
         params.append(source_id)
+    if viewer is not None:
+        extra += " AND " + VISIBLE_SQL
+        params.append(viewer)
     cur = await conn.execute(
         f"SELECT COUNT(*) AS n FROM document d"
         f" WHERE d.search_tsv @@ {_TSQUERY}{extra}", params)
@@ -64,12 +73,16 @@ async def count_documents(conn: psycopg.AsyncConnection, q: str, *,
 
 async def rank_documents(conn: psycopg.AsyncConnection, q: str, *,
                          limit: int, offset: int = 0,
-                         source_id: int | None = None) -> list[int]:
+                         source_id: int | None = None,
+                         viewer: int | None = None) -> list[int]:
     """Cheap rank-ordered id query over the GIN index (no headlines)."""
     extra, params = "", [q]
     if source_id is not None:
-        extra = " AND d.source_id = %s"
+        extra += " AND d.source_id = %s"
         params.append(source_id)
+    if viewer is not None:
+        extra += " AND " + VISIBLE_SQL
+        params.append(viewer)
     cur = await conn.execute(
         f"SELECT d.id FROM document d"
         f" WHERE d.search_tsv @@ {_TSQUERY}{extra}"
@@ -80,18 +93,27 @@ async def rank_documents(conn: psycopg.AsyncConnection, q: str, *,
 
 
 async def hydrate_page(conn: psycopg.AsyncConnection, q: str,
-                       ids: list[int]) -> list[DocumentListItem]:
+                       ids: list[int], *,
+                       viewer: int | None = None) -> list[DocumentListItem]:
     """One final page of ids -> list items WITH escaped ts_headline
     snippets, preserving the given (rank/fusion) order. This is the only
-    place ts_headline runs — it is expensive on long documents."""
+    place ts_headline runs — it is expensive on long documents.
+
+    The viewer predicate applies here too: the vector leg of hybrid search
+    ranks over ALL embeddings, so a private doc id reaching this page must
+    drop out rather than hydrate."""
     if not ids:
         return []
+    extra, params = "", [q, _HEADLINE_OPTS, ids]
+    if viewer is not None:
+        extra = " AND " + VISIBLE_SQL
+        params.append(viewer)
     cur = await conn.execute(
         f"SELECT {_LIST_COLS},"
         f" ts_headline('english', d.content_text, {_TSQUERY}, %s) AS snip"
         f" FROM document d LEFT JOIN source s ON s.id = d.source_id"
-        f" WHERE d.id = ANY(%s)",
-        (q, _HEADLINE_OPTS, ids))
+        f" WHERE d.id = ANY(%s){extra}",
+        params)
     by_id = {r["id"]: r for r in await cur.fetchall()}
     return [_to_list_item(by_id[i], snippet=_escape_snippet(by_id[i]["snip"]))
             for i in ids if i in by_id]
@@ -100,6 +122,7 @@ async def hydrate_page(conn: psycopg.AsyncConnection, q: str,
 async def search_documents(conn: psycopg.AsyncConnection, q: str, *,
                            page: int = 1, page_size: int = 20,
                            source_id: int | None = None,
+                           viewer: int | None = None,
                            ) -> tuple[list[DocumentListItem], int]:
     """Rank-ordered full-text search returning list items with snippets.
 
@@ -107,11 +130,12 @@ async def search_documents(conn: psycopg.AsyncConnection, q: str, *,
     ids; the page is then hydrated WITH ts_headline (expensive on long
     documents — never run during ranking).
     """
-    total = await count_documents(conn, q, source_id=source_id)
+    total = await count_documents(conn, q, source_id=source_id,
+                                  viewer=viewer)
     page_ids = await rank_documents(conn, q, limit=page_size,
                                     offset=(page - 1) * page_size,
-                                    source_id=source_id)
-    return await hydrate_page(conn, q, page_ids), total
+                                    source_id=source_id, viewer=viewer)
+    return await hydrate_page(conn, q, page_ids, viewer=viewer), total
 
 
 async def match_document(conn: psycopg.AsyncConnection, query: str,

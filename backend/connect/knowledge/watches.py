@@ -44,17 +44,26 @@ def _word_boundary_match(terms: list[str], text: str) -> bool:
 async def match_document(conn: psycopg.AsyncConnection,
                          doc_id: int) -> list[int]:
     """Match one freshly-ingested document against all unmuted watches.
-    Returns the ids of watches that hit."""
+    Returns the ids of watches that hit.
+
+    Tenancy: a PRIVATE document matches only its OWNER's watches — a hit
+    row feeds the per-user brief (title lands in the payload), so another
+    user's watch must never fire on it. Shared docs match everyone's
+    watches; document.watch_hit stays the global "any watch fired" bit."""
     cur = await conn.execute(
-        "SELECT title, content_text FROM document WHERE id = %s",
+        "SELECT title, content_text, visibility, owner_id FROM document"
+        " WHERE id = %s",
         (doc_id,))
     row = await cur.fetchone()
     if row is None:
         return []
     text = (row["title"] or "") + "\n" + (row["content_text"] or "")
+    owner_only = (row["visibility"] == "private")
 
     hits: list[int] = []
     for watch in await watch_dao.list_active(conn):
+        if owner_only and watch.user_id != row["owner_id"]:
+            continue
         matched = False
         if watch.kind in ("topic", "search") and watch.query_fts:
             matched = await fts_dao.match_document(
@@ -73,10 +82,11 @@ async def match_document(conn: psycopg.AsyncConnection,
     return hits
 
 
-async def badges(conn: psycopg.AsyncConnection) -> dict[int, int]:
-    return await watch_dao.badges(conn)
+async def badges(conn: psycopg.AsyncConnection,
+                 user_id: int) -> dict[int, int]:
+    return await watch_dao.badges(conn, user_id)
 
 
-async def mark_seen(conn: psycopg.AsyncConnection,
-                    watch_id: int) -> Watch | None:
-    return await watch_dao.mark_seen(conn, watch_id)
+async def mark_seen(conn: psycopg.AsyncConnection, watch_id: int,
+                    user_id: int) -> Watch | None:
+    return await watch_dao.mark_seen(conn, watch_id, user_id=user_id)

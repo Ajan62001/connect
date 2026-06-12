@@ -10,11 +10,13 @@ import {
   RssIcon,
   ScaleIcon,
   SearchIcon,
+  ShieldIcon,
   SunIcon,
   TelescopeIcon,
+  UsersIcon,
 } from "lucide-react";
 
-import { useBriefToday, useOpenContradictionCount } from "@/lib/queries";
+import { useBriefToday, useMe, useOpenContradictionCount } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 
 const NAV_ITEMS = [
@@ -24,6 +26,7 @@ const NAV_ITEMS = [
   { href: "/search", label: "Search", icon: SearchIcon },
   { href: "/analyze", label: "Analyze", icon: FlaskConicalIcon },
   { href: "/investigations", label: "Investigations", icon: TelescopeIcon },
+  { href: "/community", label: "Community", icon: UsersIcon },
   { href: "/contradictions", label: "Contradictions", icon: ScaleIcon },
   { href: "/sources", label: "Sources", icon: DatabaseIcon },
   { href: "/watchlist", label: "Watchlist", icon: EyeIcon },
@@ -31,6 +34,9 @@ const NAV_ITEMS = [
 
 export function Sidebar() {
   const pathname = usePathname();
+
+  // Gates the admin section only — every /api/admin route 403s server-side.
+  const me = useMe();
 
   // Shared with the Today page (same query key); errors just mean no dot.
   const brief = useBriefToday();
@@ -97,6 +103,22 @@ export function Sidebar() {
           );
         })}
       </nav>
+      {me.data?.role === "admin" ? (
+        <div className="border-t p-2">
+          <Link
+            href="/admin/users"
+            className={cn(
+              "flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
+              pathname.startsWith("/admin")
+                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground",
+            )}
+          >
+            <ShieldIcon className="size-4" aria-hidden />
+            Admin
+          </Link>
+        </div>
+      ) : null}
       <div className="border-t p-3 text-xs text-muted-foreground">
         Phase 3 · analysis &amp; verification
       </div>

@@ -34,6 +34,7 @@ import psycopg
 from psycopg_pool import AsyncConnectionPool
 
 from connect.analysis.pipeline import AnalysisService
+from connect.auth.oauth import GoogleOAuth
 from connect.ingestion.blobs import BlobStore
 from connect.investigation.runner import InvestigationService
 from connect.ingestion.fetcher import Fetcher
@@ -50,7 +51,12 @@ from connect.knowledge.vector import VectorIndex, create_vector_index
 from connect.llm.anthropic_provider import AnthropicProvider
 from connect.llm.batch_runner import AnthropicBatchRunner
 from connect.llm.provider import LLMProvider
-from connect.llm.spend import INVESTIGATION_PURPOSES, Governor
+from connect.llm.spend import (
+    GENERAL_SCOPE,
+    INVESTIGATION_SCOPE,
+    Governor,
+    TenantGovernor,
+)
 from connect.llm.tiers import tier_models
 from connect.orchestration.bus import EventBus
 from connect.orchestration.config import Settings
@@ -112,6 +118,16 @@ class Container:
         # v8: investigation mode — its OWN daily governor + service.
         self.investigation_governor: Governor | None = None
         self.investigations: InvestigationService | None = None
+        # Phase B auth: Google OAuth client — None without credentials
+        # (the signin page then offers only the dev hatch, if enabled).
+        # Construction is offline (discovery is fetched lazily at first
+        # login), so building it here keeps create_app import-cheap.
+        self.google_oauth: GoogleOAuth | None = None
+        if (settings.google_oauth_client_id
+                and settings.google_oauth_client_secret):
+            self.google_oauth = GoogleOAuth(
+                settings.google_oauth_client_id,
+                settings.google_oauth_client_secret)
 
     # -- lifecycle --------------------------------------------------------------
 
@@ -136,13 +152,15 @@ class Container:
             # ON CONFLICT DO NOTHING — admin edits survive restarts
             await app_settings_dao.seed_defaults(conn, self.settings)
         # general governor excludes investigation spend; the investigation
-        # governor sees ONLY it — neither budget gates or charges the other
-        self.governor = Governor(
-            pool, self.settings.daily_llm_budget_usd,
-            exclude_purposes=INVESTIGATION_PURPOSES)
-        self.investigation_governor = Governor(
-            pool, self.settings.investigation_daily_budget_usd,
-            purposes=INVESTIGATION_PURPOSES)
+        # governor sees ONLY it — neither budget gates or charges the other.
+        # Phase D: both are TenantGovernors — the same purpose envelopes
+        # PLUS the GLOBAL $10/day backstop and the per-user ceilings
+        # (override column > app_setting member default > env), gated on
+        # the ambient job owner set by execute_job.
+        self.governor = TenantGovernor(pool, self.settings,
+                                       scope=GENERAL_SCOPE)
+        self.investigation_governor = TenantGovernor(
+            pool, self.settings, scope=INVESTIGATION_SCOPE)
         self.enrichment = EnrichmentService(
             provider=self.llm,
             batch_runner=self.batch_runner,

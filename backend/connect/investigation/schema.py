@@ -245,6 +245,9 @@ class InvestigationCreate(BaseModel):
     event_id: int | None = None
     story_id: int | None = None
     options: InvestigationOptions = InvestigationOptions()
+    # None -> 'shared' (design §1 default), or 'private' when the seed is a
+    # question of a private dossier; 'private' is the explicit opt-in.
+    visibility: str | None = None
 
 
 class InvestigationAccepted(_Frozen):
@@ -268,6 +271,9 @@ class InvestigationListItem(_Frozen):
     created_at: str
     finished_at: str | None = None
     counts: InvestigationCounts = InvestigationCounts()
+    visibility: str = "shared"
+    owner_id: int | None = None
+    owner_name: str | None = None
 
 
 class InvestigationPage(_Frozen):
@@ -340,3 +346,6 @@ class InvestigationDetail(_Frozen):
     counts: InvestigationCounts = InvestigationCounts()
     cost_usd: float = 0.0
     last_seq: int = 0
+    visibility: str = "shared"
+    owner_id: int | None = None
+    owner_name: str | None = None

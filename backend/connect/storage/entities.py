@@ -98,7 +98,12 @@ async def search(conn: psycopg.AsyncConnection, q: str, *,
 
 async def get_detail(conn: psycopg.AsyncConnection, entity_id: int, *,
                      co_occurring_limit: int = 20,
-                     documents_limit: int = 10) -> EntityDetail | None:
+                     documents_limit: int = 10,
+                     viewer: int | None = None) -> EntityDetail | None:
+    """The entity page aggregate. Derived rows (mentions/events/topics)
+    need no tenancy predicates — invariant I1 guarantees they reference
+    only shared documents; ``viewer`` scopes the per-user view_cursor
+    delta only."""
     cur = await conn.execute(
         f"WITH {_STATS_CTE}"
         f" SELECT e.*, st.mention_count, st.document_count,"
@@ -124,20 +129,25 @@ async def get_detail(conn: psycopg.AsyncConnection, entity_id: int, *,
         documents=(await documents_for(conn, entity_id, page=1,
                                        page_size=documents_limit))[0],
         events=await event_dao.events_for_entity(conn, entity_id, limit=10),
-        delta=await delta_since_cursor(conn, entity_id),
+        delta=await delta_since_cursor(conn, entity_id, viewer=viewer),
         has_views=await statement_dao.has_views(conn, entity_id),
     )
 
 
 async def delta_since_cursor(conn: psycopg.AsyncConnection,
-                             entity_id: int) -> EntityDelta | None:
-    """New events / documents / claims for the entity since its view_cursor
-    (surface='entity'); None when the page has never been visited.
+                             entity_id: int, *,
+                             viewer: int | None = None,
+                             ) -> EntityDelta | None:
+    """New events / documents / claims for the entity since the VIEWER's
+    view_cursor (surface='entity'); None when never visited (or when there
+    is no viewer — cursors are per-user).
 
     "New" means when the KNOWLEDGE arrived (each row's created_at), not the
     document's publication date — the DeltaBanner answers "what did the KB
     learn since I last looked"."""
-    cursor = await cursor_dao.get(conn, "entity", entity_id)
+    if viewer is None:
+        return None
+    cursor = await cursor_dao.get(conn, viewer, "entity", entity_id)
     if cursor is None:
         return None
     cur = await conn.execute(

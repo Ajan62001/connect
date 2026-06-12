@@ -1,11 +1,12 @@
 "use client";
 
-import { use } from "react";
+import { use, useState } from "react";
 import {
   ArrowLeftIcon,
   ExternalLinkIcon,
   FileQuestionIcon,
   Loader2Icon,
+  Share2Icon,
 } from "lucide-react";
 import Link from "next/link";
 import { toast } from "sonner";
@@ -14,7 +15,9 @@ import { EntityPill } from "@/components/entities/EntityPill";
 import { StatementsCard } from "@/components/views/StatementsCard";
 import { PageHeader } from "@/components/shared/PageHeader";
 import { QueryError } from "@/components/shared/QueryError";
+import { ShareDocumentDialog } from "@/components/shared/ShareDialog";
 import { StatusChip, WatchHitChip } from "@/components/shared/StatusChip";
+import { OwnerByline, VisibilityBadge } from "@/components/shared/Visibility";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -41,7 +44,7 @@ import {
   shortHash,
   urlHost,
 } from "@/lib/format";
-import { useDocument, useFetchDocumentLink } from "@/lib/queries";
+import { useDocument, useFetchDocumentLink, useMe } from "@/lib/queries";
 
 function MetaRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -296,11 +299,56 @@ function LinksCard({ document }: { document: Document }) {
   );
 }
 
+/**
+ * Visibility row + share affordance (tenancy Phase C). Uploads/pasted text
+ * default private (design §1); the owner shares from here. Renders nothing
+ * against a pre-tenancy backend (no `visibility` field).
+ */
+function VisibilityRow({ document }: { document: Document }) {
+  const me = useMe();
+  const [shareOpen, setShareOpen] = useState(false);
+
+  if (!document.visibility) return null;
+  const canShare =
+    document.visibility === "private" &&
+    document.owner_id != null &&
+    document.owner_id === me.data?.id;
+
+  return (
+    <MetaRow label="Visibility">
+      <span className="flex flex-wrap items-center gap-1.5">
+        <VisibilityBadge visibility={document.visibility} showShared />
+        {/* Documents carry owner_id only (no display name on this row). */}
+        <OwnerByline ownerId={document.owner_id} />
+        {canShare ? (
+          <Button variant="outline" size="xs" onClick={() => setShareOpen(true)}>
+            <Share2Icon data-icon="inline-start" />
+            Share
+          </Button>
+        ) : null}
+      </span>
+      {document.visibility === "private" ? (
+        <p className="mt-1 text-xs leading-snug text-muted-foreground">
+          Only you can see this document. Share it to make it readable by
+          every member and eligible for knowledge extraction.
+        </p>
+      ) : null}
+      <ShareDocumentDialog
+        id={document.id}
+        title={document.title}
+        open={shareOpen}
+        onOpenChange={setShareOpen}
+      />
+    </MetaRow>
+  );
+}
+
 function MetadataSidebar({ document }: { document: Document }) {
   return (
     <aside className="w-full shrink-0 lg:w-64">
       <dl className="space-y-4 rounded-xl border bg-card p-4">
         <MetaRow label="Source">{document.source_name ?? "Manual ingest"}</MetaRow>
+        <VisibilityRow document={document} />
         {document.event ? (
           <MetaRow label="Event">
             <Badge

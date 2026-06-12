@@ -48,14 +48,20 @@ async def hybrid_document_ids(conn: psycopg.AsyncConnection, q: str, *,
                               embedder: Embedder | None,
                               vectors: VectorIndex | None,
                               lexical_k: int = POOL_K,
-                              vector_k: int = POOL_K) -> list[int]:
+                              vector_k: int = POOL_K,
+                              viewer: int | None = None) -> list[int]:
     """Fused document ids, best-first: lexical ranking + vector KNN under
     RRF. Either leg degrades to an empty list (no embedder/vectors, a
     no-vector embedder, or a lexical error) — fusion of one list is that
-    list, so lexical-only deployments keep exact v0.1 ordering."""
+    list, so lexical-only deployments keep exact v0.1 ordering.
+
+    ``viewer`` filters the lexical leg; the vector leg ranks over ALL
+    embeddings (T0 embeds private docs too), so callers MUST apply the
+    visibility predicate when hydrating fused ids (fts.hydrate_page does)."""
     lex_ids: list[int] = []
     try:
-        lex_ids = await fts_dao.rank_documents(conn, q, limit=lexical_k)
+        lex_ids = await fts_dao.rank_documents(conn, q, limit=lexical_k,
+                                               viewer=viewer)
     except psycopg.Error:
         log.exception("lexical ranking failed")
     vec_ids: list[int] = []
@@ -71,18 +77,22 @@ async def search(conn: psycopg.AsyncConnection, q: str, *,
                  kind: SearchKind = "all",
                  limit: int = 20,
                  embedder: Embedder | None = None,
-                 vectors: VectorIndex | None = None) -> SearchResult:
+                 vectors: VectorIndex | None = None,
+                 viewer: int | None = None) -> SearchResult:
     documents, total_documents = [], 0
     entities, total_entities = [], 0
     if kind in ("all", "documents"):
         fused = await hybrid_document_ids(
             conn, q, embedder=embedder, vectors=vectors,
-            lexical_k=max(POOL_K, limit), vector_k=max(POOL_K, limit))
-        documents = await fts_dao.hydrate_page(conn, q, fused[:limit])
+            lexical_k=max(POOL_K, limit), vector_k=max(POOL_K, limit),
+            viewer=viewer)
+        documents = await fts_dao.hydrate_page(conn, q, fused[:limit],
+                                               viewer=viewer)
         # the corpus-wide lexical count, floored by what fusion actually
         # surfaced (vector-only hits are results the count can't see)
-        total_documents = max(await fts_dao.count_documents(conn, q),
-                              len(fused))
+        total_documents = max(
+            await fts_dao.count_documents(conn, q, viewer=viewer),
+            len(documents))
     if kind in ("all", "entities"):
         entities, total_entities = await entity_dao.search(conn, q,
                                                            limit=limit)

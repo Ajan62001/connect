@@ -1,4 +1,11 @@
-"""Watch aggregate DAO — CRUD + watch_hit rows + the badges query."""
+"""Watch aggregate DAO — CRUD + watch_hit rows + the badges query.
+
+v0.2 Phase C: watches are PERSONAL (watch.user_id NOT NULL). Every CRUD
+path scopes on the owning user (another user's watch reads as absent ->
+404 at the router); ``list_active(conn)`` without a user stays the global
+T0 matching view (every user's unmuted watches — match_document applies
+the private-doc owner gate itself).
+"""
 
 from __future__ import annotations
 
@@ -21,37 +28,52 @@ def _to_model(row: Mapping[str, Any]) -> Watch:
         muted=bool(row["muted"]),
         last_seen_at=row["last_seen_at"],
         created_at=row["created_at"],
+        user_id=row["user_id"],
     )
 
 
-async def insert(conn: psycopg.AsyncConnection, *, kind: str, label: str,
-                 query_fts: str | None = None, entity_id: int | None = None,
+async def insert(conn: psycopg.AsyncConnection, *, user_id: int, kind: str,
+                 label: str, query_fts: str | None = None,
+                 entity_id: int | None = None,
                  promote: bool = True, muted: bool = False) -> Watch:
     async with conn.transaction():
         cur = await conn.execute(
-            "INSERT INTO watch (kind, label, query_fts, entity_id, promote,"
-            " muted, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-            (kind, label, query_fts, entity_id, bool(promote), bool(muted),
-             utc_now()))
+            "INSERT INTO watch (user_id, kind, label, query_fts, entity_id,"
+            " promote, muted, created_at)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (user_id, kind, label, query_fts, entity_id, bool(promote),
+             bool(muted), utc_now()))
         watch_id = (await cur.fetchone())["id"]
     return await get(conn, watch_id)  # type: ignore[return-value]
 
 
-async def get(conn: psycopg.AsyncConnection, watch_id: int) -> Watch | None:
-    cur = await conn.execute(
-        "SELECT * FROM watch WHERE id = %s", (watch_id,))
+async def get(conn: psycopg.AsyncConnection, watch_id: int, *,
+              user_id: int | None = None) -> Watch | None:
+    sql, params = "SELECT * FROM watch WHERE id = %s", [watch_id]
+    if user_id is not None:
+        sql += " AND user_id = %s"
+        params.append(user_id)
+    cur = await conn.execute(sql, params)
     row = await cur.fetchone()
     return _to_model(row) if row else None
 
 
-async def list_all(conn: psycopg.AsyncConnection) -> list[Watch]:
-    cur = await conn.execute("SELECT * FROM watch ORDER BY id")
+async def list_all(conn: psycopg.AsyncConnection,
+                   user_id: int) -> list[Watch]:
+    cur = await conn.execute(
+        "SELECT * FROM watch WHERE user_id = %s ORDER BY id", (user_id,))
     return [_to_model(r) for r in await cur.fetchall()]
 
 
-async def list_active(conn: psycopg.AsyncConnection) -> list[Watch]:
-    cur = await conn.execute(
-        "SELECT * FROM watch WHERE NOT muted ORDER BY id")
+async def list_active(conn: psycopg.AsyncConnection,
+                      user_id: int | None = None) -> list[Watch]:
+    """Unmuted watches — all users' (the T0 matching view) or one user's
+    (the per-user brief sections)."""
+    sql, params = "SELECT * FROM watch WHERE NOT muted", []
+    if user_id is not None:
+        sql += " AND user_id = %s"
+        params.append(user_id)
+    cur = await conn.execute(sql + " ORDER BY id", params)
     return [_to_model(r) for r in await cur.fetchall()]
 
 
@@ -59,7 +81,8 @@ _PATCHABLE = ("label", "query_fts", "entity_id", "promote", "muted")
 
 
 async def update(conn: psycopg.AsyncConnection, watch_id: int,
-                 fields: dict[str, Any]) -> Watch | None:
+                 fields: dict[str, Any], *,
+                 user_id: int | None = None) -> Watch | None:
     sets, params = [], []
     for col in _PATCHABLE:
         if col not in fields:
@@ -70,27 +93,39 @@ async def update(conn: psycopg.AsyncConnection, watch_id: int,
         sets.append(f"{col} = %s")
         params.append(value)
     if sets:
+        sql = f"UPDATE watch SET {', '.join(sets)} WHERE id = %s"
+        params.append(watch_id)
+        if user_id is not None:
+            sql += " AND user_id = %s"
+            params.append(user_id)
         async with conn.transaction():
-            await conn.execute(
-                f"UPDATE watch SET {', '.join(sets)} WHERE id = %s",
-                (*params, watch_id))
-    return await get(conn, watch_id)
+            await conn.execute(sql, params)
+    return await get(conn, watch_id, user_id=user_id)
 
 
-async def delete(conn: psycopg.AsyncConnection, watch_id: int) -> bool:
+async def delete(conn: psycopg.AsyncConnection, watch_id: int, *,
+                 user_id: int | None = None) -> bool:
+    sql, params = "DELETE FROM watch WHERE id = %s", [watch_id]
+    if user_id is not None:
+        sql += " AND user_id = %s"
+        params.append(user_id)
     async with conn.transaction():
-        cur = await conn.execute(
-            "DELETE FROM watch WHERE id = %s", (watch_id,))
+        cur = await conn.execute(sql, params)
     return cur.rowcount > 0
 
 
-async def mark_seen(conn: psycopg.AsyncConnection,
-                    watch_id: int) -> Watch | None:
+async def mark_seen(conn: psycopg.AsyncConnection, watch_id: int, *,
+                    user_id: int | None = None) -> Watch | None:
+    sql = "UPDATE watch SET last_seen_at = %s WHERE id = %s"
+    params: list[Any] = [utc_now(), watch_id]
+    if user_id is not None:
+        sql += " AND user_id = %s"
+        params.append(user_id)
     async with conn.transaction():
-        await conn.execute(
-            "UPDATE watch SET last_seen_at = %s WHERE id = %s",
-            (utc_now(), watch_id))
-    return await get(conn, watch_id)
+        cur = await conn.execute(sql, params)
+    if cur.rowcount == 0:
+        return None
+    return await get(conn, watch_id, user_id=user_id)
 
 
 async def insert_hit(conn: psycopg.AsyncConnection, watch_id: int,
@@ -105,12 +140,14 @@ async def insert_hit(conn: psycopg.AsyncConnection, watch_id: int,
     return cur.rowcount > 0
 
 
-async def badges(conn: psycopg.AsyncConnection) -> dict[int, int]:
-    """Unread watch_hit counts past each watch's read cursor."""
+async def badges(conn: psycopg.AsyncConnection,
+                 user_id: int) -> dict[int, int]:
+    """Unread watch_hit counts past each of the USER's watches' cursors."""
     cur = await conn.execute(
         "SELECT w.id, COUNT(h.object_id) AS unread"
         " FROM watch w LEFT JOIN watch_hit h"
         "   ON h.watch_id = w.id"
         "   AND h.created_at > COALESCE(w.last_seen_at, '1970-01-01')"
-        " WHERE NOT w.muted GROUP BY w.id")
+        " WHERE NOT w.muted AND w.user_id = %s GROUP BY w.id",
+        (user_id,))
     return {int(r["id"]): int(r["unread"]) for r in await cur.fetchall()}

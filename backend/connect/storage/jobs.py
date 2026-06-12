@@ -31,10 +31,11 @@ CHANNEL_JOB_EVENTS = "job_events"
 
 TERMINAL_STATUSES = ("done", "failed", "cancelled")
 
-# Claim returns the full row in this order (the worker needs kind+payload).
+# Claim returns the full row in this order (the worker needs kind+payload;
+# owner_id rides along so execute_job can set the ambient spend user).
 _CLAIM_COLUMN_NAMES = ("id", "kind", "priority", "payload", "dossier_id",
                        "status", "attempts", "max_attempts",
-                       "cancel_requested", "claimed_by")
+                       "cancel_requested", "claimed_by", "owner_id")
 _CLAIM_COLUMNS = ", ".join(_CLAIM_COLUMN_NAMES)
 # the UPDATE..FROM form must qualify (both job and the CTE carry "id")
 _CLAIM_COLUMNS_J = ", ".join(f"j.{c}" for c in _CLAIM_COLUMN_NAMES)
@@ -57,8 +58,12 @@ async def create(conn: psycopg.AsyncConnection, kind: str,
                  payload: dict[str, Any] | None = None,
                  dossier_id: int | None = None, *,
                  priority: int = 50, max_attempts: int = 1,
-                 delay_s: float = 0.0) -> int:
+                 delay_s: float = 0.0, owner_id: int | None = None) -> int:
     """Enqueue: job row + ``job_new`` NOTIFY in one transaction.
+
+    ``owner_id`` is the acting user (NULL = system job) — it drives the
+    per-user interactive caps and the ambient spend attribution when a
+    worker executes the job.
 
     ``poll_source`` dedups against the partial unique index (at most one
     live poll job per source); a deduped enqueue returns the EXISTING live
@@ -73,12 +78,12 @@ async def create(conn: psycopg.AsyncConnection, kind: str,
         async with conn.transaction():
             cur = await conn.execute(
                 "INSERT INTO job (kind, priority, payload, dossier_id,"
-                " status, max_attempts, created_at, run_at)"
+                " status, max_attempts, created_at, run_at, owner_id)"
                 " VALUES (%s,%s,%s,%s,'queued',%s,%s,"
-                " now() + make_interval(secs => %s))"
+                " now() + make_interval(secs => %s), %s)"
                 + conflict + " RETURNING id",
                 (kind, priority, Jsonb(payload or {}), dossier_id,
-                 max_attempts, utc_now(), delay_s))
+                 max_attempts, utc_now(), delay_s, owner_id))
             row = await cur.fetchone()
             if row is not None:
                 await conn.execute("SELECT pg_notify(%s, %s)",

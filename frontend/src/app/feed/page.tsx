@@ -40,6 +40,9 @@ function EnrichNowButton() {
   const [confirmOpen, setConfirmOpen] = useState(false);
 
   const disabled = spend.isError;
+  // Sweeps are system-level spend: prefer the global envelope for the
+  // confirm copy, falling back to my slice on a my-spend-only response.
+  const sweepLedger = spend.data?.global ?? spend.data?.mine ?? null;
 
   function runSweep() {
     sweep.mutate(
@@ -85,8 +88,12 @@ function EnrichNowButton() {
               Synchronously enrich up to {SWEEP_LIMIT} pending documents
               through the T1 ladder. This calls the Anthropic API and spends
               real money
-              {spend.data
-                ? ` (today: ${formatUsd(spend.data.today_spent_usd)} of ${formatUsd(spend.data.daily_cap_usd)} cap used)`
+              {sweepLedger
+                ? ` (today: ${formatUsd(sweepLedger.today_usd)}${
+                    sweepLedger.cap_usd !== null
+                      ? ` of ${formatUsd(sweepLedger.cap_usd)} cap`
+                      : ""
+                  } used)`
                 : ""}
               .
             </DialogDescription>

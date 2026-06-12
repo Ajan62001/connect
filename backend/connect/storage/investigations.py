@@ -52,22 +52,37 @@ async def counts_for(conn: psycopg.AsyncConnection,
         docs_added=int(docs_added) if isinstance(docs_added, int) else 0)
 
 
+# the dossier tenancy read predicate (design §5): mine OR shared
+_DOSSIER_VISIBLE = "(d.owner_id = %s OR d.visibility = 'shared')"
+
+
 async def list_page(conn: psycopg.AsyncConnection, *, page: int = 1,
-                    page_size: int = 20) -> InvestigationPage:
+                    page_size: int = 20,
+                    viewer: int | None = None) -> InvestigationPage:
+    where, params = "", []
+    if viewer is not None:
+        where = f" AND {_DOSSIER_VISIBLE}"
+        params.append(viewer)
     cur = await conn.execute(
-        "SELECT COUNT(*) AS n FROM dossier WHERE kind = 'investigation'")
+        "SELECT COUNT(*) AS n FROM dossier d"
+        " WHERE d.kind = 'investigation'" + where, params)
     total = (await cur.fetchone())["n"]
     cur = await conn.execute(
-        "SELECT id, status, title, input_text, input_type, created_at,"
-        " finished_at FROM dossier WHERE kind = 'investigation'"
-        " ORDER BY id DESC LIMIT %s OFFSET %s",
-        (page_size, (page - 1) * page_size))
+        "SELECT d.id, d.status, d.title, d.input_text, d.input_type,"
+        " d.created_at, d.finished_at, d.visibility, d.owner_id,"
+        " u.name AS owner_name"
+        " FROM dossier d LEFT JOIN app_user u ON u.id = d.owner_id"
+        " WHERE d.kind = 'investigation'" + where +
+        " ORDER BY d.id DESC LIMIT %s OFFSET %s",
+        (*params, page_size, (page - 1) * page_size))
     rows = await cur.fetchall()
     items = [InvestigationListItem(
         id=r["id"], status=r["status"], title=r["title"],
         input_text=r["input_text"], input_type=r["input_type"],
         created_at=r["created_at"], finished_at=r["finished_at"],
         counts=await counts_for(conn, r["id"]),
+        visibility=r["visibility"], owner_id=r["owner_id"],
+        owner_name=r["owner_name"],
     ) for r in rows]
     return InvestigationPage(items=items, total=int(total), page=page,
                              page_size=page_size)
@@ -94,19 +109,25 @@ async def questions_for(conn: psycopg.AsyncConnection,
 
 
 async def findings_for(conn: psycopg.AsyncConnection,
-                       dossier_id: int) -> list[FindingInfo]:
+                       dossier_id: int, *,
+                       viewer: int | None = None) -> list[FindingInfo]:
     cur = await conn.execute(
         "SELECT * FROM finding WHERE dossier_id = %s ORDER BY id",
         (dossier_id,))
     out: list[FindingInfo] = []
+    vis_clause = (" AND (d.visibility = 'shared' OR d.owner_id = %s)"
+                  if viewer is not None else "")
     for r in await cur.fetchall():
+        params: tuple = ((r["id"], viewer) if viewer is not None
+                         else (r["id"],))
         ecur = await conn.execute(
             "SELECT fe.document_id, fe.quote, fe.quote_start, fe.quote_end,"
             " d.title, d.url, s.name AS source_name, s.credibility_tier"
             " FROM finding_evidence fe"
             " JOIN document d ON d.id = fe.document_id"
             " LEFT JOIN source s ON s.id = d.source_id"
-            " WHERE fe.finding_id = %s ORDER BY fe.id", (r["id"],))
+            " WHERE fe.finding_id = %s" + vis_clause + " ORDER BY fe.id",
+            params)
         evidence = [FindingEvidenceInfo(
             document_id=e["document_id"], quote=e["quote"],
             quote_start=e["quote_start"], quote_end=e["quote_end"],
@@ -130,10 +151,18 @@ async def last_seq(conn: psycopg.AsyncConnection, dossier_id: int) -> int:
 
 
 async def get_detail(conn: psycopg.AsyncConnection,
-                     dossier_id: int) -> InvestigationDetail | None:
+                     dossier_id: int, *,
+                     viewer: int | None = None,
+                     ) -> InvestigationDetail | None:
+    where, params = "", [dossier_id]
+    if viewer is not None:
+        where = f" AND {_DOSSIER_VISIBLE}"
+        params.append(viewer)
     cur = await conn.execute(
-        "SELECT * FROM dossier WHERE id = %s AND kind = 'investigation'",
-        (dossier_id,))
+        "SELECT d.*, u.name AS owner_name"
+        " FROM dossier d LEFT JOIN app_user u ON u.id = d.owner_id"
+        " WHERE d.id = %s AND d.kind = 'investigation'" + where,
+        params)
     dossier = await cur.fetchone()
     if dossier is None:
         return None
@@ -167,7 +196,9 @@ async def get_detail(conn: psycopg.AsyncConnection,
         created_at=dossier["created_at"], started_at=dossier["started_at"],
         finished_at=dossier["finished_at"], stages=stages,
         sections=sections, questions=await questions_for(conn, dossier_id),
-        findings=await findings_for(conn, dossier_id),
+        findings=await findings_for(conn, dossier_id, viewer=viewer),
         counts=await counts_for(conn, dossier_id),
         cost_usd=float(cost) if isinstance(cost, (int, float)) else 0.0,
-        last_seq=await last_seq(conn, dossier_id))
+        last_seq=await last_seq(conn, dossier_id),
+        visibility=dossier["visibility"], owner_id=dossier["owner_id"],
+        owner_name=dossier["owner_name"])

@@ -9,9 +9,10 @@ Examples:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated
 
-from pydantic import AliasChoices, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import AliasChoices, Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # backend/ directory (this file is backend/connect/orchestration/config.py)
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -56,6 +57,75 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices(
             "TWITTERAPI_IO_API_KEY", "CONNECT_TWITTERAPI_IO_API_KEY"),
     )
+
+    # --- auth (tenancy design §3, Phase B) -----------------------------------
+    # Google OAuth client credentials (Google Cloud Console — see README
+    # "Google sign-in"). Unset => Google login is unavailable and
+    # /api/auth/methods advertises google: false.
+    google_oauth_client_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "GOOGLE_OAUTH_CLIENT_ID", "CONNECT_GOOGLE_OAUTH_CLIENT_ID"),
+    )
+    google_oauth_client_secret: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "GOOGLE_OAUTH_CLIENT_SECRET", "CONNECT_GOOGLE_OAUTH_CLIENT_SECRET"),
+    )
+    # Signs ONLY the short-lived oauth_state handshake cookie (the app
+    # session is an opaque server-side row, not a signed token). Unset => an
+    # ephemeral per-process secret: fine for dev, but logins in-flight across
+    # a restart fail — set it in any real deployment.
+    session_secret: str | None = None
+    # Explicit OAuth redirect URI override. Default: derived from the
+    # callback request URL (honors --proxy-headers). Set it when the
+    # backend's own origin is not the one registered in Google Console,
+    # e.g. CONNECT_OAUTH_REDIRECT_URI=http://localhost:8001/api/auth/callback
+    oauth_redirect_uri: str | None = None
+    # Origin prefix for post-login redirects ("" = same origin, the Caddy
+    # topology). The split-port dev flow (frontend :3000, api :8001) sets
+    # CONNECT_FRONTEND_ORIGIN=http://localhost:3000 so the callback lands
+    # back on the frontend.
+    frontend_origin: str = ""
+    # Invite gate (default ON): new Google identities must be invited by an
+    # admin, be the first user ever (-> admin), or appear in admin_emails.
+    open_signup: bool = False
+    # Bootstrap override: these emails may always sign in and are created
+    # as admins (comma-separated or JSON list in the env).
+    admin_emails: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # DEV-ONLY login escape hatch: when set, POST /api/auth/dev-login signs
+    # in as exactly this email without Google (created on first use; invite
+    # gate bypassed — setting the env IS the authorization). NEVER set in
+    # production; unset, the endpoint refuses to exist (404).
+    dev_login_email: str | None = None
+    # Sessions: opaque httpOnly cookie, sliding TTL, hard cap from creation.
+    session_ttl_days: int = 30
+    session_max_days: int = 90
+    # Sliding-expiry writes happen at most once per this interval.
+    session_touch_seconds: int = 3600
+    # Origin-check middleware (CSRF defense-in-depth): state-changing
+    # requests carrying an Origin header must match the request's own host
+    # or one of these (the Next dev rewrite forwards the browser's :3000
+    # Origin while the backend sees its own Host). Add your LAN origin
+    # (e.g. http://192.168.1.20:3000) when serving the dev stack over LAN.
+    # Comma-separated or JSON list in the env.
+    allowed_origins: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["http://localhost:3000",
+                                 "http://127.0.0.1:3000"])
+
+    @field_validator("admin_emails", "allowed_origins", mode="before")
+    @classmethod
+    def _split_csv(cls, v: object) -> object:
+        """Accept 'a@x.com,b@y.com' or '["a@x.com"]' alongside a real list
+        (NoDecode skips pydantic-settings' JSON pass, so the raw env string
+        lands here)."""
+        if isinstance(v, str):
+            text = v.strip()
+            if text.startswith("["):
+                import json
+                return json.loads(text)
+            return [part.strip() for part in text.split(",") if part.strip()]
+        return v
 
     # storage — PostgreSQL DSN (v0.2; CONNECT_DATABASE_URL)
     database_url: str = "postgresql://connect:connect@127.0.0.1:5432/connect"
@@ -123,9 +193,17 @@ class Settings(BaseSettings):
     # wired in the safety/ops phase alongside the governors)
     llm_max_concurrent: int = 4
     # backpressure → 429 on POST /analyses|/investigations (runtime design
-    # §5; enforced with auth, when requests carry a user)
+    # §5; enforced in api/limits.py against job.owner_id)
     user_max_interactive: int = 2
     interactive_queue_limit: int = 20
+    # per-user API rate limits (tenancy design §4 — the slowapi pick's
+    # `limits` engine driven directly; in-memory moving windows, per
+    # process: restarts reset them, the PG governors remain the hard cost
+    # backstop). SSE endpoints are exempt.
+    rate_limit_enabled: bool = True
+    rate_limit_read_per_minute: int = 120
+    rate_limit_ingest_per_minute: int = 10
+    rate_limit_create_per_minute: int = 5
     # sync fast-path: enrich watch-hit / fact-checker docs right after ingest
     enrich_fast_path_enabled: bool = True
     # how often an enrich_t1_batch job polls the Message Batch status

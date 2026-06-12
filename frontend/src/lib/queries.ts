@@ -16,6 +16,8 @@ import {
 import * as api from "@/lib/api";
 import { ANALYSIS_EVENT_NAMES, INVESTIGATION_EVENT_NAMES } from "@/lib/api";
 import type {
+  AdminSettingsUpdate,
+  AdminUserUpdate,
   AnalysisCreate,
   AnalysisDetail,
   AnalysisEvent,
@@ -34,6 +36,7 @@ import type {
   InvestigationDetail,
   InvestigationEvent,
   InvestigationListParams,
+  InviteCreate,
   SearchKind,
   SourceCreate,
   SourceTestRequest,
@@ -45,6 +48,8 @@ import type {
 
 export const queryKeys = {
   health: ["health"] as const,
+  me: ["me"] as const,
+  authMethods: ["auth", "methods"] as const,
   sources: ["sources"] as const,
   documents: ["documents"] as const,
   documentList: (params: DocumentListParams) =>
@@ -83,6 +88,11 @@ export const queryKeys = {
   investigationList: (params: InvestigationListParams) =>
     ["investigations", "list", params] as const,
   investigation: (id: number) => ["investigations", "detail", id] as const,
+  admin: ["admin"] as const,
+  adminUsers: ["admin", "users"] as const,
+  adminInvites: ["admin", "invites"] as const,
+  adminSettings: ["admin", "settings"] as const,
+  adminSpend: (days: number) => ["admin", "spend", days] as const,
 };
 
 // --------------------------------------------------------------------------
@@ -96,6 +106,79 @@ export function useHealth() {
     refetchInterval: 30_000,
     retry: false,
   });
+}
+
+// --------------------------------------------------------------------------
+// Auth (v0.2 Phase B)
+// --------------------------------------------------------------------------
+
+/**
+ * The signed-in user. `retry: false` because the interesting failure is a
+ * 401, and the fetch wrapper already redirects to /signin on it.
+ */
+export function useMe() {
+  return useQuery({
+    queryKey: queryKeys.me,
+    queryFn: api.getMe,
+    retry: false,
+    staleTime: 60_000,
+  });
+}
+
+/** Which sign-in buttons to render (open endpoint; signin page only). */
+export function useAuthMethods() {
+  return useQuery({
+    queryKey: queryKeys.authMethods,
+    queryFn: api.getAuthMethods,
+    retry: 1,
+    staleTime: Infinity,
+  });
+}
+
+/** Dev-hatch sign-in; the caller navigates on success. */
+export function useDevLogin() {
+  return useMutation({ mutationFn: api.devLogin });
+}
+
+/**
+ * Sign out: server session destroyed, then a HARD navigation to /signin —
+ * a full load drops every cached query of the previous user. The explicit
+ * clear() is belt-and-braces: nothing of the signed-out user survives even
+ * if the navigation is delayed (slow unload, devtools pause, bfcache).
+ */
+export function useLogout() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: api.logout,
+    onSuccess: () => {
+      queryClient.clear();
+      window.location.assign("/signin");
+    },
+  });
+}
+
+/**
+ * Tenancy guard against cross-user cache leaks (design §6): when the
+ * signed-in user *changes* within one JS lifetime (every current login path
+ * is a hard navigation, but nothing guarantees that forever), drop the whole
+ * query cache — watches, briefs, today, spend, dossier lists are all
+ * per-user now. Mounted once inside the QueryClientProvider.
+ */
+export function useUserSwitchCacheReset() {
+  const queryClient = useQueryClient();
+  const me = useMe();
+  const meId = me.data?.id;
+  const lastUserIdRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (meId === undefined) return; // loading / signed out — nothing to compare
+    if (lastUserIdRef.current !== null && lastUserIdRef.current !== meId) {
+      // A different user is now signed in: every cached query (including the
+      // /api/me just observed) belongs to the previous user's view. clear()
+      // wipes the cache; active observers refetch as the new user.
+      queryClient.clear();
+    }
+    lastUserIdRef.current = meId;
+  }, [meId, queryClient]);
 }
 
 // --------------------------------------------------------------------------
@@ -227,6 +310,26 @@ export function useFetchDocumentLink(documentId: number) {
   });
 }
 
+/**
+ * Shares a private document (uploads/pasted text default private, design §1).
+ * One-way in practice: once shared, the doc becomes enrichment-eligible and
+ * compounds into the shared KB. Refreshes the detail plus every listing the
+ * newly-visible document can appear in.
+ */
+export function useShareDocument() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.setDocumentVisibility(id, "shared"),
+    // Invalidate rather than seed from the response: the PATCH may answer
+    // with a slimmer row than the GET detail payload.
+    onSuccess: (_document, id) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.document(id) });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.documents });
+      void queryClient.invalidateQueries({ queryKey: ["feed"] });
+    },
+  });
+}
+
 // --------------------------------------------------------------------------
 // Entities (Phase 1)
 // --------------------------------------------------------------------------
@@ -326,10 +429,15 @@ export function useSearch(q: string, kind: SearchKind) {
 // LLM spend / enrichment sweeps (Phase 1)
 // --------------------------------------------------------------------------
 
+/**
+ * Normalized spend view: my spend (Phase D backend) + the global envelope;
+ * `mine` is null against a pre-Phase-D backend and consumers fall back to
+ * the global slice (see api.normalizeSpend).
+ */
 export function useSpend(days = 7) {
   return useQuery({
     queryKey: queryKeys.spend(days),
-    queryFn: () => api.getSpend(days),
+    queryFn: () => api.getSpendView(days),
     refetchInterval: 60_000,
     retry: false,
   });
@@ -558,6 +666,32 @@ export function useCancelAnalysis() {
       // 202 — cancellation is async; refetch so the status flips when it lands.
       void queryClient.invalidateQueries({ queryKey: queryKeys.analysis(id) });
       void queryClient.invalidateQueries({ queryKey: queryKeys.analyses });
+    },
+  });
+}
+
+/** Both halves of the two-step share PATCH (see api.setAnalysisVisibility):
+ *  `confirm: false` probes; `confirm: true` runs the document cascade. */
+export interface ShareDossierInput {
+  id: number;
+  confirm: boolean;
+}
+
+/**
+ * Flips a private analysis to shared (the confirmed call auto-shares cited
+ * private documents server-side, design §1) — so the document listings
+ * refresh too.
+ */
+export function useShareAnalysis() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, confirm }: ShareDossierInput) =>
+      api.setAnalysisVisibility(id, "shared", confirm),
+    onSuccess: (_result, { id }) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.analysis(id) });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.analyses });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.documents });
+      void queryClient.invalidateQueries({ queryKey: ["feed"] });
     },
   });
 }
@@ -903,6 +1037,23 @@ export function useCancelInvestigation() {
   });
 }
 
+/** Flips a private investigation to shared — see useShareAnalysis. */
+export function useShareInvestigation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, confirm }: ShareDossierInput) =>
+      api.setInvestigationVisibility(id, "shared", confirm),
+    onSuccess: (_result, { id }) => {
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.investigation(id),
+      });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.investigations });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.documents });
+      void queryClient.invalidateQueries({ queryKey: ["feed"] });
+    },
+  });
+}
+
 /**
  * Manual question recursion. `parentInvestigationId` lets the hook refresh
  * the parent snapshot so the question row picks up its spawned_dossier_id.
@@ -1216,3 +1367,94 @@ export function useInvestigation(id: number) {
 
 /** Stable empty buffer returned while activity state belongs to another id. */
 const NO_INVESTIGATION_ACTIVITY: InvestigationActivityLine[] = [];
+
+// --------------------------------------------------------------------------
+// Admin (v0.2 Phase D) — users / invites / settings / system spend
+// --------------------------------------------------------------------------
+
+// All admin reads use `retry: false`: the interesting failures are 403 (not
+// an admin) and 404 (backend hasn't shipped the endpoint yet) and both
+// should degrade immediately, not after a retry storm.
+
+export function useAdminUsers() {
+  return useQuery({
+    queryKey: queryKeys.adminUsers,
+    queryFn: api.listAdminUsers,
+    retry: false,
+  });
+}
+
+/** Role / disable / budget-override PATCH. Caps feed the spend dashboard
+ *  and (when editing yourself) the topbar badge, so both refresh. */
+export function useUpdateAdminUser() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, payload }: { id: number; payload: AdminUserUpdate }) =>
+      api.updateAdminUser(id, payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers });
+      void queryClient.invalidateQueries({ queryKey: ["admin", "spend"] });
+      void queryClient.invalidateQueries({ queryKey: ["spend"] });
+    },
+  });
+}
+
+export function useInvites() {
+  return useQuery({
+    queryKey: queryKeys.adminInvites,
+    queryFn: api.listInvites,
+    retry: false,
+  });
+}
+
+export function useCreateInvite() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: InviteCreate) => api.createInvite(payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminInvites });
+    },
+  });
+}
+
+export function useDeleteInvite() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (email: string) => api.deleteInvite(email),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminInvites });
+    },
+  });
+}
+
+export function useAdminSettings() {
+  return useQuery({
+    queryKey: queryKeys.adminSettings,
+    queryFn: api.getAdminSettings,
+    retry: false,
+  });
+}
+
+/** Global budget knobs (app_setting wins over env). Member caps may change,
+ *  so my-spend and the dashboard refresh alongside the settings. */
+export function useUpdateAdminSettings() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: AdminSettingsUpdate) =>
+      api.updateAdminSettings(payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminSettings });
+      void queryClient.invalidateQueries({ queryKey: ["admin", "spend"] });
+      void queryClient.invalidateQueries({ queryKey: ["spend"] });
+    },
+  });
+}
+
+export function useAdminSpend(days = 7) {
+  return useQuery({
+    queryKey: queryKeys.adminSpend(days),
+    queryFn: () => api.getAdminSpend(days),
+    refetchInterval: 60_000,
+    retry: false,
+  });
+}

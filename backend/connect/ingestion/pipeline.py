@@ -85,13 +85,19 @@ class IngestionPipeline:
                          source_id: int | None = None,
                          title: str | None = None, *,
                          published_at_hint: str | None = None,
-                         is_link_follow: bool = False) -> IngestResult:
+                         is_link_follow: bool = False,
+                         origin: str | None = None) -> IngestResult:
         """``title`` (e.g. the RSS entry headline) overrides the extracted
         page title — feed titles are editor-curated, while page <title>s can
         be generic shells (RBI's circular pages all say "Notifications").
         ``published_at_hint`` (the feed item's pubDate) likewise WINS over
         extracted metadata — PIB pages carry wrong embedded dates; the
-        extracted date stays as the fallback when no hint exists."""
+        extracted date stays as the fallback when no hint exists.
+
+        Tenancy (design §1): URL ingests are public web content — always
+        ``visibility='shared'``, ``owner_id=NULL``. ``origin`` defaults to
+        'polled' ('link_follow' on depth-1 ingests); user-initiated and
+        investigation fetches pass 'user_url'/'investigation_fetch'."""
         result = await self.fetcher.fetch(url)
         ctype = result.content_type.lower()
         is_pdf = ("pdf" in ctype) or result.final_url.lower().endswith(".pdf")
@@ -117,7 +123,8 @@ class IngestionPipeline:
             extracted = replace(extracted, published_at=published_at_hint)
         stored = await self._store(
             conn, extracted, raw=result.content, media_type=media_type,
-            url=url, canonical_url=result.final_url, source_id=source_id)
+            url=url, canonical_url=result.final_url, source_id=source_id,
+            origin=origin or ("link_follow" if is_link_follow else "polled"))
         if stored.created and media_type == "html":
             await self._process_links(
                 conn, stored.document, raw=result.content,
@@ -126,7 +133,9 @@ class IngestionPipeline:
 
     async def ingest_file(self, conn: psycopg.AsyncConnection,
                           filename: str, data: bytes,
-                          content_type: str | None = None) -> IngestResult:
+                          content_type: str | None = None, *,
+                          owner_id: int | None = None,
+                          visibility: str = "shared") -> IngestResult:
         name = filename.lower()
         ctype = (content_type or "").lower()
         office_kind = detect_office_kind(
@@ -152,7 +161,9 @@ class IngestionPipeline:
                 text=extracted.text, title=filename, author=extracted.author,
                 published_at=extracted.published_at, language=extracted.language)
         stored = await self._store(conn, extracted, raw=data,
-                                   media_type=media_type)
+                                   media_type=media_type,
+                                   owner_id=owner_id, visibility=visibility,
+                                   origin="user_upload")
         if stored.created and media_type == "html":
             # No base URL for an upload: only absolute links are extractable.
             await self._process_links(
@@ -186,7 +197,10 @@ class IngestionPipeline:
 
     async def ingest_text(self, conn: psycopg.AsyncConnection, text: str,
                           title: str | None = None,
-                          source_id: int | None = None) -> IngestResult:
+                          source_id: int | None = None, *,
+                          owner_id: int | None = None,
+                          visibility: str = "shared",
+                          origin: str = "user_text") -> IngestResult:
         cleaned = text.strip()
         if not cleaned:
             raise ExtractionError("empty text")
@@ -195,7 +209,8 @@ class IngestionPipeline:
         extracted = Extracted(text=cleaned, title=title)
         return await self._store(
             conn, extracted, raw=text.encode("utf-8"), media_type="text",
-            source_id=source_id)
+            source_id=source_id, owner_id=owner_id, visibility=visibility,
+            origin=origin)
 
     # -- the one store path -------------------------------------------------------
 
@@ -203,7 +218,10 @@ class IngestionPipeline:
                      extracted: Extracted, *, raw: bytes, media_type: str,
                      url: str | None = None,
                      canonical_url: str | None = None,
-                     source_id: int | None = None) -> IngestResult:
+                     source_id: int | None = None,
+                     owner_id: int | None = None,
+                     visibility: str = "shared",
+                     origin: str = "polled") -> IngestResult:
         normalized = dedup.normalize_text(extracted.text)
         chash = dedup.content_hash(normalized)
 
@@ -215,7 +233,8 @@ class IngestionPipeline:
         canonical_id = await dedup.find_near_duplicate(
             conn, fingerprint,
             window_days=self.dedup_window_days,
-            max_hamming=self.simhash_max_hamming)
+            max_hamming=self.simhash_max_hamming,
+            owner_id=owner_id)
         status = "skipped_dup" if canonical_id is not None else "pending"
 
         blob_path = self.blobs.put(raw)
@@ -235,6 +254,9 @@ class IngestionPipeline:
             "enrichment_status": status,
             "simhash": dedup.to_signed64(fingerprint),
             "canonical_document_id": canonical_id,
+            "owner_id": owner_id,
+            "visibility": visibility,
+            "origin": origin,
         })
 
         # T0 hooks — never fatal to the ingest.
@@ -247,7 +269,10 @@ class IngestionPipeline:
 
         # Phase 1 fast path: watch-hit / fact-checker docs jump the nightly
         # batch — only for docs still 'pending' (near-dups stay T0-only).
-        if self.enrich_fast_path is not None and status == "pending":
+        # Private docs never enqueue: enrichment is gate 1 of invariant I1
+        # (the in-job eligibility check would skip them anyway).
+        if (self.enrich_fast_path is not None and status == "pending"
+                and visibility == "shared"):
             try:
                 await self.enrich_fast_path(conn, doc_id, source_id,
                                             bool(hits))

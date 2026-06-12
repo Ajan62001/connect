@@ -68,26 +68,29 @@ class AnalysisService:
 
     # -- start / cancel -----------------------------------------------------------
 
-    async def start(self, input_text: str, *,
+    async def start(self, input_text: str, *, owner_id: int,
+                    visibility: str = "shared",
                     max_evidence_per_claim: int | None = None,
                     ) -> tuple[int, int]:
         """Create the dossier + enqueue the job (the registered 'analysis'
         handler reconstructs the run from the payload). Returns
         (analysis_id, job_id). Caller has validated input_text and
-        provider presence."""
+        provider presence; ``owner_id`` is the requesting user, visibility
+        defaults to 'shared' (design §1 — community compounding)."""
         k = max_evidence_per_claim or self.default_max_evidence
         async with self.pool.connection() as conn:
             async with conn.transaction():
                 cur = await conn.execute(
                     "INSERT INTO dossier (input_text, input_type, status,"
-                    " created_at) VALUES (%s, 'claim', 'pending', %s)"
+                    " created_at, owner_id, visibility)"
+                    " VALUES (%s, 'claim', 'pending', %s, %s, %s)"
                     " RETURNING id",
-                    (input_text, utc_now()))
+                    (input_text, utc_now(), owner_id, visibility))
                 dossier_id = int((await cur.fetchone())["id"])
         job_id = await self.jobs.enqueue(
             "analysis",
             {"dossier_id": dossier_id, "max_evidence_per_claim": k},
-            dossier_id=dossier_id)
+            dossier_id=dossier_id, owner_id=owner_id)
         return dossier_id, job_id
 
     async def job_for(self, dossier_id: int) -> int | None:
@@ -106,7 +109,8 @@ class AnalysisService:
         already-terminal dossiers."""
         async with self.pool.connection() as conn:
             cur = await conn.execute(
-                "SELECT status FROM dossier WHERE id = %s",
+                "SELECT status FROM dossier WHERE id = %s"
+                " AND kind = 'analysis'",
                 (dossier_id,))
             row = await cur.fetchone()
             if row is None or row["status"] not in ("pending", "running"):
@@ -131,7 +135,8 @@ class AnalysisService:
             raise LLMError("LLM provider not configured "
                            "(ANTHROPIC_API_KEY not set)")
         cur = await conn.execute(
-            "SELECT input_text FROM dossier WHERE id = %s",
+            "SELECT input_text, owner_id, visibility FROM dossier"
+            " WHERE id = %s",
             (dossier_id,))
         row = await cur.fetchone()
         if row is None:
@@ -147,7 +152,11 @@ class AnalysisService:
             ingest=self.ingest, embedder=self.embedder,
             vectors=self.vectors, dossier_id=dossier_id,
             max_evidence_per_claim=k,
-            emit=_emit)
+            emit=_emit,
+            # gate 2 (I1): private dossiers never write the shared KB;
+            # retrieval runs as the dossier owner (shared + own-private)
+            shared=(row["visibility"] == "shared"),
+            viewer=row["owner_id"])
 
         await self._set_dossier(conn, dossier_id, "running", started=True)
         stage = "normalize"

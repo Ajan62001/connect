@@ -40,8 +40,9 @@ legacy lineage, via connect/tools/legacy_sqlite). Properties:
   (source.type='search' -> investigation_fetch, source_id -> polled,
   document_link.resolved_document_id -> link_follow, url -> user_url, else
   user_text owned by the admin); llm_call/job history stays system
-  (user/owner NULL). Without ``--owner-email`` the user columns stay NULL
-  (the baseline schema is single-user-safe).
+  (user/owner NULL). ``--owner-email`` is REQUIRED when the source carries
+  dossier/watch/brief/view_cursor rows — those columns are NOT NULL since
+  schema v3 (Phase C tenancy); the run refuses loudly without it.
 - v2 queue columns: job.run_at = created_at; priority/max_attempts follow
   workers.queue's per-kind policy. Runtime state tables (fetch_domain,
   robots_cache, beat_run) and meta start fresh. Auth tables (user_session,
@@ -824,6 +825,20 @@ def run_etl(sqlite_path: str, pg_dsn: str, *,
     sq = _open_source(sqlite_path)
     try:
         report.source_version = _source_preflight(sq)
+
+        # v3 tenancy: dossier.owner_id and watch/brief/view_cursor.user_id
+        # are NOT NULL — sources carrying such rows REQUIRE --owner-email
+        # (design §7's bootstrap rule). Refuse loudly, never guess.
+        if not owner_email:
+            needy = [t for t in ("dossier", "watch", "brief", "view_cursor")
+                     if sq.execute(
+                         f"SELECT 1 FROM {t} LIMIT 1").fetchone()]
+            if needy:
+                raise SystemExit(
+                    "--owner-email is required: the source has rows in "
+                    + ", ".join(needy)
+                    + " and the v3 schema requires an owner (the rows are"
+                      " backfilled to that admin user)")
 
         # Target schema via the app's own bootstrap (advisory-lock guarded).
         asyncio.run(pg_mod.init_db(pg_dsn))

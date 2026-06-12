@@ -27,9 +27,11 @@ class ImmediateQueue(PgJobQueue):
     async def enqueue(self, kind: str, payload: dict[str, Any], *,
                       dossier_id: int | None = None,
                       priority: int | None = None,
-                      delay_s: float = 0.0) -> int:
+                      delay_s: float = 0.0,
+                      owner_id: int | None = None) -> int:
         job_id = await super().enqueue(kind, payload, dossier_id=dossier_id,
-                                       priority=priority, delay_s=delay_s)
+                                       priority=priority, delay_s=delay_s,
+                                       owner_id=owner_id)
         self._pending.append((job_id, kind, dict(payload)))
         return job_id
 
@@ -53,7 +55,8 @@ class ImmediateQueue(PgJobQueue):
                     if claimed is None:
                         continue
                     await execute_job(conn, self.services, job_id, kind,
-                                      payload)
+                                      payload,
+                                      owner_id=claimed["owner_id"])
             except asyncio.CancelledError:
                 pass  # the job row is already terminal ('cancelled')
             ran.append(job_id)

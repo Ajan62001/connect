@@ -7,6 +7,7 @@ import {
   CircleAlertIcon,
   FileQuestionIcon,
   FileSearchIcon,
+  Share2Icon,
   TelescopeIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -30,12 +31,14 @@ import { InvestigationStageTimeline } from "@/components/investigation/StageTime
 import { WatchNextPanel } from "@/components/investigation/WatchNextPanel";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { QueryError } from "@/components/shared/QueryError";
+import { ShareDossierDialog } from "@/components/shared/ShareDialog";
+import { OwnerByline, VisibilityBadge } from "@/components/shared/Visibility";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { InvestigationDetail, InvestigationFinding } from "@/lib/api";
 import { formatUsd, relativeTime } from "@/lib/format";
-import { useCancelInvestigation, useInvestigation } from "@/lib/queries";
+import { useCancelInvestigation, useInvestigation, useMe } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 
 function Section({
@@ -249,9 +252,18 @@ export default function InvestigationPage({
   const investigationId = Number(id);
   const { query, activity, isLive } = useInvestigation(investigationId);
   const cancel = useCancelInvestigation();
+  const me = useMe();
   const [sheetTarget, setSheetTarget] = useState<DocumentSheetTarget | null>(
     null,
   );
+  const [shareOpen, setShareOpen] = useState(false);
+
+  // Owner-only share affordance (admins can't even read others' private work
+  // — private is absolute), shown only while the dossier is still private.
+  const canShare =
+    query.data?.visibility === "private" &&
+    query.data.owner_id != null &&
+    query.data.owner_id === me.data?.id;
 
   if (!Number.isFinite(investigationId)) {
     return (
@@ -295,6 +307,13 @@ export default function InvestigationPage({
                   follow-up
                 </Badge>
               ) : null}
+              <VisibilityBadge visibility={query.data.visibility} showShared />
+              {query.data.visibility === "shared" ? (
+                <OwnerByline
+                  ownerId={query.data.owner_id}
+                  ownerName={query.data.owner_name}
+                />
+              ) : null}
               <span className="text-xs text-muted-foreground">
                 started {relativeTime(query.data.created_at)}
                 {query.data.finished_at
@@ -304,6 +323,17 @@ export default function InvestigationPage({
                   ? ` · ${formatUsd(query.data.cost_usd)}`
                   : ""}
               </span>
+              {canShare ? (
+                <Button
+                  variant="outline"
+                  size="xs"
+                  className="ml-auto"
+                  onClick={() => setShareOpen(true)}
+                >
+                  <Share2Icon data-icon="inline-start" />
+                  Share
+                </Button>
+              ) : null}
             </div>
           </div>
 
@@ -339,6 +369,13 @@ export default function InvestigationPage({
           </div>
         </>
       )}
+
+      <ShareDossierDialog
+        kind="investigation"
+        id={investigationId}
+        open={shareOpen}
+        onOpenChange={setShareOpen}
+      />
 
       <DocumentSheet
         target={sheetTarget}

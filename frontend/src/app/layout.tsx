@@ -2,8 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 
-import { Sidebar } from "@/components/shell/Sidebar";
-import { Topbar } from "@/components/shell/Topbar";
+import { AppShell } from "@/components/shell/AppShell";
 import { Toaster } from "@/components/ui/sonner";
 
 import { Providers } from "./providers";
@@ -42,17 +41,9 @@ export default function RootLayout({
       </head>
       <body className="h-screen overflow-hidden">
         <Providers>
-          <div className="flex h-full">
-            <Sidebar />
-            <div className="flex min-w-0 flex-1 flex-col">
-              <Topbar />
-              <main className="flex-1 overflow-y-auto">
-                <div className="mx-auto w-full max-w-6xl space-y-6 p-6">
-                  {children}
-                </div>
-              </main>
-            </div>
-          </div>
+          {/* Session-aware shell: /signin renders bare, everything else
+              renders sidebar/topbar behind the /api/me auth gate. */}
+          <AppShell>{children}</AppShell>
           <Toaster richColors position="bottom-right" />
         </Providers>
       </body>

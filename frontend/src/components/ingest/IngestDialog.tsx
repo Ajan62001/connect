@@ -22,6 +22,21 @@ import { cn } from "@/lib/utils";
 import { useIngest, type IngestInput } from "@/lib/queries";
 
 /**
+ * Tenancy hint (design §1): pasted text and uploads are stored PRIVATE to
+ * the uploader (shareable later from the document page); URL ingests fetch
+ * public web content and land straight in the shared corpus.
+ */
+function PrivacyHint({ mode }: { mode: "private" | "shared" }) {
+  return (
+    <p className="text-xs leading-snug text-muted-foreground">
+      {mode === "private"
+        ? "Stored privately — only you can see it until you share it from the document page."
+        : "Public web content — stored in the shared corpus, visible to every member."}
+    </p>
+  );
+}
+
+/**
  * Shared "+ Add to corpus" dialog: paste text, submit a URL, or upload a
  * PDF/txt file. On success navigates to the stored document's reading view.
  */
@@ -121,6 +136,7 @@ export function IngestDialog({
                 className="min-h-40"
               />
             </div>
+            <PrivacyHint mode="private" />
             <Button
               className="w-full"
               disabled={busy || text.trim().length === 0}
@@ -150,6 +166,7 @@ export function IngestDialog({
                 placeholder="https://pib.gov.in/PressReleasePage.aspx?PRID=…"
               />
             </div>
+            <PrivacyHint mode="shared" />
             <Button
               className="w-full"
               disabled={busy || !/^https?:\/\/\S+/.test(url.trim())}
@@ -197,6 +214,7 @@ export function IngestDialog({
                 </Button>
               </div>
             ) : null}
+            <PrivacyHint mode="private" />
             <Button
               className="w-full"
               disabled={busy || file === null}

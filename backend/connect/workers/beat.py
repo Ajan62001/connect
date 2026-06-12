@@ -11,10 +11,9 @@ over within ``retry_s``). Beat only ENQUEUES, never works:
 |               | partial unique index dedups)                            |
 | nightly batch | 'enrich_t1_batch' at CONNECT_NIGHTLY_SWEEP_UTC_HOUR,    |
 |               | guarded by a beat_run row (restarts don't double-fire)  |
-| brief pre-gen | 'brief_generate' per user active in the last 7 days,    |
-|               | run_at staggered over an hour. STUB until the auth      |
-|               | workstream writes app_user.last_login_at — the query    |
-|               | returns no rows today; inactive users stay on-demand.   |
+| brief pre-gen | 'brief_generate' per user active in the last 7 days     |
+|               | (last_login_at, stamped on login), run_at staggered     |
+|               | over an hour; inactive users stay on-demand.            |
 """
 
 from __future__ import annotations
@@ -124,10 +123,9 @@ async def tick(services: Any) -> dict[str, int]:
             await services.jobs.enqueue("enrich_t1_batch", {})
             counts["nightly"] = 1
 
-        # 4. brief pre-gen for 7-day-active users, staggered over an hour.
-        # STUB until auth lands: nothing writes last_login_at yet, so this
-        # enqueues nothing — the shape (guard, stagger, user fan-out) is
-        # what the auth workstream plugs into.
+        # 4. brief pre-gen for 7-day-active users (last_login_at is
+        # stamped on every login since Phase B), staggered over an hour;
+        # inactive users stay on-demand (locked decision).
         if await _nightly_due(conn, "brief_pregen",
                               settings.nightly_sweep_utc_hour):
             cur = await conn.execute(

@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Mapping
 
 import psycopg
 
@@ -287,7 +287,8 @@ class ToolExecutor:
                  state: InvestigationState,
                  emit: Callable[[str, dict[str, Any]], Awaitable[Any]],
                  web_source_id: int | None = None,
-                 t1_enrich: Callable[[int], Awaitable[bool]] | None = None):
+                 t1_enrich: Callable[[int], Awaitable[bool]] | None = None,
+                 viewer: int | None = None):
         self.conn = conn
         self.pipeline = pipeline
         self.search = search
@@ -298,6 +299,13 @@ class ToolExecutor:
         self.emit = emit
         self.web_source_id = web_source_id
         self.t1_enrich = t1_enrich
+        # the retrieval seam's viewer (design §5): the dossier OWNER —
+        # corpus reads see shared docs + the owner's own private docs
+        self.viewer = viewer
+
+    def _doc_visible(self, row: Mapping[str, Any]) -> bool:
+        return (row["visibility"] == "shared"
+                or row["owner_id"] == self.viewer)
 
     async def __call__(self, call: ToolCall) -> ToolOutcome:
         handler = getattr(self, f"_tool_{call.name}", None)
@@ -331,18 +339,19 @@ class ToolExecutor:
         # RRF; either leg degrades to empty, fusion of one list is the list
         fused = await hybrid_document_ids(
             self.conn, query, embedder=self.embedder, vectors=self.vectors,
-            lexical_k=top_k * 2, vector_k=top_k * 2)
+            lexical_k=top_k * 2, vector_k=top_k * 2, viewer=self.viewer)
 
         results: list[dict[str, Any]] = []
         for doc_id in fused:
             cur = await self.conn.execute(
                 "SELECT d.id, d.title, d.published_at, d.content_text,"
+                " d.visibility, d.owner_id,"
                 " s.name AS source_name, s.credibility_tier"
                 " FROM document d LEFT JOIN source s ON s.id = d.source_id"
                 " WHERE d.id = %s", (doc_id,))
             row = await cur.fetchone()
-            if row is None:
-                continue
+            if row is None or not self._doc_visible(row):
+                continue  # the vector leg ranks over ALL embeddings
             published = row["published_at"]
             if before and published and published[:10] >= str(before)[:10]:
                 continue
@@ -393,8 +402,10 @@ class ToolExecutor:
         if not url:
             return ToolOutcome(content="url is required", is_error=True)
         cur = await self.conn.execute(
-            "SELECT id, title FROM document WHERE url = %s"
-            " OR canonical_url = %s LIMIT 1", (url, url))
+            "SELECT id, title FROM document WHERE (url = %s"
+            " OR canonical_url = %s)"
+            " AND (visibility = 'shared' OR owner_id = %s) LIMIT 1",
+            (url, url, self.viewer))
         existing = await cur.fetchone()
         if existing is not None:
             self.state.touched_doc_ids.add(existing["id"])
@@ -409,8 +420,10 @@ class ToolExecutor:
         if self.pipeline is None:
             return ToolOutcome(content="ingestion pipeline unavailable",
                                is_error=True)
+        # public web content: shared, system-owned (design §1)
         result = await self.pipeline.ingest_url(
-            self.conn, url, source_id=self.web_source_id)
+            self.conn, url, source_id=self.web_source_id,
+            origin="investigation_fetch")
         self.state.web_fetches_used += 1
         doc = result.document
         self.state.touched_doc_ids.add(doc.id)
@@ -436,11 +449,12 @@ class ToolExecutor:
         offset = max(0, int(args.get("offset", 0) or 0))
         cur = await self.conn.execute(
             "SELECT d.id, d.title, d.url, d.published_at, d.content_text,"
+            " d.visibility, d.owner_id,"
             " s.name AS source_name, s.credibility_tier"
             " FROM document d LEFT JOIN source s ON s.id = d.source_id"
             " WHERE d.id = %s", (doc_id,))
         row = await cur.fetchone()
-        if row is None:
+        if row is None or not self._doc_visible(row):
             return ToolOutcome(content=f"document {doc_id} not found",
                                is_error=True)
         content = row["content_text"] or ""

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from connect.api.deps import get_container
+from connect.api.deps import get_container, require_admin
 from connect.domain.models import EnrichmentSweepRequest, JobAccepted
 from connect.orchestration.container import Container
 
-router = APIRouter(prefix="/enrichment", tags=["enrichment"])
+# manual sweep triggers spend the global budget — admin-only (design §5)
+router = APIRouter(prefix="/enrichment", tags=["enrichment"],
+                   dependencies=[Depends(require_admin)])
 
 
 @router.post("/sweep", response_model=JobAccepted, status_code=202)

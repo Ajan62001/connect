@@ -53,11 +53,15 @@ PURPOSE_T1 = "enrich_t1"
 
 _Row = Mapping[str, Any]
 
+# Gate 1 of invariant I1 (tenancy design §1): ONLY shared documents are
+# enrichment-eligible — private docs simply stay 'pending' and the next
+# sweep after a share picks them up; no special status, no special action.
 _ELIGIBLE_SQL = """
 SELECT d.id, d.title, d.content_text
 FROM document d
 LEFT JOIN source s ON s.id = d.source_id
 WHERE d.enrichment_status = 'pending'
+  AND d.visibility = 'shared'
   AND d.canonical_document_id IS NULL
   AND (s.id IS NULL OR NOT s.t1_exempt OR d.watch_hit)
 ORDER BY d.id
@@ -66,12 +70,14 @@ LIMIT %s
 
 # v9 backfill (target='statements'): docs already T1-enriched under a prompt
 # older than t1-v2 (no statement extraction yet). Full re-extraction —
-# persist_t1 is an idempotent per-doc replace.
+# persist_t1 is an idempotent per-doc replace. The visibility predicate is
+# belt-and-braces: enriched docs are shared by I1.
 _BACKFILL_STATEMENTS_SQL = """
 SELECT d.id, d.title, d.content_text
 FROM document d
 JOIN document_enrichment de ON de.document_id = d.id
 WHERE de.prompt_version < %s
+  AND d.visibility = 'shared'
 ORDER BY d.id
 LIMIT %s
 """
@@ -109,11 +115,14 @@ class EnrichmentService:
         Returns a short status string (job result)."""
         provider = self._require_provider()
         cur = await conn.execute(
-            "SELECT id, title, content_text, enrichment_status"
+            "SELECT id, title, content_text, enrichment_status, visibility"
             " FROM document WHERE id = %s", (document_id,))
         row = await cur.fetchone()
         if row is None:
             return f"document {document_id} not found"
+        if row["visibility"] != "shared":  # I1 gate 1 — same predicate as
+            return ("skipped: private document"  # the sweep's _ELIGIBLE_SQL
+                    " (stays pending until shared)")
         model = provider.model_for(ModelTier.FAST)
         try:
             await self.governor.check(
@@ -131,9 +140,14 @@ class EnrichmentService:
         'enrich_t2' job). Ensures T1 first (governor-checked), then runs T2
         with the 'manual' trigger. Returns a short status string."""
         cur = await conn.execute(
-            "SELECT id FROM document WHERE id = %s", (document_id,))
-        if await cur.fetchone() is None:
+            "SELECT id, visibility FROM document WHERE id = %s",
+            (document_id,))
+        row = await cur.fetchone()
+        if row is None:
             return f"document {document_id} not found"
+        if row["visibility"] != "shared":
+            # I1 gate 1: T2 writes events/edges/assignments — shared tables
+            return "skipped: private document cannot enter the shared KB"
         cur = await conn.execute(
             "SELECT 1 FROM document_enrichment WHERE document_id = %s",
             (document_id,))

@@ -33,6 +33,7 @@ from typing import Any, Protocol
 import psycopg
 from psycopg_pool import AsyncConnectionPool
 
+from connect.llm import spend
 from connect.orchestration import events
 from connect.storage import jobs as job_dao
 from connect.workers.registry import CancelToken, WorkerContext, handler_for
@@ -84,22 +85,30 @@ class JobQueue(Protocol):
     async def enqueue(self, kind: str, payload: dict[str, Any], *,
                       dossier_id: int | None = None,
                       priority: int | None = None,
-                      delay_s: float = 0.0) -> int: ...
+                      delay_s: float = 0.0,
+                      owner_id: int | None = None) -> int: ...
 
     async def request_cancel(self, job_id: int) -> bool: ...
 
 
 async def execute_job(conn: psycopg.AsyncConnection, services: Any,
                       job_id: int, kind: str,
-                      payload: dict[str, Any]) -> None:
+                      payload: dict[str, Any], *,
+                      owner_id: int | None = None) -> None:
     """Run one CLAIMED job: registry dispatch + the v0.1 terminal-state /
     event discipline (started -> done|error|cancelled). Shared by both
     queue modes and the ImmediateQueue test double so every path exercises
-    the REAL handlers."""
+    the REAL handlers.
+
+    THE attribution choke point (tenancy design §4): the job owner becomes
+    the ambient spend user for the whole handler task tree — every
+    record_call/TenantGovernor.check inside charges and gates the acting
+    user; system jobs (owner NULL) charge only the global envelopes."""
     await events.emit(conn, job_id, "started")
     ctx = WorkerContext(services=services, job_id=job_id, conn=conn,
                         cancel=CancelToken(conn, job_id))
     handler = handler_for(kind)
+    token = spend.CURRENT_USER_ID.set(owner_id)
     try:
         result = await handler(ctx, payload)
     except asyncio.CancelledError:
@@ -114,6 +123,8 @@ async def execute_job(conn: psycopg.AsyncConnection, services: Any,
         await job_dao.mark_finished(conn, job_id, "done")
         data = {"result": result} if isinstance(result, (str, int)) else {}
         await events.emit(conn, job_id, "done", data)
+    finally:
+        spend.CURRENT_USER_ID.reset(token)
 
 
 class Heartbeater:
@@ -168,7 +179,8 @@ class PgJobQueue:
     async def enqueue(self, kind: str, payload: dict[str, Any], *,
                       dossier_id: int | None = None,
                       priority: int | None = None,
-                      delay_s: float = 0.0) -> int:
+                      delay_s: float = 0.0,
+                      owner_id: int | None = None) -> int:
         """Create the job row (+ job_new NOTIFY); returns job id."""
         handler_for(kind)  # unknown kind fails HERE, not in a worker
         async with self.pool.connection() as conn:
@@ -176,7 +188,7 @@ class PgJobQueue:
                 conn, kind, payload, dossier_id=dossier_id,
                 priority=priority_for(kind) if priority is None else priority,
                 max_attempts=KIND_MAX_ATTEMPTS.get(kind, 1),
-                delay_s=delay_s)
+                delay_s=delay_s, owner_id=owner_id)
 
     async def request_cancel(self, job_id: int) -> bool:
         """Set the durable flag + job_control NOTIFY; a still-queued job is
@@ -211,9 +223,11 @@ class AsyncioJobQueue(PgJobQueue):
     async def enqueue(self, kind: str, payload: dict[str, Any], *,
                       dossier_id: int | None = None,
                       priority: int | None = None,
-                      delay_s: float = 0.0) -> int:
+                      delay_s: float = 0.0,
+                      owner_id: int | None = None) -> int:
         job_id = await super().enqueue(kind, payload, dossier_id=dossier_id,
-                                       priority=priority, delay_s=delay_s)
+                                       priority=priority, delay_s=delay_s,
+                                       owner_id=owner_id)
         task = asyncio.create_task(
             self._run(job_id, kind, payload, delay_s=delay_s),
             name=f"job-{job_id}-{kind}")
@@ -234,7 +248,8 @@ class AsyncioJobQueue(PgJobQueue):
                 self.heartbeater.add(job_id)
                 try:
                     await execute_job(conn, self.services, job_id, kind,
-                                      payload)
+                                      payload,
+                                      owner_id=claimed["owner_id"])
                 finally:
                     self.heartbeater.discard(job_id)
 

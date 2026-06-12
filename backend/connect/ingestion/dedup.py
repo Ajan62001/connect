@@ -30,13 +30,18 @@ __all__ = [
 async def find_near_duplicate(conn: psycopg.AsyncConnection,
                               fingerprint: int, *,
                               window_days: int = 14,
-                              max_hamming: int = 3) -> int | None:
+                              max_hamming: int = 3,
+                              owner_id: int | None = None) -> int | None:
     """Return the canonical document id of a near-duplicate within the
-    window, or None. ``fingerprint`` is the unsigned 64-bit simhash."""
+    window, or None. ``fingerprint`` is the unsigned 64-bit simhash.
+
+    Tenancy: candidates are shared docs plus the ingesting owner's own
+    private docs — a new doc never canonicalizes onto a private doc its
+    ingester cannot see."""
     since = (datetime.now(timezone.utc) - timedelta(days=window_days)
              ).strftime("%Y-%m-%dT%H:%M:%S")
     for doc_id, stored, canonical_id in await doc_dao.recent_simhashes(
-            conn, since):
+            conn, since, owner_id=owner_id):
         if hamming(from_signed64(stored), fingerprint) <= max_hamming:
             return canonical_id or doc_id
     return None

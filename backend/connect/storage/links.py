@@ -112,12 +112,18 @@ async def mark_failed(conn: psycopg.AsyncConnection, link_id: int,
 
 
 async def linked_from(conn: psycopg.AsyncConnection,
-                      document_id: int) -> list[LinkedFrom]:
-    """Parents whose extracted links resolved to this document."""
-    cur = await conn.execute(
-        "SELECT DISTINCT l.document_id, d.title"
-        " FROM document_link l JOIN document d ON d.id = l.document_id"
-        " WHERE l.resolved_document_id = %s ORDER BY l.document_id",
-        (document_id,))
+                      document_id: int, *,
+                      viewer: int | None = None) -> list[LinkedFrom]:
+    """Parents whose extracted links resolved to this document. The viewer
+    predicate hides PRIVATE parents (a private upload linking to a shared
+    doc must not leak its title here)."""
+    sql = ("SELECT DISTINCT l.document_id, d.title"
+           " FROM document_link l JOIN document d ON d.id = l.document_id"
+           " WHERE l.resolved_document_id = %s")
+    params: list = [document_id]
+    if viewer is not None:
+        sql += " AND (d.visibility = 'shared' OR d.owner_id = %s)"
+        params.append(viewer)
+    cur = await conn.execute(sql + " ORDER BY l.document_id", params)
     return [LinkedFrom(document_id=r["document_id"], title=r["title"])
             for r in await cur.fetchall()]

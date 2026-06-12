@@ -6,6 +6,13 @@ items can be marked seen. Every item's reason string is template-rendered
 from score components at generation time (components are kept in
 reason_json for auditability) — NEVER LLM-written.
 
+v0.2 Phase C (tenancy design §5): the brief is PER-USER — brief rows carry
+user_id, the watch-driven sections (watch_dev, the suggestion watch
+component, the position-shift watched ranking) read the CALLER's watches,
+and the shared-KB sections (threads, contradictions, trending) are safe
+without predicates thanks to invariant I1. Concurrent first-GETs are
+settled by UNIQUE(user_id, brief_date) + ON CONFLICT DO NOTHING.
+
 Phase 2 fills watch_dev and thread_move; Phase 3 (verification slice)
 fills contradiction / trending_claim / suggestion. Suggestion scoring is
 the deterministic component sum from result.consumption:
@@ -82,48 +89,56 @@ class _Draft:
 
 # -- public API ----------------------------------------------------------------------
 
-async def get_or_generate(conn: psycopg.AsyncConnection,
+async def get_or_generate(conn: psycopg.AsyncConnection, user_id: int,
                           brief_date: str | None = None,
                           ) -> BriefResponse | None:
-    """Today's brief (generating it on first call); a past date returns its
-    persisted brief or None (history is never back-filled)."""
+    """The user's brief for today (generating it on first call); a past
+    date returns the persisted brief or None (history is never
+    back-filled)."""
     today = today_utc()
     date = brief_date or today
-    row = await _brief_row(conn, date)
+    row = await _brief_row(conn, user_id, date)
     if row is None:
         if date != today:
             return None
-        await _generate(conn, date)
-        row = await _brief_row(conn, date)
+        await _generate(conn, user_id, date)
+        row = await _brief_row(conn, user_id, date)
         assert row is not None
     return await _assemble(conn, row)
 
 
-async def mark_seen(conn: psycopg.AsyncConnection, item_id: int) -> bool:
+async def mark_seen(conn: psycopg.AsyncConnection, item_id: int,
+                    user_id: int) -> bool:
+    """Flip seen on one of the USER's brief items — another user's item
+    reads as absent (per-user isolation)."""
     async with conn.transaction():
         cur = await conn.execute(
-            "UPDATE brief_item SET seen = TRUE WHERE id = %s", (item_id,))
+            "UPDATE brief_item SET seen = TRUE WHERE id = %s"
+            " AND brief_id IN (SELECT id FROM brief WHERE user_id = %s)",
+            (item_id, user_id))
     return cur.rowcount > 0
 
 
 # -- generation -----------------------------------------------------------------------
 
-async def _generate(conn: psycopg.AsyncConnection, brief_date: str) -> None:
-    """Compute and persist one day's brief in a single transaction.
-    Idempotent under races: brief.brief_date is UNIQUE (NULLS NOT DISTINCT
-    with the single-user NULL user_id); the loser no-ops."""
+async def _generate(conn: psycopg.AsyncConnection, user_id: int,
+                    brief_date: str) -> None:
+    """Compute and persist one user-day brief in a single transaction.
+    Idempotent under races: UNIQUE(user_id, brief_date); the loser
+    no-ops."""
     drafts: list[_Draft] = []
-    drafts += await _watch_dev_items(conn)
+    drafts += await _watch_dev_items(conn, user_id)
     drafts += await _thread_move_items(conn, brief_date)
     drafts += await _contradiction_items(conn, brief_date)
     drafts += await _trending_claim_items(conn, brief_date)
-    drafts += await _suggestion_items(conn, brief_date)
-    drafts += await _position_shift_items(conn, brief_date)
+    drafts += await _suggestion_items(conn, user_id, brief_date)
+    drafts += await _position_shift_items(conn, user_id, brief_date)
     async with conn.transaction():
         cur = await conn.execute(
-            "INSERT INTO brief (brief_date, generated_at) VALUES (%s, %s)"
+            "INSERT INTO brief (user_id, brief_date, generated_at)"
+            " VALUES (%s, %s, %s)"
             " ON CONFLICT (user_id, brief_date) DO NOTHING RETURNING id",
-            (brief_date, utc_now()))
+            (user_id, brief_date, utc_now()))
         row = await cur.fetchone()
         if row is None:  # concurrent first-GET already generated it
             return
@@ -142,12 +157,13 @@ async def _generate(conn: psycopg.AsyncConnection, brief_date: str) -> None:
                  Jsonb(draft.payload)))
 
 
-async def _watch_dev_items(conn: psycopg.AsyncConnection) -> list[_Draft]:
+async def _watch_dev_items(conn: psycopg.AsyncConnection,
+                           user_id: int) -> list[_Draft]:
     """Per-watch new hits since the watch's read cursor — the 'On your
-    watches' section. One item per hit object, newest first, capped per
-    watch; watches in id order."""
+    watches' section, over the CALLER's watches only. One item per hit
+    object, newest first, capped per watch; watches in id order."""
     drafts: list[_Draft] = []
-    for watch in await watch_dao.list_active(conn):
+    for watch in await watch_dao.list_active(conn, user_id):
         cursor = watch.last_seen_at or "1970-01-01"
         cur = await conn.execute(
             "SELECT COUNT(*) AS n FROM watch_hit"
@@ -324,7 +340,7 @@ async def _trending_claim_items(conn: psycopg.AsyncConnection,
     return drafts
 
 
-async def _suggestion_items(conn: psycopg.AsyncConnection,
+async def _suggestion_items(conn: psycopg.AsyncConnection, user_id: int,
                             brief_date: str) -> list[_Draft]:
     """Top-5 suggested analyses by the deterministic component score;
     reasons are template-rendered from the fired components — NEVER LLM,
@@ -339,7 +355,7 @@ async def _suggestion_items(conn: psycopg.AsyncConnection,
     candidates = [r["claim_id"] for r in await cur.fetchall()]
     scored: list[tuple[int, int, _Draft]] = []
     for claim_id in candidates:
-        draft = await _score_suggestion(conn, brief_date, claim_id)
+        draft = await _score_suggestion(conn, user_id, brief_date, claim_id)
         if draft is not None:
             scored.append((int(draft.components["score"]), claim_id, draft))
     scored.sort(key=lambda t: (-t[0], t[1]))
@@ -357,7 +373,8 @@ async def _claim_document_ids(conn: psycopg.AsyncConnection,
     return [r["document_id"] for r in await cur.fetchall()]
 
 
-async def _score_suggestion(conn: psycopg.AsyncConnection, brief_date: str,
+async def _score_suggestion(conn: psycopg.AsyncConnection, user_id: int,
+                            brief_date: str,
                             claim_id: int) -> _Draft | None:
     cur = await conn.execute(
         "SELECT id, text, verdict FROM claim WHERE id = %s", (claim_id,))
@@ -400,17 +417,18 @@ async def _score_suggestion(conn: psycopg.AsyncConnection, brief_date: str,
         cur = await conn.execute(
             "SELECT w.label FROM watch w"
             " JOIN entity_mention m ON m.entity_id = w.entity_id"
-            " WHERE w.kind = 'entity' AND NOT w.muted"
+            " WHERE w.kind = 'entity' AND NOT w.muted AND w.user_id = %s"
             " AND m.document_id = ANY(%s)"
-            " ORDER BY w.id LIMIT 1", (doc_ids,))
+            " ORDER BY w.id LIMIT 1", (user_id, doc_ids))
         row = await cur.fetchone()
         if row is None:
             cur = await conn.execute(
                 "SELECT w.label FROM watch w"
                 " JOIN watch_hit h ON h.watch_id = w.id"
-                " WHERE NOT w.muted AND h.object_type = 'document'"
+                " WHERE NOT w.muted AND w.user_id = %s"
+                " AND h.object_type = 'document'"
                 " AND h.object_id = ANY(%s)"
-                " ORDER BY w.id LIMIT 1", (doc_ids,))
+                " ORDER BY w.id LIMIT 1", (user_id, doc_ids))
             row = await cur.fetchone()
         watch_label = row["label"] if row is not None else None
     if watch_label is not None:
@@ -459,13 +477,16 @@ async def _score_suggestion(conn: psycopg.AsyncConnection, brief_date: str,
 
 
 async def _position_shift_items(conn: psycopg.AsyncConnection,
+                                user_id: int,
                                 brief_date: str) -> list[_Draft]:
-    """Open position shifts detected since the LAST brief (all open shifts
-    on the very first brief). Watched entities rank first, then newest.
-    Both quotes are frozen in the payload — verbatim by construction."""
+    """Open position shifts detected since the USER's last brief (all open
+    shifts on their very first brief). Entities the USER watches rank
+    first, then newest. Both quotes are frozen in the payload — verbatim
+    by construction."""
     cur = await conn.execute(
         "SELECT generated_at FROM brief WHERE brief_date < %s"
-        " ORDER BY brief_date DESC LIMIT 1", (brief_date,))
+        " AND user_id = %s ORDER BY brief_date DESC LIMIT 1",
+        (brief_date, user_id))
     prev = await cur.fetchone()
     since = prev["generated_at"] if prev is not None else "1970-01-01"
     cur = await conn.execute(
@@ -474,14 +495,15 @@ async def _position_shift_items(conn: psycopg.AsyncConnection,
         " sf.quote AS from_quote, st.quote AS to_quote,"
         " sf.stated_at AS from_date, st.stated_at AS to_date,"
         " EXISTS (SELECT 1 FROM watch w WHERE w.kind = 'entity'"
-        "   AND w.entity_id = ps.entity_id AND NOT w.muted) AS watched"
+        "   AND w.entity_id = ps.entity_id AND NOT w.muted"
+        "   AND w.user_id = %s) AS watched"
         " FROM position_shift ps"
         " JOIN entity e ON e.id = ps.entity_id"
         " JOIN statement sf ON sf.id = ps.from_statement_id"
         " JOIN statement st ON st.id = ps.to_statement_id"
         " WHERE ps.status = 'open' AND ps.detected_at > %s"
         " ORDER BY watched DESC, ps.detected_at DESC, ps.id DESC LIMIT %s",
-        (since, MAX_POSITION_SHIFT_ITEMS))
+        (user_id, since, MAX_POSITION_SHIFT_ITEMS))
     rows = await cur.fetchall()
     drafts: list[_Draft] = []
     for row in rows:
@@ -507,11 +529,11 @@ async def _position_shift_items(conn: psycopg.AsyncConnection,
 
 # -- read path -------------------------------------------------------------------------
 
-async def _brief_row(conn: psycopg.AsyncConnection,
+async def _brief_row(conn: psycopg.AsyncConnection, user_id: int,
                      date: str) -> Mapping[str, Any] | None:
     cur = await conn.execute(
         "SELECT id, brief_date, generated_at FROM brief"
-        " WHERE brief_date = %s", (date,))
+        " WHERE user_id = %s AND brief_date = %s", (user_id, date))
     return await cur.fetchone()
 
 

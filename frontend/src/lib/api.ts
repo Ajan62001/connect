@@ -23,6 +23,91 @@ export const ANALYSIS_EVENTS_BASE =
 // Contract types
 // ---------------------------------------------------------------------------
 
+// --- auth (v0.2 Phase B) ----------------------------------------------------
+
+export type Role = "admin" | "member";
+
+/** GET /api/me — the signed-in user. */
+export interface Me {
+  id: number;
+  email: string;
+  name: string | null;
+  avatar_url: string | null;
+  role: Role;
+  created_at: string;
+  last_login_at: string | null;
+}
+
+/** GET /api/auth/methods — which sign-in paths the backend offers. */
+export interface AuthMethods {
+  google: boolean;
+  dev: boolean;
+}
+
+// --- tenancy (v0.2 Phase C) -------------------------------------------------
+
+/**
+ * Dossier/document visibility (design §1). Optional on every row that carries
+ * it so a backend that predates tenancy keeps all surfaces rendering — an
+ * absent value simply hides the chips/affordances.
+ */
+export type Visibility = "private" | "shared";
+
+/** Mirrors DOCUMENT_ORIGINS in backend domain/enums.py. */
+export type DocumentOrigin =
+  | "polled"
+  | "link_follow"
+  | "investigation_fetch"
+  | "user_url"
+  | "user_upload"
+  | "user_text";
+
+/** One private document the share cascade would flip to shared (mirrors
+ * backend ShareDocumentRef). Listed in the 409 confirmation payload. */
+export interface ShareDocumentRef {
+  id: number;
+  title: string | null;
+}
+
+/** 200 from a dossier visibility PATCH (mirrors DossierVisibilityResult). */
+export interface DossierVisibilityResult {
+  id: number;
+  visibility: Visibility;
+  /** Documents the cascade flipped to shared alongside the dossier. */
+  shared_document_ids: number[];
+}
+
+/**
+ * Mine | Shared | All listing scope (design §6 — the community feed lives on
+ * the existing dossier lists). Serialized as `?scope=` so a backend that
+ * implements it filters (and paginates) server-side; until then FastAPI
+ * ignores the unknown param and the UI applies the same predicate
+ * client-side over each page (see matchesDossierScope).
+ */
+export type DossierScope = "all" | "mine" | "shared";
+
+/**
+ * The client-side half of the scope contract: the predicate a scoped row
+ * must satisfy. Applying it on top of a scope-aware backend is a no-op
+ * (idempotent filter), so the UI is correct either way.
+ */
+export function matchesDossierScope(
+  row: { visibility?: Visibility; owner_id?: number | null },
+  scope: DossierScope,
+  meId: number | undefined,
+): boolean {
+  switch (scope) {
+    case "all":
+      return true;
+    case "mine":
+      return meId !== undefined && row.owner_id === meId;
+    case "shared":
+      // Pre-tenancy rows carry no visibility — treat them as shared (they
+      // ARE the shared corpus on a single-user backend).
+      return row.visibility !== "private";
+  }
+}
+
 export type SourceType =
   | "rss"
   | "twitter"
@@ -126,6 +211,11 @@ export interface DocumentListItem {
   canonical_document_id: number | null;
   /** FTS5 snippet — non-null only when the listing was filtered with `q`. */
   snippet: string | null;
+  /** Tenancy (Phase C); absent on a pre-tenancy backend. owner_id NULL =
+   *  system-owned (polled / public web fetches). */
+  visibility?: Visibility;
+  origin?: DocumentOrigin;
+  owner_id?: number | null;
 }
 
 export type DocumentLinkStatus =
@@ -437,6 +527,10 @@ export interface AnalysisListItem {
   created_at: string;
   finished_at: string | null;
   verdict_summary: VerdictSummary | null;
+  /** Tenancy (Phase C); absent on a pre-tenancy backend. */
+  visibility?: Visibility;
+  owner_id?: number | null;
+  owner_name?: string | null;
 }
 
 export interface AnalysisStageRun {
@@ -484,11 +578,17 @@ export interface AnalysisDetail {
   claims: AnalysisClaim[];
   /** Highest job_event.seq included in this snapshot; SSE resumes after it. */
   last_seq: number;
+  /** Tenancy (Phase C); absent on a pre-tenancy backend. */
+  visibility?: Visibility;
+  owner_id?: number | null;
+  owner_name?: string | null;
 }
 
 export interface AnalysisCreate {
   input_text: string;
   options?: { max_evidence_per_claim?: number };
+  /** Default 'shared' (design §1) — private is the opt-in. */
+  visibility?: Visibility;
 }
 
 /** 202 from POST /api/analyses. */
@@ -500,6 +600,8 @@ export interface AnalysisAccepted {
 export interface AnalysisListParams {
   page?: number;
   page_size?: number;
+  /** Mine | Shared | All — see DossierScope ("all"/undefined sends nothing). */
+  scope?: DossierScope;
 }
 
 /**
@@ -707,6 +809,10 @@ export interface InvestigationListItem {
   cost_usd: number | null;
   /** Null-tolerant: rows render without chips when the backend omits counts. */
   counts: InvestigationCounts | null;
+  /** Tenancy (Phase C); absent on a pre-tenancy backend. */
+  visibility?: Visibility;
+  owner_id?: number | null;
+  owner_name?: string | null;
 }
 
 export interface InvestigationStageRun {
@@ -895,6 +1001,10 @@ export interface InvestigationDetail {
   findings: InvestigationFinding[];
   /** Highest job_event.seq included in this snapshot; SSE resumes after it. */
   last_seq: number;
+  /** Tenancy (Phase C); absent on a pre-tenancy backend. */
+  visibility?: Visibility;
+  owner_id?: number | null;
+  owner_name?: string | null;
 }
 
 /**
@@ -912,6 +1022,8 @@ export interface InvestigationCreate {
     max_iterations?: number;
     max_web_fetches?: number;
   };
+  /** Default 'shared' (design §1) — private is the opt-in. */
+  visibility?: Visibility;
 }
 
 /** 202 from POST /api/investigations and POST /api/questions/{id}/investigate. */
@@ -923,6 +1035,8 @@ export interface InvestigationAccepted {
 export interface InvestigationListParams {
   page?: number;
   page_size?: number;
+  /** Mine | Shared | All — see DossierScope ("all"/undefined sends nothing). */
+  scope?: DossierScope;
 }
 
 /**
@@ -994,6 +1108,115 @@ export interface SpendReport {
   daily_cap_usd: number;
   today_spent_usd: number;
   days: SpendDay[];
+}
+
+// --- spend self-view + admin (v0.2 Phase D) ---------------------------------
+
+/**
+ * One spend ledger slice (mine or system-wide), normalized client-side.
+ * `cap_usd` null = the backend didn't expose a cap for this slice.
+ */
+export interface SpendSlice {
+  today_usd: number;
+  cap_usd: number | null;
+  /** Investigations run on a separate daily envelope (design §4). */
+  investigation_cap_usd: number | null;
+  days: SpendDay[];
+}
+
+/**
+ * Normalized GET /api/spend. Phase D reshapes the endpoint into "my spend
+ * plus global context" (design §4: {my_caps, my_today, my_days[]} + global
+ * caps/today); the pre-Phase-D backend serves the global-only SpendReport.
+ * normalizeSpend() accepts both: `mine` is null against the legacy shape,
+ * and consumers fall back to the global slice.
+ */
+export interface SpendView {
+  mine: SpendSlice | null;
+  global: SpendSlice | null;
+}
+
+/** GET /api/admin/users row (design §5; mirrors app_user). NULL budget
+ *  overrides mean "member default from app_setting". */
+export interface AdminUser {
+  id: number;
+  email: string;
+  name: string | null;
+  avatar_url: string | null;
+  role: Role;
+  disabled: boolean;
+  daily_budget_usd: number | null;
+  investigation_daily_budget_usd: number | null;
+  created_at: string | null;
+  last_login_at: string | null;
+}
+
+/** PATCH /api/admin/users/{id} — explicit null clears a budget override. */
+export interface AdminUserUpdate {
+  role?: Role;
+  disabled?: boolean;
+  daily_budget_usd?: number | null;
+  investigation_daily_budget_usd?: number | null;
+}
+
+/** Invite allowlist row (admin-only invites is a locked decision). */
+export interface Invite {
+  email: string;
+  invited_by: number | null;
+  note: string | null;
+  created_at: string;
+}
+
+export interface InviteCreate {
+  email: string;
+  note?: string | null;
+}
+
+/**
+ * GET/PATCH /api/admin/settings — the admin-editable budget globals as
+ * EFFECTIVE values (app_setting wins over env once an admin edits it).
+ * Null = the backend didn't return the key (older backend); it then falls
+ * back to its env default server-side.
+ */
+export interface AdminSettings {
+  /** Deployment-wide daily backstop across all users + system jobs. */
+  global_daily_budget_usd: number | null;
+  /** General-purpose daily envelope — also the admins' general cap. */
+  daily_llm_budget_usd: number | null;
+  /** Investigation daily envelope — also the admins' investigation cap. */
+  investigation_daily_budget_usd: number | null;
+  member_daily_budget_usd: number | null;
+  member_investigation_daily_budget_usd: number | null;
+}
+
+export interface AdminSettingsUpdate {
+  global_daily_budget_usd?: number;
+  daily_llm_budget_usd?: number;
+  investigation_daily_budget_usd?: number;
+  member_daily_budget_usd?: number;
+  member_investigation_daily_budget_usd?: number;
+}
+
+/** Per-user breakdown row of GET /api/admin/spend. user_id null = system
+ *  jobs (polling sweeps, batch enrichment — charged only to the global
+ *  envelope). Caps are the *effective* ceilings (override > setting > env)
+ *  when the backend provides them. */
+export interface AdminSpendUser {
+  user_id: number | null;
+  email: string | null;
+  name: string | null;
+  today_usd: number;
+  cap_usd: number | null;
+  investigation_cap_usd: number | null;
+  days: SpendDay[];
+}
+
+/** Normalized GET /api/admin/spend — system totals + per-user breakdown. */
+export interface AdminSpend {
+  global_cap_usd: number | null;
+  global_today_usd: number;
+  days: SpendDay[];
+  users: AdminSpendUser[];
 }
 
 export type SweepMode = "sync" | "batch";
@@ -1068,12 +1291,16 @@ export interface IngestResult {
 export class ApiError extends Error {
   readonly status: number;
   readonly detail: string;
+  /** Parsed response body — for errors whose `detail` is structured JSON
+   *  (e.g. the share-cascade 409 confirmation list), not just a string. */
+  readonly body: unknown;
 
-  constructor(status: number, detail: string) {
+  constructor(status: number, detail: string, body?: unknown) {
     super(detail);
     this.name = "ApiError";
     this.status = status;
     this.detail = detail;
+    this.body = body;
   }
 }
 
@@ -1100,7 +1327,18 @@ async function raise(res: Response): Promise<never> {
   } else if (typeof body === "string" && body.length > 0) {
     detail = body;
   }
-  throw new ApiError(res.status, detail);
+  // 401 interceptor: the session is gone (expired / revoked / signed out)
+  // — every surface is API-backed, so a hard redirect to the signin page
+  // is the whole "route guard". The throw below still rejects the caller's
+  // promise; the navigation just wins the race.
+  if (
+    res.status === 401 &&
+    typeof window !== "undefined" &&
+    window.location.pathname !== "/signin"
+  ) {
+    window.location.assign("/signin");
+  }
+  throw new ApiError(res.status, detail, body);
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -1137,6 +1375,32 @@ function qs(params: Record<string, string | number | undefined>): string {
 
 export function getHealth(): Promise<Health> {
   return request<Health>("/api/health");
+}
+
+// ---------------------------------------------------------------------------
+// Auth (v0.2 Phase B)
+// ---------------------------------------------------------------------------
+
+export function getMe(): Promise<Me> {
+  return request<Me>("/api/me");
+}
+
+/** Open endpoint — drives which buttons the signin page renders. */
+export function getAuthMethods(): Promise<AuthMethods> {
+  return request<AuthMethods>("/api/auth/methods");
+}
+
+/**
+ * DEV-ONLY escape hatch: signs in as the backend's CONNECT_DEV_LOGIN_EMAIL
+ * (404 when the hatch is disabled). Takes no input by design.
+ */
+export function devLogin(): Promise<Me> {
+  return request<Me>("/api/auth/dev-login", { method: "POST" });
+}
+
+/** 204 — deletes the server-side session and clears the cookie. */
+export function logout(): Promise<void> {
+  return request<void>("/api/auth/logout", { method: "POST" });
 }
 
 // ---------------------------------------------------------------------------
@@ -1217,6 +1481,22 @@ export function fetchDocumentLink(linkId: number): Promise<LinkFetchResult> {
   });
 }
 
+/**
+ * Owner-only visibility flip on a document (design §5; body mirrors backend
+ * DocumentVisibilityUpdate). Sharing is one-way in practice: a shared
+ * document becomes enrichment-eligible and compounds into the shared KB,
+ * after which the backend refuses the downgrade (409).
+ */
+export function setDocumentVisibility(
+  id: number,
+  visibility: Visibility,
+): Promise<unknown> {
+  return request<unknown>(
+    `/api/documents/${id}`,
+    jsonInit("PATCH", { visibility }),
+  );
+}
+
 export function searchCorpus(
   q: string,
   kind: SearchKind = "all",
@@ -1278,11 +1558,139 @@ export function dismissPositionShift(id: number): Promise<PositionShift> {
 }
 
 // ---------------------------------------------------------------------------
-// LLM spend / enrichment sweeps (Phase 1)
+// LLM spend / enrichment sweeps (Phase 1 + v0.2 Phase D self-view)
 // ---------------------------------------------------------------------------
 
-export function getSpend(days = 7): Promise<SpendReport> {
-  return request<SpendReport>(`/api/spend${qs({ days })}`);
+// Phase D reshapes /api/spend into "my spend + global context" and adds the
+// /api/admin/* management surface; the exact JSON field names aren't frozen
+// yet (the backend lands in a sibling workstream), so everything below
+// decodes tolerantly: numbers are picked from a candidate-key list and
+// missing pieces degrade to null instead of breaking the page.
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function asFiniteNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+/** First finite number found under any of `keys` (app_setting values arrive
+ *  as strings — the TEXT column — so numeric strings count). */
+function pickNumber(
+  record: Record<string, unknown>,
+  keys: readonly string[],
+): number | null {
+  for (const key of keys) {
+    const value = asFiniteNumber(record[key]);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function asSpendDays(value: unknown): SpendDay[] {
+  if (!Array.isArray(value)) return [];
+  const days: SpendDay[] = [];
+  for (const item of value) {
+    const record = asRecord(item);
+    if (!record || typeof record.day !== "string") continue;
+    days.push({
+      day: record.day,
+      calls: asFiniteNumber(record.calls) ?? 0,
+      input_tokens: asFiniteNumber(record.input_tokens) ?? 0,
+      output_tokens: asFiniteNumber(record.output_tokens) ?? 0,
+      cost_usd: asFiniteNumber(record.cost_usd) ?? 0,
+    });
+  }
+  return days;
+}
+
+/** Decodes one SpendSlice from a record using legacy/global key names. */
+function decodeSpendSlice(record: Record<string, unknown>): SpendSlice | null {
+  const today = pickNumber(record, ["today_spent_usd", "today_usd", "spent_usd"]);
+  const cap = pickNumber(record, ["daily_cap_usd", "cap_usd", "daily_budget_usd"]);
+  if (today === null && cap === null) return null;
+  return {
+    today_usd: today ?? 0,
+    cap_usd: cap,
+    investigation_cap_usd: pickNumber(record, [
+      "investigation_cap_usd",
+      "investigation_daily_budget_usd",
+    ]),
+    days: asSpendDays(record.days),
+  };
+}
+
+/**
+ * Accepts every plausible /api/spend shape:
+ * - legacy (pre-Phase-D): {daily_cap_usd, today_spent_usd, days} → global only;
+ * - design §4 flat: {my_caps{...}, my_today*, my_days, global_*};
+ * - nested: {mine: {...}, global: {...}} with legacy key names inside.
+ */
+export function normalizeSpend(raw: unknown): SpendView {
+  const record = asRecord(raw) ?? {};
+
+  const mineNested = asRecord(record.mine ?? record.me);
+  const hasFlatMine = ["my_caps", "my_today", "my_today_usd", "my_days"].some(
+    (key) => key in record,
+  );
+
+  let mine: SpendSlice | null = null;
+  if (mineNested) {
+    mine = decodeSpendSlice(mineNested);
+  } else if (hasFlatMine) {
+    const caps = asRecord(record.my_caps) ?? {};
+    mine = {
+      today_usd:
+        pickNumber(record, ["my_today_usd", "my_today", "my_spent_today_usd"]) ?? 0,
+      cap_usd:
+        pickNumber(caps, ["daily_usd", "daily_budget_usd", "daily_cap_usd", "general_usd"]) ??
+        pickNumber(record, ["my_cap_usd", "my_daily_cap_usd"]),
+      investigation_cap_usd:
+        pickNumber(caps, [
+          "investigation_daily_usd",
+          "investigation_daily_budget_usd",
+          "investigation_usd",
+        ]) ?? pickNumber(record, ["my_investigation_cap_usd"]),
+      days: asSpendDays(record.my_days),
+    };
+  }
+
+  const globalNested = asRecord(record.global ?? record.system);
+  let global: SpendSlice | null = null;
+  if (globalNested) {
+    global = decodeSpendSlice(globalNested);
+  } else if (mine !== null) {
+    // My-spend shape with flat global_* context fields.
+    const today = pickNumber(record, ["global_today_usd", "global_today"]);
+    const cap = pickNumber(record, ["global_cap_usd", "global_daily_budget_usd"]);
+    if (today !== null || cap !== null) {
+      global = {
+        today_usd: today ?? 0,
+        cap_usd: cap,
+        investigation_cap_usd: pickNumber(record, ["global_investigation_cap_usd"]),
+        days: asSpendDays(record.global_days),
+      };
+    }
+  } else {
+    // Legacy single-ledger shape: the one report IS the global view.
+    global = decodeSpendSlice(record);
+  }
+
+  return { mine, global };
+}
+
+/** Normalized spend view — my spend (Phase D) plus the global envelope. */
+export async function getSpendView(days = 7): Promise<SpendView> {
+  const raw = await request<unknown>(`/api/spend${qs({ days })}`);
+  return normalizeSpend(raw);
 }
 
 /** 202 — the sweep runs in a background job; sync mode processes inline. */
@@ -1373,7 +1781,11 @@ export function createAnalysis(payload: AnalysisCreate): Promise<AnalysisAccepte
 export function listAnalyses(
   params: AnalysisListParams = {},
 ): Promise<Page<AnalysisListItem>> {
-  return request<Page<AnalysisListItem>>(`/api/analyses${qs({ ...params })}`);
+  // "all" is the unfiltered default — send nothing (see DossierScope).
+  const scope = params.scope === "all" ? undefined : params.scope;
+  return request<Page<AnalysisListItem>>(
+    `/api/analyses${qs({ ...params, scope })}`,
+  );
 }
 
 export function getAnalysis(id: number): Promise<AnalysisDetail> {
@@ -1383,6 +1795,64 @@ export function getAnalysis(id: number): Promise<AnalysisDetail> {
 /** 202 — cancellation is asynchronous; the snapshot flips when it lands. */
 export function cancelAnalysis(id: number): Promise<void> {
   return request<void>(`/api/analyses/${id}/cancel`, { method: "POST" });
+}
+
+/**
+ * Owner-or-admin visibility PATCH (body mirrors backend
+ * DossierVisibilityUpdate). Two-step share protocol (design §1 cascade):
+ * the unconfirmed call (`confirmDocuments=false`) succeeds only when no
+ * private documents are cited; otherwise it answers 409 carrying the
+ * confirmation list (see shareConfirmationDocuments), and the caller
+ * re-PATCHes with `confirmDocuments=true` to run the cascade. A
+ * shared→private downgrade is always 409 (writeback already compounded).
+ */
+export function setAnalysisVisibility(
+  id: number,
+  visibility: Visibility,
+  confirmDocuments = false,
+): Promise<DossierVisibilityResult> {
+  return request<DossierVisibilityResult>(
+    `/api/analyses/${id}`,
+    jsonInit("PATCH", { visibility, confirm_documents: confirmDocuments }),
+  );
+}
+
+/**
+ * Extracts the share-cascade confirmation list from a 409's structured
+ * detail. Shape-tolerant — accepts `{detail: {documents: [...]}}`,
+ * `{detail: [...]}`, or `{documents: [...]}` — and returns null for any
+ * other 409 (downgrade refusal, foreign private evidence), whose string
+ * detail renders as an error instead.
+ */
+export function shareConfirmationDocuments(
+  error: unknown,
+): ShareDocumentRef[] | null {
+  if (!(error instanceof ApiError) || error.status !== 409) return null;
+  const body = error.body as { detail?: unknown; documents?: unknown } | null;
+  const detail = body?.detail as
+    | { documents?: unknown }
+    | unknown[]
+    | null
+    | undefined;
+  const candidates: unknown[] = [
+    Array.isArray(detail) ? detail : (detail as { documents?: unknown })?.documents,
+    body?.documents,
+  ];
+  for (const candidate of candidates) {
+    if (!Array.isArray(candidate) || candidate.length === 0) continue;
+    const docs: ShareDocumentRef[] = [];
+    for (const item of candidate) {
+      if (typeof item !== "object" || item === null) return null;
+      const record = item as { id?: unknown; title?: unknown };
+      if (typeof record.id !== "number") return null;
+      docs.push({
+        id: record.id,
+        title: typeof record.title === "string" ? record.title : null,
+      });
+    }
+    return docs;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,8 +1925,10 @@ export function createInvestigation(
 export function listInvestigations(
   params: InvestigationListParams = {},
 ): Promise<Page<InvestigationListItem>> {
+  // "all" is the unfiltered default — send nothing (see DossierScope).
+  const scope = params.scope === "all" ? undefined : params.scope;
   return request<Page<InvestigationListItem>>(
-    `/api/investigations${qs({ ...params })}`,
+    `/api/investigations${qs({ ...params, scope })}`,
   );
 }
 
@@ -1481,6 +1953,19 @@ export function cancelInvestigation(id: number): Promise<void> {
   return request<void>(`/api/investigations/${id}/cancel`, { method: "POST" });
 }
 
+/** Owner-or-admin visibility PATCH — see setAnalysisVisibility (two-step
+ *  share protocol + 409 rules). */
+export function setInvestigationVisibility(
+  id: number,
+  visibility: Visibility,
+  confirmDocuments = false,
+): Promise<DossierVisibilityResult> {
+  return request<DossierVisibilityResult>(
+    `/api/investigations/${id}`,
+    jsonInit("PATCH", { visibility, confirm_documents: confirmDocuments }),
+  );
+}
+
 /**
  * 202 — manual recursion: spawns a child investigation seeded from an open
  * question (sets question.spawned_dossier_id + child.parent_question_id).
@@ -1492,4 +1977,170 @@ export function investigateQuestion(
     `/api/questions/${questionId}/investigate`,
     { method: "POST" },
   );
+}
+
+// ---------------------------------------------------------------------------
+// Admin (v0.2 Phase D) — everything behind require_admin (403 for members)
+// ---------------------------------------------------------------------------
+
+function decodeAdminUser(raw: unknown): AdminUser | null {
+  const record = asRecord(raw);
+  if (!record) return null;
+  const id = asFiniteNumber(record.id);
+  if (id === null || typeof record.email !== "string") return null;
+  return {
+    id,
+    email: record.email,
+    name: typeof record.name === "string" ? record.name : null,
+    avatar_url: typeof record.avatar_url === "string" ? record.avatar_url : null,
+    role: record.role === "admin" ? "admin" : "member",
+    disabled: record.disabled === true,
+    daily_budget_usd: asFiniteNumber(record.daily_budget_usd),
+    investigation_daily_budget_usd: asFiniteNumber(
+      record.investigation_daily_budget_usd,
+    ),
+    created_at: typeof record.created_at === "string" ? record.created_at : null,
+    last_login_at:
+      typeof record.last_login_at === "string" ? record.last_login_at : null,
+  };
+}
+
+export async function listAdminUsers(): Promise<AdminUser[]> {
+  const raw = await request<unknown>("/api/admin/users");
+  const rows = Array.isArray(raw)
+    ? raw
+    : (asRecord(raw)?.items ?? asRecord(raw)?.users);
+  if (!Array.isArray(rows)) return [];
+  return rows
+    .map(decodeAdminUser)
+    .filter((user): user is AdminUser => user !== null);
+}
+
+/** Role / disable / budget-override management. Explicit JSON nulls clear a
+ *  budget override back to the member default; absent fields are untouched. */
+export async function updateAdminUser(
+  id: number,
+  payload: AdminUserUpdate,
+): Promise<AdminUser | null> {
+  const raw = await request<unknown>(
+    `/api/admin/users/${id}`,
+    jsonInit("PATCH", payload),
+  );
+  return decodeAdminUser(raw);
+}
+
+// Invites are the one pinned admin contract (Phase B shipped them).
+
+export function listInvites(): Promise<Invite[]> {
+  return request<Invite[]>("/api/admin/invites");
+}
+
+/** 201; 409 when the email is already invited. */
+export function createInvite(payload: InviteCreate): Promise<Invite> {
+  return request<Invite>("/api/admin/invites", jsonInit("POST", payload));
+}
+
+/** 204; 404 when the invite does not exist. */
+export function deleteInvite(email: string): Promise<void> {
+  return request<void>(`/api/admin/invites/${encodeURIComponent(email)}`, {
+    method: "DELETE",
+  });
+}
+
+function decodeAdminSettings(raw: unknown): AdminSettings {
+  let record = asRecord(raw) ?? {};
+  const nested = asRecord(record.settings);
+  if (nested) record = nested;
+  if (Array.isArray(raw)) {
+    // Tolerate the literal app_setting rows: [{key, value}, ...].
+    const map: Record<string, unknown> = {};
+    for (const item of raw) {
+      const row = asRecord(item);
+      if (row && typeof row.key === "string") map[row.key] = row.value;
+    }
+    record = map;
+  }
+  return {
+    global_daily_budget_usd: pickNumber(record, ["global_daily_budget_usd"]),
+    daily_llm_budget_usd: pickNumber(record, ["daily_llm_budget_usd"]),
+    investigation_daily_budget_usd: pickNumber(record, [
+      "investigation_daily_budget_usd",
+    ]),
+    member_daily_budget_usd: pickNumber(record, ["member_daily_budget_usd"]),
+    member_investigation_daily_budget_usd: pickNumber(record, [
+      "member_investigation_daily_budget_usd",
+    ]),
+  };
+}
+
+/** The three seeded app_setting budgets (design §4). */
+export async function getAdminSettings(): Promise<AdminSettings> {
+  return decodeAdminSettings(await request<unknown>("/api/admin/settings"));
+}
+
+export async function updateAdminSettings(
+  payload: AdminSettingsUpdate,
+): Promise<AdminSettings> {
+  return decodeAdminSettings(
+    await request<unknown>("/api/admin/settings", jsonInit("PATCH", payload)),
+  );
+}
+
+function decodeAdminSpendUser(raw: unknown): AdminSpendUser | null {
+  const record = asRecord(raw);
+  if (!record) return null;
+  return {
+    user_id: asFiniteNumber(record.user_id ?? record.id),
+    email: typeof record.email === "string" ? record.email : null,
+    name: typeof record.name === "string" ? record.name : null,
+    today_usd:
+      pickNumber(record, [
+        "today_usd",
+        "today_spent_usd",
+        "spent_today_usd",
+        "cost_usd",
+        "total_usd",
+      ]) ?? 0,
+    cap_usd: pickNumber(record, [
+      "cap_usd",
+      "daily_cap_usd",
+      "daily_budget_usd",
+      "effective_daily_budget_usd",
+    ]),
+    investigation_cap_usd: pickNumber(record, [
+      "investigation_cap_usd",
+      "investigation_daily_budget_usd",
+    ]),
+    days: asSpendDays(record.days),
+  };
+}
+
+/** System totals + per-user breakdown (design §4 admin spend split). */
+export async function getAdminSpend(days = 7): Promise<AdminSpend> {
+  const raw = await request<unknown>(`/api/admin/spend${qs({ days })}`);
+  const record = asRecord(raw) ?? {};
+  const usersRaw =
+    [record.users, record.per_user, record.by_user, record.members].find(
+      (candidate): candidate is unknown[] => Array.isArray(candidate),
+    ) ?? [];
+  return {
+    global_cap_usd: pickNumber(record, [
+      "global_cap_usd",
+      "global_daily_budget_usd",
+      "daily_cap_usd",
+      "cap_usd",
+    ]),
+    global_today_usd:
+      pickNumber(record, [
+        "global_today_usd",
+        "today_total_usd",
+        "total_today_usd",
+        "today_spent_usd",
+        "today_usd",
+      ]) ?? 0,
+    days: asSpendDays(record.days),
+    users: usersRaw
+      .map(decodeAdminSpendUser)
+      .filter((user): user is AdminSpendUser => user !== null),
+  };
 }

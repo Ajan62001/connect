@@ -14,7 +14,13 @@ Rules enforced here:
    closed scope-pack menu;
 4. evidence=[] only when speculation=true;
 5. link node ids must exist, relation must be in the causal vocabulary,
-   src/dst types must match the relation signature (storage/edges.py).
+   src/dst types must match the relation signature (storage/edges.py);
+6. TENANCY (I1 gate 3, design §1): evidence on a PRIVATE document is
+   allowed only when the document belongs to the dossier owner AND the
+   dossier itself is private. For private dossiers the grade-2 causal
+   edge insert into the SHARED graph is DEFERRED — the validated link
+   dict is persisted in finding.payload["link"] and materialized when
+   the dossier is later flipped to shared (knowledge/sharing.py).
 """
 
 from __future__ import annotations
@@ -57,7 +63,9 @@ async def _node_exists(conn: psycopg.AsyncConnection, node_type: str,
 
 
 async def _validate_evidence(conn: psycopg.AsyncConnection,
-                             evidence: Any) -> list[dict[str, Any]]:
+                             evidence: Any, *,
+                             dossier_owner_id: int | None,
+                             dossier_private: bool) -> list[dict[str, Any]]:
     _require(isinstance(evidence, list),
              "evidence must be a list of {document_id, quote}")
     cleaned: list[dict[str, Any]] = []
@@ -72,11 +80,20 @@ async def _validate_evidence(conn: psycopg.AsyncConnection,
         _require(isinstance(quote, str) and quote.strip() != "",
                  f"evidence[{i}].quote must be a non-empty string")
         cur = await conn.execute(
-            "SELECT content_text FROM document WHERE id = %s",
+            "SELECT content_text, visibility, owner_id FROM document"
+            " WHERE id = %s",
             (doc_id,))
         row = await cur.fetchone()
         _require(row is not None,
                  f"evidence[{i}]: document {doc_id} not found")
+        if row["visibility"] != "shared":
+            # I1 gate 3: private evidence only inside the owner's own
+            # private dossier — never into a shared finding
+            _require(
+                dossier_private and row["owner_id"] == dossier_owner_id,
+                f"evidence[{i}]: document {doc_id} is private — private"
+                " evidence is allowed only in the owner's private"
+                " investigation")
         content = row["content_text"] or ""
         _require(
             grounding.span_is_verbatim(quote, content),
@@ -135,7 +152,19 @@ async def record_finding(
                  "confidence must be a number")
         confidence = min(1.0, max(0.0, float(confidence)))
 
-    evidence = await _validate_evidence(conn, args.get("evidence", []))
+    # tenancy context (I1 gate 3): the dossier's owner + visibility decide
+    # the private-evidence rule and whether the edge insert is deferred
+    cur = await conn.execute(
+        "SELECT owner_id, visibility FROM dossier WHERE id = %s",
+        (dossier_id,))
+    dossier = await cur.fetchone()
+    _require(dossier is not None, f"dossier {dossier_id} not found")
+    dossier_private = dossier["visibility"] == "private"
+
+    evidence = await _validate_evidence(
+        conn, args.get("evidence", []),
+        dossier_owner_id=dossier["owner_id"],
+        dossier_private=dossier_private)
 
     # rule 2: alternatives are mined, never invented
     if kind == "alternative":
@@ -202,6 +231,12 @@ async def record_finding(
             "entity_jaccard": candidate.entity_jaccard,
             "cosine": candidate.cosine,
         }
+    # I1 gate 3: a PRIVATE dossier defers the shared-graph edge insert —
+    # the validated link dict is persisted in the finding payload and
+    # materialized by the share cascade (knowledge/sharing.py).
+    deferred_link = link is not None and dossier_private
+    if deferred_link:
+        payload["link"] = dict(link)
     now = utc_now()
     async with conn.transaction():
         cur = await conn.execute(
@@ -219,19 +254,14 @@ async def record_finding(
                  item["quote_start"], item["quote_end"]))
 
     edge_id: int | None = None
-    if link is not None:
-        properties: dict[str, Any] = {
-            "quote": evidence[0]["quote"] if evidence else None,
-            "speculation": speculation,
-            "finding_id": finding_id,
-        }
-        if "score_components" in payload:
-            properties["score_components"] = payload["score_components"]
+    if link is not None and not deferred_link:
         edge_id = await edge_dao.insert_causal(
             conn,
             src_type=link["src_type"], src_id=link["src_id"],
             dst_type=link["dst_type"], dst_id=link["dst_id"],
-            relation=link["relation"], properties=properties,
+            relation=link["relation"],
+            properties=_edge_properties(payload, evidence, speculation,
+                                        finding_id),
             provenance_document_id=(evidence[0]["document_id"]
                                     if evidence else None),
             provenance_dossier_id=dossier_id,
@@ -248,9 +278,27 @@ async def record_finding(
               "speculation": speculation, "edge_id": edge_id,
               "question_id": question_id,
               "evidence_count": len(evidence)}
+    if deferred_link:
+        result["edge_deferred"] = True
     if emit is not None:
         await emit("finding_recorded", result)
     return result
+
+
+def _edge_properties(payload: dict[str, Any],
+                     evidence: list[dict[str, Any]], speculation: bool,
+                     finding_id: int) -> dict[str, Any]:
+    """The grounding payload a causal edge carries ({quote, speculation,
+    finding_id, score_components?}) — shared by the immediate insert here
+    and the share cascade's deferred materialization."""
+    properties: dict[str, Any] = {
+        "quote": evidence[0]["quote"] if evidence else None,
+        "speculation": speculation,
+        "finding_id": finding_id,
+    }
+    if "score_components" in payload:
+        properties["score_components"] = payload["score_components"]
+    return properties
 
 
 async def _attach_finding_to_question(conn: psycopg.AsyncConnection,

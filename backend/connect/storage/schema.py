@@ -25,11 +25,13 @@ PG conventions:
 - Self/circular FKs (document.canonical_document_id, edge.superseded_by_
   edge_id, dossier.parent_question_id) are DEFERRABLE INITIALLY IMMEDIATE:
   free at runtime, lets the one-shot ETL defer.
-- Tenancy ownership columns ship NULLABLE with single-user-safe defaults
-  (visibility 'shared', origin 'polled', owner/user NULL = system) so the
-  v0.1 code paths keep working before the auth workstream lands; NOT NULL
-  tightening and the view_cursor PK swap are cheap PG ALTERs owned by that
-  workstream (no rebuild).
+- Tenancy ownership columns: document.owner_id / job.owner_id /
+  llm_call.user_id stay NULLABLE (NULL = system); v3 (Phase C tenancy)
+  tightened the PER-USER surfaces — dossier.owner_id, watch.user_id,
+  brief.user_id, view_cursor.user_id are NOT NULL and view_cursor's PK is
+  (user_id, surface, ref_id). Existing DBs get there via
+  migrations.pg_migrate_2_to_3 (backfill NULLs to the first admin, then
+  cheap ALTERs).
 
 Every CHECK vocabulary is built from domain/enums.py — the single home of
 controlled vocabularies. ``PG_SCHEMA_VERSION`` starts a FRESH lineage at 1
@@ -63,7 +65,7 @@ class StorageVersionError(StorageError):
 # PostgreSQL baseline schema (v0.2, the canonical DDL) — fresh lineage, v1.
 # ==============================================================================
 
-PG_SCHEMA_VERSION = 2
+PG_SCHEMA_VERSION = 3
 
 # Extensions first: the compose image is pgvector/pgvector:pg17, so both are
 # present; IF NOT EXISTS keeps re-entry harmless.
@@ -459,14 +461,13 @@ CREATE TABLE IF NOT EXISTS dossier (
     created_at         timestamptz NOT NULL,
     started_at         timestamptz,
     finished_at        timestamptz,
-    owner_id           bigint REFERENCES app_user(id),
+    owner_id           bigint NOT NULL REFERENCES app_user(id),
     visibility         text NOT NULL DEFAULT 'shared'
                        CONSTRAINT ck_dossier_visibility
                        CHECK (visibility IN {E.sql_in(E.VISIBILITIES)})
 )"""
-# owner_id is NULLABLE in the baseline (NULL = the single-user 'system
-# viewer'); the auth workstream backfills and tightens to NOT NULL — a
-# cheap ALTER, not a rebuild.
+# owner_id NOT NULL since v3 (dossiers are always user-initiated); the
+# v2->v3 migration backfilled pre-tenancy rows to the first admin.
 
 _PG_DDL_DOSSIER_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_dossier_owner"
@@ -829,10 +830,10 @@ CREATE TABLE IF NOT EXISTS watch (
     muted        boolean NOT NULL DEFAULT false,
     last_seen_at timestamptz,
     created_at   timestamptz NOT NULL,
-    user_id      bigint REFERENCES app_user(id) ON DELETE CASCADE
+    user_id      bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE
 )"""
-# user_id NULLABLE in the baseline (single-user); tightened by the auth
-# workstream after backfill.
+# user_id NOT NULL since v3 (watches are personal); pre-tenancy rows were
+# backfilled to the first admin by the v2->v3 migration.
 
 _PG_DDL_WATCH_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_watch_user ON watch(user_id)",
@@ -854,9 +855,10 @@ _PG_DDL_WATCH_HIT_INDEXES = (
     " ON watch_hit(watch_id, created_at)",
 )
 
-# UNIQUE NULLS NOT DISTINCT (PG 15+): single-user rows (user_id NULL) keep
-# the v0.1 one-brief-per-day dedupe; per-user uniqueness comes for free when
-# the auth workstream backfills user_id — no rebuild.
+# One brief per (user, day) — the UNIQUE doubles as the ON CONFLICT target
+# guarding concurrent first-GET generation (tenancy design §5). NULLS NOT
+# DISTINCT is kept for DDL continuity with v2 (user_id is NOT NULL now, so
+# it is inert).
 _PG_DDL_BRIEF = """
 CREATE TABLE IF NOT EXISTS brief (
     id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -864,7 +866,7 @@ CREATE TABLE IF NOT EXISTS brief (
     generated_at timestamptz NOT NULL,
     gloss_text   text,
     gloss_model  text,
-    user_id      bigint REFERENCES app_user(id) ON DELETE CASCADE,
+    user_id      bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
     UNIQUE NULLS NOT DISTINCT (user_id, brief_date)
 )"""
 
@@ -886,16 +888,15 @@ _PG_DDL_BRIEF_ITEM_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_brief_item_brief ON brief_item(brief_id)",
 )
 
-# PK stays (surface, ref_id) in the baseline (current upsert key); the
-# tenancy workstream swaps it to (user_id, surface, ref_id) once user_id is
-# backfilled NOT NULL — DROP/ADD PRIMARY KEY, a cheap ALTER in PG.
+# v3: the read cursor is per-user — PK (user_id, surface, ref_id), the
+# upsert key the tenancy design §2 specifies.
 _PG_DDL_VIEW_CURSOR = """
 CREATE TABLE IF NOT EXISTS view_cursor (
     surface      text NOT NULL,
     ref_id       bigint NOT NULL DEFAULT 0,
     last_seen_at timestamptz NOT NULL,
-    user_id      bigint REFERENCES app_user(id) ON DELETE CASCADE,
-    PRIMARY KEY (surface, ref_id)
+    user_id      bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, surface, ref_id)
 )"""
 
 _PG_DDL_CALENDAR_EVENT = f"""

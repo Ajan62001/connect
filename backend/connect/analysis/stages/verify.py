@@ -161,27 +161,36 @@ def doc_domain(url: str | None, source_name: str | None,
 async def _doc_row(conn: psycopg.AsyncConnection,
                    doc_id: int) -> _Row | None:
     cur = await conn.execute(
-        "SELECT d.id, d.title, d.url, d.content_text, s.name AS source_name,"
+        "SELECT d.id, d.title, d.url, d.content_text, d.visibility,"
+        " d.owner_id, s.name AS source_name,"
         " s.credibility_tier FROM document d"
         " LEFT JOIN source s ON s.id = d.source_id WHERE d.id = %s",
         (doc_id,))
     return await cur.fetchone()
 
 
-async def _url_in_corpus(conn: psycopg.AsyncConnection,
-                         url: str) -> int | None:
-    cur = await conn.execute(
-        "SELECT id FROM document WHERE url = %s OR canonical_url = %s"
-        " LIMIT 1", (url, url))
+async def _url_in_corpus(ctx: AnalysisContext, url: str) -> int | None:
+    cur = await ctx.conn.execute(
+        "SELECT id FROM document WHERE (url = %s OR canonical_url = %s)"
+        " AND (visibility = 'shared' OR owner_id = %s)"
+        " LIMIT 1", (url, url, ctx.viewer))
     row = await cur.fetchone()
     return int(row["id"]) if row else None
+
+
+def _visible_to_viewer(ctx: AnalysisContext, row: _Row) -> bool:
+    """The retrieval seam's tenancy rule (design §5): the dossier owner is
+    the viewer — shared docs plus their own private docs."""
+    return (row["visibility"] == "shared"
+            or row["owner_id"] == ctx.viewer)
 
 
 async def gather_evidence(ctx: AnalysisContext, claim: DecomposedClaim,
                           k: int) -> list[_Row]:
     """Up to ``k`` candidate docs: corpus FTS, then corpus vectors, then
     NEW web docs fetched through the ingestion pipeline. Dedup by doc id;
-    fetch failures are skipped, never fatal."""
+    fetch failures are skipped, never fatal. The corpus legs run as the
+    dossier OWNER (viewer): shared docs + their own private docs."""
     ordered: list[int] = []
     seen: set[int] = set()
 
@@ -193,7 +202,8 @@ async def gather_evidence(ctx: AnalysisContext, claim: DecomposedClaim,
     try:
         # ranking only — ids; the snippet/ts_headline pass never runs here
         for doc_id in await fts_dao.rank_documents(
-                ctx.conn, claim.text, limit=CORPUS_POOL_LIMIT):
+                ctx.conn, claim.text, limit=CORPUS_POOL_LIMIT,
+                viewer=ctx.viewer):
             _take(doc_id)
     except psycopg.Error:
         log.exception("corpus FTS failed for claim %s", claim.id)
@@ -211,8 +221,12 @@ async def gather_evidence(ctx: AnalysisContext, claim: DecomposedClaim,
     out = []
     for doc_id in ordered[:k]:
         row = await _doc_row(ctx.conn, doc_id)
-        if row is not None and (row["content_text"] or "").strip():
-            out.append(row)
+        if row is None or not (row["content_text"] or "").strip():
+            continue
+        # the vector leg ranks over ALL embeddings — re-check visibility
+        if not _visible_to_viewer(ctx, row):
+            continue
+        out.append(row)
     return out
 
 
@@ -227,7 +241,7 @@ async def _gather_web(ctx: AnalysisContext, claim: DecomposedClaim, k: int,
     for hit in hits:
         if budget <= 0:
             break
-        existing = await _url_in_corpus(ctx.conn, hit.url)
+        existing = await _url_in_corpus(ctx, hit.url)
         if existing is not None:
             take(existing)
             budget -= 1
@@ -380,10 +394,15 @@ async def run(ctx: AnalysisContext, normalized: NormalizedInput,
     results: list[ClaimResult] = []
 
     # reconcile ALL claims onto canonical nodes first (ids exist while
-    # verification is still running)
-    for claim in normalized.claims:
-        claim_id, method = await writeback.reconcile_claim(
-            ctx, text=claim.text, kind=claim.kind)
+    # verification is still running). Gate 2 (I1): a PRIVATE dossier never
+    # touches the shared claim table — its claims get synthetic NEGATIVE
+    # ids and live only in the dossier-scoped section content.
+    for index, claim in enumerate(normalized.claims):
+        if ctx.shared:
+            claim_id, method = await writeback.reconcile_claim(
+                ctx, text=claim.text, kind=claim.kind)
+        else:
+            claim_id, method = -(index + 1), "private"
         results.append(ClaimResult(
             claim_id=claim_id, local_id=claim.id, text=claim.text,
             kind=claim.kind, checkable=claim.checkable,
@@ -436,7 +455,9 @@ async def run(ctx: AnalysisContext, normalized: NormalizedInput,
             if asyncio.iscoroutine(_maybe_await):
                 await _maybe_await
 
-    new_contradictions = await contradictions.scan(conn)
+    # the contradiction scan reads the shared evidence ledger; a private
+    # dossier wrote nothing there, so there is nothing new to scan
+    new_contradictions = await contradictions.scan(conn) if ctx.shared else 0
 
     notes = [f"verified {verified} of {len(checkable)} checkable claims"]
     if ctx.search.name == "null":
@@ -488,15 +509,22 @@ async def _verify_claim(ctx: AnalysisContext, claim: DecomposedClaim,
     stances = [(wd.stance, w) for wd, w in zip(weighed_docs, weights)]
     verdict, confidence, s_score, total_weight = compute_verdict(stances)
 
-    # KB writeback: evidence rows (grade 2) + closed menu for reasoning
+    # KB writeback: evidence rows (grade 2) + closed menu for reasoning.
+    # Gate 2 (I1): rows are written only for SHARED dossiers, and evidence
+    # referencing a PRIVATE document is dropped from the shared writeback
+    # (synthetic negative id; the quote survives in the dossier-scoped
+    # section content only).
     menu = grounding.EvidenceMenu()
     evidence: list[EvidenceRef] = []
     for (doc, judgment), weight in zip(accepted, weights):
-        evidence_id = await writeback.write_evidence(
-            ctx.conn, claim_id=base.claim_id, document_id=doc["id"],
-            stance=judgment.stance, relevance=judgment.relevance,
-            quote=judgment.quoted_span, note=judgment.note,
-            model=ctx.provider.model_for(ModelTier.FAST))
+        if ctx.shared and doc["visibility"] == "shared":
+            evidence_id = await writeback.write_evidence(
+                ctx.conn, claim_id=base.claim_id, document_id=doc["id"],
+                stance=judgment.stance, relevance=judgment.relevance,
+                quote=judgment.quoted_span, note=judgment.note,
+                model=ctx.provider.model_for(ModelTier.FAST))
+        else:
+            evidence_id = -(len(evidence) + 1)
         evidence.append(EvidenceRef(
             evidence_id=evidence_id, document_id=doc["id"],
             stance=judgment.stance, relevance=judgment.relevance,
@@ -511,10 +539,13 @@ async def _verify_claim(ctx: AnalysisContext, claim: DecomposedClaim,
         ctx, claim_text=claim.text, verdict=verdict, menu=menu,
         fallback=fallback)
 
-    await writeback.update_verdict(
-        ctx.conn, claim_id=base.claim_id, verdict=verdict,
-        confidence=confidence, dossier_id=ctx.dossier_id,
-        evidence=evidence)
+    if ctx.shared:
+        # snapshot only the PERSISTED evidence rows (positive ids) — a
+        # dropped private-doc ref must not enter the shared verdict ledger
+        await writeback.update_verdict(
+            ctx.conn, claim_id=base.claim_id, verdict=verdict,
+            confidence=confidence, dossier_id=ctx.dossier_id,
+            evidence=[e for e in evidence if e.evidence_id > 0])
 
     note_parts = []
     if degraded:

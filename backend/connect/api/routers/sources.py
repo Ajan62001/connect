@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 
 import psycopg
 
-from connect.api.deps import get_container, get_db
+from connect.api.deps import get_container, get_db, require_admin
 from connect.domain.models import (
     JobAccepted,
     SampleItem,
@@ -34,7 +34,11 @@ async def list_sources(db: psycopg.AsyncConnection = Depends(get_db)):
     return await source_dao.list_all(db)
 
 
-@router.post("", response_model=Source, status_code=201)
+# Mutations + manual polls are admin-only (design §5: sources are
+# admin-managed; GET stays member-readable for transparency).
+
+@router.post("", response_model=Source, status_code=201,
+             dependencies=[Depends(require_admin)])
 async def create_source(body: SourceCreate,
                         db: psycopg.AsyncConnection = Depends(get_db)):
     _validate_config(body.type, body.config)
@@ -47,7 +51,8 @@ async def create_source(body: SourceCreate,
         enabled=body.enabled, t1_exempt=body.t1_exempt)
 
 
-@router.post("/test", response_model=SourceTestResult)
+@router.post("/test", response_model=SourceTestResult,
+             dependencies=[Depends(require_admin)])
 async def test_source(body: SourceTestRequest,
                       container: Container = Depends(get_container)):
     if body.type == "manual":
@@ -80,7 +85,8 @@ async def get_source(source_id: int,
     return source
 
 
-@router.patch("/{source_id}", response_model=Source)
+@router.patch("/{source_id}", response_model=Source,
+              dependencies=[Depends(require_admin)])
 async def patch_source(source_id: int, body: SourceUpdate,
                        db: psycopg.AsyncConnection = Depends(get_db)):
     existing = await source_dao.get(db, source_id)
@@ -92,7 +98,8 @@ async def patch_source(source_id: int, body: SourceUpdate,
     return await source_dao.update(db, source_id, fields)
 
 
-@router.delete("/{source_id}", status_code=204, response_class=Response)
+@router.delete("/{source_id}", status_code=204, response_class=Response,
+               dependencies=[Depends(require_admin)])
 async def delete_source(source_id: int,
                         db: psycopg.AsyncConnection = Depends(get_db)):
     if not await source_dao.delete(db, source_id):
@@ -100,7 +107,8 @@ async def delete_source(source_id: int,
     return Response(status_code=204)
 
 
-@router.post("/{source_id}/poll", response_model=JobAccepted, status_code=202)
+@router.post("/{source_id}/poll", response_model=JobAccepted,
+             status_code=202, dependencies=[Depends(require_admin)])
 async def poll_source(source_id: int,
                       container: Container = Depends(get_container),
                       db: psycopg.AsyncConnection = Depends(get_db)):

@@ -4,8 +4,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 import psycopg
 
-from connect.api.deps import get_container, get_db
+from connect.api.deps import get_container, get_current_user, get_db
 from connect.domain.models import (
+    CurrentUser,
     DocumentPage,
     EnrichmentEntityRef,
     EntityDetail,
@@ -49,8 +50,11 @@ async def list_entities(q: str | None = Query(default=None),
 
 @router.get("/{entity_id}", response_model=EntityDetail)
 async def get_entity(entity_id: int,
-                     db: psycopg.AsyncConnection = Depends(get_db)):
-    detail = await entity_dao.get_detail(db, entity_id)
+                     db: psycopg.AsyncConnection = Depends(get_db),
+                     user: CurrentUser = Depends(get_current_user)):
+    # derived rows are I1-safe (no tenancy predicate); the viewer scopes
+    # only the per-user view_cursor delta
+    detail = await entity_dao.get_detail(db, entity_id, viewer=user.id)
     if detail is None:
         raise HTTPException(status_code=404, detail="entity not found")
     return detail

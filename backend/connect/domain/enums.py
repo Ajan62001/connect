@@ -12,9 +12,11 @@ from typing import Literal
 
 # --- source ----------------------------------------------------------------
 
-SOURCE_TYPES = ("rss", "scrape", "api", "search", "manual", "twitter", "telegram")
+SOURCE_TYPES = ("rss", "web_news", "scrape", "api", "search", "manual",
+                "twitter", "telegram")
 SourceType = Literal[
-    "rss", "scrape", "api", "search", "manual", "twitter", "telegram"]
+    "rss", "web_news", "scrape", "api", "search", "manual",
+    "twitter", "telegram"]
 
 CREDIBILITY_TIERS = (1, 2, 3, 4)  # 1 official/primary, 2 national media, 3 regional/aggregator, 4 unverified
 

@@ -61,7 +61,7 @@ def test_manual_config_validates():
 
 def test_registry_covers_all_adapter_types():
     assert set(SOURCE_ADAPTERS) == {
-        "rss", "twitter", "telegram", "scrape", "api", "search"}
+        "rss", "web_news", "twitter", "telegram", "scrape", "api", "search"}
 
 
 # --- twitter config ----------------------------------------------------------

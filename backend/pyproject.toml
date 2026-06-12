@@ -14,6 +14,7 @@ dependencies = [
     "trafilatura",
     "pymupdf",
     "feedparser",
+    "lxml",
     "rapidfuzz",
     "sse-starlette",
     "pydantic>=2",

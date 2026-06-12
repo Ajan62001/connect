@@ -48,6 +48,38 @@ class RssConfig(_FrozenConfig):
         return v
 
 
+class WebNewsConfig(_FrozenConfig):
+    """HTML news-listing scraper: fetches an index page, extracts article
+    links matching a regex, and emits them as DiscoveredItems for the normal
+    link-follow → ingest pipeline. Works for any news site that dropped RSS
+    (Moneycontrol, NDTV, Business Standard, etc.).
+
+    ``link_pattern`` is compiled as ``re.search()`` against every full href
+    found on the index page — keep it specific enough to exclude nav/category
+    links (e.g. require a numeric article ID suffix)."""
+    type: Literal["web_news"] = "web_news"
+    index_url: str
+    link_pattern: str
+    poll_interval_minutes: int = Field(default=60, ge=1)
+
+    @field_validator("index_url")
+    @classmethod
+    def _http_url(cls, v: str) -> str:
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("index_url must be an http(s) URL")
+        return v
+
+    @field_validator("link_pattern")
+    @classmethod
+    def _valid_regex(cls, v: str) -> str:
+        import re
+        try:
+            re.compile(v)
+        except re.error as exc:
+            raise ValueError(f"link_pattern is not a valid regex: {exc}") from exc
+        return v
+
+
 class ScrapeConfig(_FrozenConfig):  # stub — adapter lands with PRS in Phase 4
     type: Literal["scrape"] = "scrape"
     index_urls: list[str] = Field(default_factory=list)
@@ -123,8 +155,8 @@ class TelegramConfig(_FrozenConfig):
 
 
 SourceConfig = Annotated[
-    Union[RssConfig, ScrapeConfig, ApiConfig, SearchConfig, ManualConfig,
-          TwitterConfig, TelegramConfig],
+    Union[RssConfig, WebNewsConfig, ScrapeConfig, ApiConfig, SearchConfig,
+          ManualConfig, TwitterConfig, TelegramConfig],
     Field(discriminator="type"),
 ]
 

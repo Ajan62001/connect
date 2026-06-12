@@ -12,9 +12,11 @@ from connect.sources.adapters.rss import RssAdapter
 from connect.sources.adapters.stubs import ApiAdapter, ScrapeAdapter, SearchAdapter
 from connect.sources.adapters.telegram import TelegramAdapter
 from connect.sources.adapters.twitter import TwitterAdapter
+from connect.sources.adapters.web_news import WebNewsAdapter
 
 SOURCE_ADAPTERS: dict[str, type] = {
     "rss": RssAdapter,
+    "web_news": WebNewsAdapter,
     "twitter": TwitterAdapter,
     "telegram": TelegramAdapter,
     "scrape": ScrapeAdapter,
@@ -25,4 +27,4 @@ SOURCE_ADAPTERS: dict[str, type] = {
 # Types the poller actually polls — adapters with working discovery. The
 # stubs raise NotImplementedError until their phases land; `manual` has no
 # adapter at all.
-POLLABLE_TYPES: tuple[str, ...] = ("rss", "twitter", "telegram")
+POLLABLE_TYPES: tuple[str, ...] = ("rss", "web_news", "twitter", "telegram")

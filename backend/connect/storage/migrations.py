@@ -106,12 +106,23 @@ async def pg_migrate_2_to_3(conn: "psycopg.AsyncConnection") -> None:
         " ADD PRIMARY KEY (user_id, surface, ref_id)")
 
 
+async def pg_migrate_3_to_4(conn: "psycopg.AsyncConnection") -> None:
+    """v4 — web_news source type: extend ck_source_type CHECK vocabulary.
+    Named constraint (introduced in PG v1) makes this a non-rebuild ALTER."""
+    await conn.execute(
+        "ALTER TABLE source DROP CONSTRAINT ck_source_type")
+    await conn.execute(
+        "ALTER TABLE source ADD CONSTRAINT ck_source_type"
+        f" CHECK (type IN {schema.E.sql_in(schema.E.SOURCE_TYPES)})")
+
+
 # Registry: version N -> async function taking N's schema to N+1's.
 # Forward-only.
 PG_MIGRATIONS: dict[
     int, Callable[["psycopg.AsyncConnection"], Awaitable[None]]] = {
     1: pg_migrate_1_to_2,
     2: pg_migrate_2_to_3,
+    3: pg_migrate_3_to_4,
 }
 
 

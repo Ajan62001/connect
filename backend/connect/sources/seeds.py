@@ -69,13 +69,17 @@ SEED_SOURCES: tuple[dict, ...] = (
     },
     {
         "name": "Moneycontrol News",
-        "type": "rss",
-        "config": {"feed_url": "https://www.moneycontrol.com/rss/latestnews.xml",
-                   "poll_interval_minutes": 60},
+        "type": "web_news",
+        "config": {
+            "index_url": "https://www.moneycontrol.com/news/",
+            "link_pattern": r"moneycontrol\.com/news/[a-z][a-z0-9/\-]+-\d+\.html",
+            "poll_interval_minutes": 60,
+        },
         "credibility_tier": 2,
-        "notes": "Moneycontrol latest-news feed — Indian markets, economy, "
-                 "corporate. Tier 2 (established national financial media). "
-                 "URL needs live-verification on first deploy.",
+        "notes": "Moneycontrol news index — HTML scraping (no RSS). "
+                 "link_pattern matches article URLs (slug + numeric id + .html) "
+                 "and excludes nav/category links. Tier 2 (established national "
+                 "financial media).",
     },
     {
         "name": "LiveMint News",

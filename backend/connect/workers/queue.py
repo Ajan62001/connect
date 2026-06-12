@@ -54,6 +54,9 @@ KIND_PRIORITIES: dict[str, int] = {
     "enrich_t1_batch": PRIORITY_BACKGROUND,
     "brief_generate": 60,
     "poll_source": PRIORITY_POLL,
+    # bulk historical crawl — lowest priority so it never starves polls or
+    # interactive work; runs when the queue is otherwise idle.
+    "backfill_source": 95,
 }
 
 # the idempotent batch poll survives worker deaths (design §5). Interactive
@@ -67,6 +70,9 @@ KIND_MAX_ATTEMPTS: dict[str, int] = {
     "enrich_t1_batch": 3,
     "analysis": 2,
     "investigation": 2,
+    # idempotent (URL-dedup + content-hash), so a worker crash mid-backfill
+    # should reclaim/requeue rather than orphan-fail it.
+    "backfill_source": 2,
 }
 
 

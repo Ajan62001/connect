@@ -19,7 +19,9 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
+import socket
 import time
 import urllib.robotparser
 from dataclasses import dataclass
@@ -53,6 +55,11 @@ class FetchTooLarge(FetchError):
     """Response body exceeded the byte cap."""
 
 
+class FetchBlocked(FetchError):
+    """SSRF guard: the host resolves to a private/loopback/reserved address.
+    Terminal — never retried, never tried as an https twin."""
+
+
 @dataclass(frozen=True)
 class FetchResult:
     url: str
@@ -60,6 +67,55 @@ class FetchResult:
     status_code: int
     content: bytes
     content_type: str
+
+
+def _ip_is_blocked(ip_text: str) -> bool:
+    """True for addresses we must never fetch server-side: RFC1918 private,
+    loopback (127/8, ::1), link-local (169.254/16 incl. the cloud metadata
+    endpoint, fe80::/10), unique-local (fc00::/7), reserved, multicast,
+    unspecified (0.0.0.0)."""
+    try:
+        ip = ipaddress.ip_address(ip_text)
+    except ValueError:
+        return False
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+async def _host_is_blocked(host: str | None) -> bool:
+    """Resolve ``host`` and block if ANY resolved address is internal. A
+    bare IP literal is classified directly; an unresolvable name is NOT
+    blocked here (the connection simply fails downstream)."""
+    if not host:
+        return True
+    h = host.strip("[]")  # IPv6 literal arrives bracketed from a URL
+    try:
+        ipaddress.ip_address(h)
+        return _ip_is_blocked(h)           # literal address
+    except ValueError:
+        pass
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            h, None, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError, OSError):
+        return False  # let the real connection attempt fail normally
+    return any(_ip_is_blocked(info[4][0]) for info in infos)
+
+
+class _SsrfGuardTransport(httpx.AsyncHTTPTransport):
+    """Validates EVERY request the client makes — including each redirect hop,
+    since httpx invokes the transport per hop — before the socket opens, so an
+    internal target is refused rather than fetched. The single chokepoint
+    behind every Fetcher.fetch (polls, link-follow, user-URL ingest,
+    investigation fetch, backfill)."""
+
+    async def handle_async_request(self, request: httpx.Request
+                                   ) -> httpx.Response:
+        if await _host_is_blocked(request.url.host):
+            raise FetchBlocked(
+                f"refusing to fetch internal/reserved host: "
+                f"{request.url.host!r}")
+        return await super().handle_async_request(request)
 
 
 class Fetcher:
@@ -100,6 +156,9 @@ class Fetcher:
                 },
                 follow_redirects=True,
                 timeout=self.timeout_seconds,
+                # SSRF chokepoint: every hop (incl. redirects) is validated
+                # against private/reserved address space before connecting.
+                transport=_SsrfGuardTransport(),
             )
         return self._client
 
@@ -199,8 +258,8 @@ class Fetcher:
         try:
             return await self._fetch_with_retries(
                 url, parts.netloc, ignore_robots=ignore_robots)
-        except (FetchTooLarge, FetchDisallowed):
-            raise  # https twin would be just as large / just as disallowed
+        except (FetchTooLarge, FetchDisallowed, FetchBlocked):
+            raise  # the https twin is just as large / disallowed / internal
         except FetchError:
             if parts.scheme != "http":
                 raise
@@ -220,7 +279,8 @@ class Fetcher:
             await self._throttle(domain)
             try:
                 return await self._fetch_once(url)
-            except (FetchTooLarge, FetchDisallowed, FetchTerminal):
+            except (FetchTooLarge, FetchDisallowed, FetchTerminal,
+                    FetchBlocked):
                 raise
             except (httpx.HTTPError, FetchError) as e:
                 last_error = e

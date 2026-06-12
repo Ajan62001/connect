@@ -358,6 +358,15 @@ export interface Document extends DocumentListItem {
   statements?: DocumentStatement[];
 }
 
+/** A grounded answer to a question about one document (POST /documents/{id}/ask). */
+export interface DocumentAnswer {
+  answer: string;
+  /** true only when the answer is supported by the document text. */
+  grounded: boolean;
+  /** verbatim supporting excerpt; null when grounded is false. */
+  quote: string | null;
+}
+
 // --- Phase 2: events / threads / briefs / cursors / calendar ----------------
 
 /** Minimal event reference hung off a document detail. */
@@ -825,7 +834,6 @@ export interface InvestigationStageRun {
 
 /** One verbatim quote backing a finding (finding_evidence row). */
 export interface FindingEvidence {
-  id: number;
   document_id: number;
   quote: string;
   title?: string | null;
@@ -1257,6 +1265,35 @@ export interface WatchUpdate {
   muted?: boolean;
 }
 
+// --- findings board (user-authored posts, often sourced from news) ----------
+
+export interface Post {
+  id: number;
+  title: string;
+  body: string;
+  /** the news document this finding was posted from, if any. */
+  document_id: number | null;
+  document_title: string | null;
+  visibility: Visibility;
+  owner_id: number | null;
+  owner_name: string | null;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface PostCreate {
+  title: string;
+  body: string;
+  document_id?: number | null;
+  visibility?: Visibility;
+}
+
+export interface PostUpdate {
+  title?: string;
+  body?: string;
+  visibility?: Visibility;
+}
+
 /** `{watch_id: unread_count}` — JSON object keys arrive as strings. */
 export type WatchBadges = Record<string, number>;
 
@@ -1473,6 +1510,14 @@ export function listDocuments(
 
 export function getDocument(id: number): Promise<Document> {
   return request<Document>(`/api/documents/${id}`);
+}
+
+/** Ask a grounded question about one document (synchronous single LLM call). */
+export function askDocument(id: number, question: string): Promise<DocumentAnswer> {
+  return request<DocumentAnswer>(
+    `/api/documents/${id}/ask`,
+    jsonInit("POST", { question }),
+  );
 }
 
 export function fetchDocumentLink(linkId: number): Promise<LinkFetchResult> {
@@ -1767,6 +1812,26 @@ export function getWatchBadges(): Promise<WatchBadges> {
 
 export function markWatchSeen(id: number): Promise<Watch> {
   return request<Watch>(`/api/watches/${id}/seen`, { method: "POST" });
+}
+
+// ---------------------------------------------------------------------------
+// Findings board (posts)
+// ---------------------------------------------------------------------------
+
+export function listPosts(documentId?: number): Promise<Post[]> {
+  return request<Post[]>(`/api/posts${qs({ document_id: documentId })}`);
+}
+
+export function createPost(payload: PostCreate): Promise<Post> {
+  return request<Post>("/api/posts", jsonInit("POST", payload));
+}
+
+export function updatePost(id: number, payload: PostUpdate): Promise<Post> {
+  return request<Post>(`/api/posts/${id}`, jsonInit("PATCH", payload));
+}
+
+export function deletePost(id: number): Promise<void> {
+  return request<void>(`/api/posts/${id}`, { method: "DELETE" });
 }
 
 // ---------------------------------------------------------------------------

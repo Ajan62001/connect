@@ -65,7 +65,7 @@ class StorageVersionError(StorageError):
 # PostgreSQL baseline schema (v0.2, the canonical DDL) — fresh lineage, v1.
 # ==============================================================================
 
-PG_SCHEMA_VERSION = 4
+PG_SCHEMA_VERSION = 6
 
 # Extensions first: the compose image is pgvector/pgvector:pg17, so both are
 # present; IF NOT EXISTS keeps re-entry harmless.
@@ -855,6 +855,32 @@ _PG_DDL_WATCH_HIT_INDEXES = (
     " ON watch_hit(watch_id, created_at)",
 )
 
+# User-authored findings board (v6): short notes/insights a user posts, often
+# sourced from a news document. Owned + shared/private like dossier; the
+# optional document_id ties a finding to the article it came from. No FTS /
+# content_hash — posts are mutable user content, not immutable snapshots.
+_PG_DDL_POST = f"""
+CREATE TABLE IF NOT EXISTS post (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    owner_id    bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    title       text NOT NULL,
+    body        text NOT NULL,
+    document_id bigint REFERENCES document(id) ON DELETE SET NULL,
+    visibility  text NOT NULL DEFAULT 'shared'
+                CONSTRAINT ck_post_visibility
+                CHECK (visibility IN {E.sql_in(E.VISIBILITIES)}),
+    created_at  timestamptz NOT NULL,
+    updated_at  timestamptz
+)"""
+
+_PG_DDL_POST_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_post_owner"
+    " ON post(owner_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_post_visibility"
+    " ON post(visibility, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_post_document ON post(document_id)",
+)
+
 # One brief per (user, day) — the UNIQUE doubles as the ON CONFLICT target
 # guarding concurrent first-GET generation (tenancy design §5). NULLS NOT
 # DISTINCT is kept for DDL continuity with v2 (user_id is NOT NULL now, so
@@ -1045,6 +1071,8 @@ PG_DDL: tuple[str, ...] = (
     *_PG_DDL_WATCH_INDEXES,
     _PG_DDL_WATCH_HIT,
     *_PG_DDL_WATCH_HIT_INDEXES,
+    _PG_DDL_POST,
+    *_PG_DDL_POST_INDEXES,
     _PG_DDL_BRIEF,
     _PG_DDL_BRIEF_ITEM,
     *_PG_DDL_BRIEF_ITEM_INDEXES,

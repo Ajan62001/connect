@@ -191,7 +191,10 @@ async def test_degrade_ladder_corpus_only_then_forced_conclude(container,
         if n == 1:
             return tool_turn(("search_corpus", {"query": "x"}),
                              usage=usage)
-        return tool_turn(("web_search", {"query": "x"}), usage=usage)
+        # fetch_and_ingest stays gated by corpus_only (web_search no longer is
+        # — searches spend no fetch budget); turn 2 fires it under the flip.
+        return tool_turn(("fetch_and_ingest",
+                          {"url": "https://example.com/x"}), usage=usage)
 
     provider = make_provider(scripted, usage=usage)
     service = make_service(container, provider)
@@ -210,8 +213,8 @@ async def test_degrade_ladder_corpus_only_then_forced_conclude(container,
 
     calls = tools_calls(provider)
     assert [c["tool_choice"] for c in calls] == [None, None, "conclude"]
-    # turn 2's web_search came back as an is_error tool_result naming the
-    # corpus-only degrade (visible to the model in turn 3's transcript)
+    # turn 2's fetch_and_ingest came back as an is_error tool_result naming
+    # the corpus-only degrade (visible to the model in turn 3's transcript)
     final_messages = calls[2]["messages"]
     block = final_messages[-1]["content"][0]
     assert block["type"] == "tool_result"

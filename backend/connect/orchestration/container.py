@@ -110,10 +110,13 @@ class Container:
                 settings.anthropic_api_key)
         self.governor: Governor | None = None
         self.enrichment: EnrichmentService | None = None
-        # Phase 3: web search seam (NullSearchClient when keyless —
-        # verification degrades to corpus-only) + the analysis service.
+        # Phase 3: web search seam — Tavily with a key, else the keyless
+        # DuckDuckGo backend so web search works out of the box; Null only
+        # when web_search_enabled=False (tests/air-gapped). The analysis +
+        # investigation services share this client.
         self.search_client: SearchClient = create_search_client(
-            settings.tavily_api_key)
+            settings.tavily_api_key,
+            web_search_enabled=settings.web_search_enabled)
         self.analysis: AnalysisService | None = None
         # v8: investigation mode — its OWN daily governor + service.
         self.investigation_governor: Governor | None = None

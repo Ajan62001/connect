@@ -11,6 +11,8 @@ from connect.api.deps import get_container, get_current_user, get_db
 from connect.domain.models import (
     CurrentUser,
     Document,
+    DocumentAnswer,
+    DocumentAskRequest,
     DocumentPage,
     DocumentVisibilityUpdate,
     IngestResult,
@@ -18,6 +20,10 @@ from connect.domain.models import (
 )
 from connect.ingestion.extract_html import ExtractionError
 from connect.ingestion.fetcher import FetchDisallowed, FetchError
+from connect.llm import spend
+from connect.llm.provider import LLMError
+from connect.llm.spend import BudgetExceeded
+from connect.llm.tiers import ModelTier
 from connect.orchestration.container import Container
 from connect.storage import documents as doc_dao
 from connect.storage import enrichment as enrichment_dao
@@ -29,6 +35,19 @@ from connect.storage import statements as statement_dao
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 MAX_PAGE_SIZE = 100
+
+# document Q&A (grounded single-call): the model sees at most this many chars
+# of the document; most docs fit whole, long ones are truncated with a note.
+PURPOSE_DOC_QA = "document_qa"
+DOC_QA_CONTENT_CAP = 30_000
+DOC_QA_MAX_TOKENS = 700
+DOC_QA_EST_OUT_TOKENS = 500
+_DOC_QA_SYSTEM = (
+    "You answer the user's question about ONE document, using ONLY that"
+    " document's text — never outside knowledge. If the document does not"
+    " contain the answer, set grounded=false and say it isn't covered."
+    " When grounded, quote a short verbatim excerpt that supports the answer."
+    " Be concise and specific.")
 
 
 def _ingest_response(result: IngestResult) -> JSONResponse:
@@ -130,6 +149,60 @@ async def get_document(doc_id: int,
         "statements": await statement_dao.statements_for_document(
             db, doc_id),
     })
+
+
+@router.post("/{doc_id}/ask", response_model=DocumentAnswer)
+async def ask_document(doc_id: int, body: DocumentAskRequest,
+                       container: Container = Depends(get_container),
+                       db: psycopg.AsyncConnection = Depends(get_db),
+                       user: CurrentUser = Depends(get_current_user)):
+    """Ask a free-text question about ONE document; returns a grounded answer
+    (with a verbatim supporting quote) derived only from that document's
+    stored text. A synchronous, governed single LLM call — NOT the
+    investigation engine. Respects document visibility (a private doc you
+    cannot see is 404)."""
+    document = await doc_dao.get(db, doc_id, viewer=user.id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    if container.llm is None:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not set")
+    question = body.question.strip()
+    if not question:
+        raise HTTPException(status_code=422, detail="question is empty")
+
+    content = document.content_text or ""
+    truncated = len(content) > DOC_QA_CONTENT_CAP
+    if truncated:
+        content = content[:DOC_QA_CONTENT_CAP] + "\n…[document truncated]"
+    user_prompt = (f"QUESTION:\n{question}\n\n"
+                   f"DOCUMENT (title: {document.title or 'untitled'}):\n"
+                   f"{content}")
+
+    # Phase D tenant budget gate (general envelope; purpose excluded from the
+    # investigation governor) -> friendly 429 BEFORE spending.
+    est_in = (len(_DOC_QA_SYSTEM) + len(user_prompt)) // 4 + 200
+    projected = spend.cost_usd(
+        container.llm.model_for(ModelTier.BALANCED),
+        input_tokens=est_in, output_tokens=DOC_QA_EST_OUT_TOKENS)
+    try:
+        await container.governor.check(projected, user_id=user.id)
+    except BudgetExceeded as e:
+        raise HTTPException(status_code=429, detail=str(e)) from e
+
+    try:
+        completion = await container.llm.complete_structured(
+            system=_DOC_QA_SYSTEM,
+            messages=[{"role": "user", "content": user_prompt}],
+            schema=DocumentAnswer, tier=ModelTier.BALANCED,
+            max_tokens=DOC_QA_MAX_TOKENS)
+    except LLMError as e:
+        raise HTTPException(status_code=502,
+                            detail=f"could not answer: {e}") from e
+
+    await spend.record_call(db, purpose=PURPOSE_DOC_QA,
+                            model=completion.model, usage=completion.usage,
+                            user_id=user.id)
+    return completion.output
 
 
 @router.patch("/{doc_id}", response_model=Document)

@@ -20,6 +20,14 @@ class FakeFetcher:
         return FetchResult(url=url, final_url=url, status_code=200,
                            content=content, content_type=content_type)
 
+    def bind_pool(self, pool: object) -> None:
+        """No-op: mirror Fetcher's pool binding so a FakeFetcher can stand in
+        for the container's fetcher in tests."""
+
+    async def aclose(self) -> None:
+        """No-op: mirror Fetcher.aclose so container.shutdown() is clean when
+        a test swaps in a FakeFetcher."""
+
 
 def html_page(title: str, body_html: str) -> tuple[str, bytes]:
     """A page with enough prose that trafilatura reliably extracts it."""

@@ -85,7 +85,7 @@ function FindingCard({
         <div className="flex flex-wrap items-center gap-1.5">
           {finding.evidence.map((evidence) => (
             <Button
-              key={evidence.id}
+              key={evidence.document_id}
               variant="ghost"
               size="xs"
               className="max-w-full"

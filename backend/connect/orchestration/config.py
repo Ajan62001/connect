@@ -52,6 +52,12 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("TAVILY_API_KEY", "CONNECT_TAVILY_API_KEY"),
     )
+    # Web search backend selection: with a Tavily key we use it; without one
+    # we fall back to the keyless DuckDuckGo scraper so investigations can
+    # still reach the open web. Set CONNECT_WEB_SEARCH_ENABLED=false to force
+    # NullSearchClient (corpus-only) — the default in tests (offline) and for
+    # air-gapped deployments.
+    web_search_enabled: bool = True
     twitterapi_io_api_key: str | None = Field(
         default=None,
         validation_alias=AliasChoices(

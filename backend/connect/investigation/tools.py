@@ -102,10 +102,12 @@ TOOL_DEFS: tuple[ToolDef, ...] = (
     ToolDef(
         name="fetch_and_ingest",
         description="Fetch one URL and ingest it as a permanent corpus"
-                    " document (deduped, indexed, T1-enriched, attached to"
-                    " the 'Web (investigation)' tier-4 source). Counted"
-                    " against the per-run web-fetch cap; an already-known"
-                    " URL returns the existing document free.",
+                    " document (deduped, indexed, T1-enriched). Attaches to"
+                    " the registered source that owns the domain (its real"
+                    " credibility tier) when known, else the 'Web"
+                    " (investigation)' tier-4 source. Counted against the"
+                    " per-run web-fetch cap; an already-known URL returns the"
+                    " existing document free.",
         input_schema={
             "type": "object",
             "properties": {"url": {"type": "string"}},
@@ -302,6 +304,11 @@ class ToolExecutor:
         # the retrieval seam's viewer (design §5): the dossier OWNER —
         # corpus reads see shared docs + the owner's own private docs
         self.viewer = viewer
+        # lazily-built domain -> source index: a fetched article from a
+        # registered outlet (moneycontrol, livemint, ...) attaches to that
+        # real tier 1-3 source instead of the tier-4 web sentinel, so its
+        # credibility provenance is correct for fact-check.
+        self._domain_index: dict[str, tuple[int, int]] | None = None
 
     def _doc_visible(self, row: Mapping[str, Any]) -> bool:
         return (row["visibility"] == "shared"
@@ -371,11 +378,10 @@ class ToolExecutor:
         return {"results": results, "total": len(results)}
 
     async def _tool_web_search(self, args: dict[str, Any]) -> Any:
-        if self.state.corpus_only:
-            return ToolOutcome(
-                content="web search disabled: budget degraded to"
-                        " corpus-only — use search_corpus",
-                is_error=True)
+        # NOTE: web_search is deliberately NOT gated by corpus_only — a search
+        # spends no fetch budget (only LLM tokens, already metered per turn),
+        # so the agent can keep FINDING material under budget pressure even
+        # though fetch_and_ingest (which DOES cost a fetch) stays gated below.
         if self.search.name == "null":
             return ToolOutcome(
                 content="web search unavailable; corpus only",
@@ -420,9 +426,12 @@ class ToolExecutor:
         if self.pipeline is None:
             return ToolOutcome(content="ingestion pipeline unavailable",
                                is_error=True)
-        # public web content: shared, system-owned (design §1)
+        # public web content: shared, system-owned (design §1). Attach to the
+        # registered source that owns this domain when known (real tier),
+        # else the tier-4 web sentinel.
+        source_id = await self._resolve_source_id(url)
         result = await self.pipeline.ingest_url(
-            self.conn, url, source_id=self.web_source_id,
+            self.conn, url, source_id=source_id,
             origin="investigation_fetch")
         self.state.web_fetches_used += 1
         doc = result.document
@@ -438,6 +447,23 @@ class ToolExecutor:
         return {"document_id": doc.id, "title": doc.title,
                 "created": result.created, "t1_enriched": t1_done,
                 "chars": len(doc.content_text or "")}
+
+    async def _resolve_source_id(self, url: str) -> int | None:
+        """The registered source that owns ``url``'s domain (tier 1-3), or
+        the tier-4 web sentinel fallback. The index is built once per run and
+        any failure degrades silently to the sentinel."""
+        from connect.sources.attribution import (
+            build_domain_index,
+            resolve_in_index,
+        )
+        if self._domain_index is None:
+            try:
+                self._domain_index = await build_domain_index(self.conn)
+            except Exception:  # noqa: BLE001 — attribution is best-effort
+                # transient failure: fall back this once but DON'T cache an
+                # empty index (that would mis-tier the rest of the run).
+                return self.web_source_id
+        return resolve_in_index(self._domain_index, url) or self.web_source_id
 
     # -- reads --------------------------------------------------------------------
 

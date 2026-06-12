@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+<head><title>rbi repo rate at DuckDuckGo</title></head>
+<body>
+<div class="serp__results">
+  <div id="links" class="results">
+
+    <!-- normal result: uddg-wrapped href + snippet -->
+    <div class="result results_links results_links_deep web-result">
+      <div class="links_main links_deep result__body">
+        <h2 class="result__title">
+          <a rel="nofollow" class="result__a"
+             href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.rbi.org.in%2Fpressrelease.aspx%3Fid%3D12345&amp;rut=deadbeef">
+            RBI keeps repo rate unchanged at 6.5%
+          </a>
+        </h2>
+        <a class="result__snippet"
+           href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.rbi.org.in%2Fpressrelease.aspx%3Fid%3D12345">
+          The Reserve Bank of India left the repo rate unchanged citing
+          easing food inflation and a stable rupee.
+        </a>
+      </div>
+    </div>
+
+    <!-- second result -->
+    <div class="result results_links results_links_deep web-result">
+      <div class="links_main links_deep result__body">
+        <h2 class="result__title">
+          <a rel="nofollow" class="result__a"
+             href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.livemint.com%2Feconomy%2Frbi-mpc-outcome-9876543.html&amp;rut=cafe">
+            RBI MPC outcome: what economists say
+          </a>
+        </h2>
+        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=x">
+          Economists weigh in on the monetary policy committee decision.
+        </a>
+      </div>
+    </div>
+
+    <!-- direct http href (no uddg wrapper) -->
+    <div class="result results_links web-result">
+      <div class="links_main result__body">
+        <h2 class="result__title">
+          <a rel="nofollow" class="result__a"
+             href="https://economictimes.indiatimes.com/news/economy/policy/article-1.cms">
+            ET: RBI policy review
+          </a>
+        </h2>
+        <a class="result__snippet" href="#">Direct-link result snippet.</a>
+      </div>
+    </div>
+
+    <!-- duplicate of the first target — must be collapsed -->
+    <div class="result results_links web-result">
+      <div class="links_main result__body">
+        <h2 class="result__title">
+          <a rel="nofollow" class="result__a"
+             href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.rbi.org.in%2Fpressrelease.aspx%3Fid%3D12345&amp;rut=again">
+            RBI keeps repo rate unchanged (dup)
+          </a>
+        </h2>
+      </div>
+    </div>
+
+    <!-- an ad / internal DDG link with no real uddg target — must be dropped -->
+    <div class="result result--ad">
+      <div class="links_main result__body">
+        <a rel="nofollow" class="result__a"
+           href="//duckduckgo.com/y.js?ad_provider=foo&amp;u3=bar">
+          Sponsored: open a brokerage account
+        </a>
+        <a class="result__snippet" href="#">Ad snippet.</a>
+      </div>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>

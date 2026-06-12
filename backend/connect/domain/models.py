@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from connect.domain.enums import (
     BriefObjectType,
@@ -236,6 +236,53 @@ class SourceTestRequest(_Frozen):
     config: dict[str, Any] = Field(default_factory=dict)
 
 
+_BACKFILL_METHODS = ("sitemap", "pagination", "wayback", "manual")
+
+
+class BackfillRequest(_Frozen):
+    """POST /sources/{id}/backfill — pull OLDER documents into the corpus via
+    one or more discovery strategies (default: all four). Dates are ISO
+    'YYYY-MM-DD'; an open bound (None) means unbounded on that side."""
+    methods: list[str] = Field(
+        default_factory=lambda: list(_BACKFILL_METHODS))
+    start_date: str | None = None
+    end_date: str | None = None
+    limit: int = Field(default=200, ge=1, le=5000)
+    max_pages: int = Field(default=10, ge=1, le=100)
+    # pagination: explicit URL template containing {page} (else ?page=N)
+    page_template: str | None = None
+    # sitemap: explicit sitemap roots (else probed from the source domain)
+    sitemap_urls: list[str] = Field(default_factory=list)
+    # manual: explicit URLs and/or a {date}-templated URL over the range
+    manual_urls: list[str] = Field(default_factory=list)
+    manual_url_template: str | None = None
+
+    @field_validator("methods")
+    @classmethod
+    def _valid_methods(cls, v: list[str]) -> list[str]:
+        cleaned = [m.strip() for m in v if m and m.strip()]
+        bad = [m for m in cleaned if m not in _BACKFILL_METHODS]
+        if bad:
+            raise ValueError(
+                f"unknown backfill method(s) {bad}; "
+                f"choose from {list(_BACKFILL_METHODS)}")
+        if not cleaned:
+            raise ValueError("at least one backfill method is required")
+        return cleaned
+
+    @field_validator("start_date", "end_date")
+    @classmethod
+    def _iso_date(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        from datetime import date
+        try:
+            date.fromisoformat(v.strip())
+        except ValueError as e:
+            raise ValueError(f"date must be ISO YYYY-MM-DD: {e}") from e
+        return v.strip()
+
+
 class SampleItem(_Frozen):
     title: str
     url: str | None = None
@@ -374,6 +421,29 @@ class DocumentPage(_Frozen):
     total: int
     page: int
     page_size: int
+
+
+class DocumentAskRequest(_Frozen):
+    """POST /documents/{id}/ask — a free-text question answered from that one
+    document's stored text."""
+    question: str = Field(min_length=1, max_length=1000)
+
+
+class DocumentAnswer(_Frozen):
+    """A grounded answer to a question about a single document. Doubles as the
+    LLM output schema — the field descriptions ARE the model's instructions."""
+    answer: str = Field(
+        description="A concise answer to the question, derived ONLY from the"
+                    " document text. If the document does not contain the"
+                    " answer, say so plainly and set grounded=false.")
+    grounded: bool = Field(
+        description="true only when the answer is supported by the document"
+                    " text; false when the document does not address the"
+                    " question.")
+    quote: str | None = Field(
+        default=None,
+        description="A short VERBATIM excerpt from the document that supports"
+                    " the answer; null when grounded=false.")
 
 
 # --- entities (Phase 1) --------------------------------------------------------
@@ -632,6 +702,36 @@ class WatchUpdate(_Frozen):
     entity_id: int | None = None
     promote: bool | None = None
     muted: bool | None = None
+
+
+# --- findings board (v6): user-authored posts, often sourced from news --------
+
+class Post(_Frozen):
+    """One user-authored finding/note, optionally tied to the news document it
+    came from. Owned + shared/private like a dossier."""
+    id: int
+    title: str
+    body: str
+    document_id: int | None = None
+    document_title: str | None = None   # joined from the linked document
+    visibility: Visibility = "shared"
+    owner_id: int | None = None
+    owner_name: str | None = None
+    created_at: str
+    updated_at: str | None = None
+
+
+class PostCreate(_Frozen):
+    title: str = Field(min_length=1, max_length=300)
+    body: str = Field(min_length=1, max_length=20_000)
+    document_id: int | None = None
+    visibility: Visibility = "shared"
+
+
+class PostUpdate(_Frozen):
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    body: str | None = Field(default=None, min_length=1, max_length=20_000)
+    visibility: Visibility | None = None
 
 
 # --- jobs --------------------------------------------------------------------

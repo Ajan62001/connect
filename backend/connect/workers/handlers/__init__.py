@@ -6,6 +6,7 @@ first enqueue. One module per job family, mirroring the enqueue sites.
 
 from connect.workers.handlers import (  # noqa: F401 — registration imports
     analysis,
+    backfill,
     brief,
     enrichment,
     investigation,

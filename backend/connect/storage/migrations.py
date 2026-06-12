@@ -116,6 +116,29 @@ async def pg_migrate_3_to_4(conn: "psycopg.AsyncConnection") -> None:
         f" CHECK (type IN {schema.E.sql_in(schema.E.SOURCE_TYPES)})")
 
 
+async def pg_migrate_4_to_5(conn: "psycopg.AsyncConnection") -> None:
+    """v5 — historical backfill: add the 'backfill' document origin and the
+    'backfill_source' job kind. Both are named-CHECK vocabulary extensions
+    (document.ck_document_origin, job.ck_job_kind) — non-rebuild ALTERs."""
+    await conn.execute(
+        "ALTER TABLE document DROP CONSTRAINT ck_document_origin")
+    await conn.execute(
+        "ALTER TABLE document ADD CONSTRAINT ck_document_origin"
+        f" CHECK (origin IN {schema.E.sql_in(schema.E.DOCUMENT_ORIGINS)})")
+    await conn.execute(
+        "ALTER TABLE job DROP CONSTRAINT ck_job_kind")
+    await conn.execute(
+        "ALTER TABLE job ADD CONSTRAINT ck_job_kind"
+        f" CHECK (kind IN {schema.E.sql_in(schema.E.JOB_KINDS)})")
+
+
+async def pg_migrate_5_to_6(conn: "psycopg.AsyncConnection") -> None:
+    """v6 — user-authored findings board: a new owned/visibility ``post``
+    table (CREATE TABLE from schema's DDL — app_user/document already exist)."""
+    for ddl in (schema._PG_DDL_POST, *schema._PG_DDL_POST_INDEXES):
+        await conn.execute(ddl)
+
+
 # Registry: version N -> async function taking N's schema to N+1's.
 # Forward-only.
 PG_MIGRATIONS: dict[
@@ -123,6 +146,8 @@ PG_MIGRATIONS: dict[
     1: pg_migrate_1_to_2,
     2: pg_migrate_2_to_3,
     3: pg_migrate_3_to_4,
+    4: pg_migrate_4_to_5,
+    5: pg_migrate_5_to_6,
 }
 
 

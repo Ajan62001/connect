@@ -48,6 +48,9 @@ def settings(tmp_path, pg_database) -> Settings:
         # never auto-queue LLM work in tests (backend/.env may carry a real
         # ANTHROPIC_API_KEY); tests inject MockProvider explicitly instead
         enrich_fast_path_enabled=False,
+        # keep suites offline: keyless web search would otherwise default to
+        # the live DuckDuckGo backend. Off => NullSearchClient (corpus-only).
+        web_search_enabled=False,
         # deterministic suites hammer the API far past 120 req/min; the
         # dedicated rate-limit tests opt back in with their own Settings
         rate_limit_enabled=False,

@@ -6,6 +6,7 @@ import psycopg
 
 from connect.api.deps import get_container, get_db, require_admin
 from connect.domain.models import (
+    BackfillRequest,
     JobAccepted,
     SampleItem,
     Source,
@@ -122,4 +123,32 @@ async def poll_source(source_id: int,
     jobs = container.jobs
     assert container.poller is not None and jobs is not None
     job_id = await jobs.enqueue("poll_source", {"source_id": source_id})
+    return JobAccepted(job_id=job_id)
+
+
+@router.post("/{source_id}/backfill", response_model=JobAccepted,
+             status_code=202, dependencies=[Depends(require_admin)])
+async def backfill_source(source_id: int, body: BackfillRequest,
+                          container: Container = Depends(get_container),
+                          db: psycopg.AsyncConnection = Depends(get_db)):
+    """Enqueue a historical backfill: pull OLDER documents into the corpus via
+    sitemap / pagination / Wayback / manual discovery (default: all four).
+    The bulk crawl runs at lowest queue priority on a worker."""
+    source = await source_dao.get(db, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="source not found")
+    cfg = source.config or {}
+    has_domain = bool(cfg.get("index_url") or cfg.get("feed_url"))
+    has_manual = bool(body.manual_urls or body.sitemap_urls
+                      or body.manual_url_template)
+    if not has_domain and not has_manual:
+        raise HTTPException(
+            status_code=400,
+            detail=f"source type {source.type!r} carries no web domain to "
+                   "backfill; provide manual_urls / sitemap_urls / "
+                   "manual_url_template")
+    jobs = container.jobs
+    assert jobs is not None
+    payload = {"source_id": source_id, **body.model_dump()}
+    job_id = await jobs.enqueue("backfill_source", payload)
     return JobAccepted(job_id=job_id)

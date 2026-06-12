@@ -6,6 +6,7 @@ import {
   ExternalLinkIcon,
   FileQuestionIcon,
   Loader2Icon,
+  NotebookPenIcon,
   Share2Icon,
 } from "lucide-react";
 import Link from "next/link";
@@ -17,7 +18,11 @@ import { PageHeader } from "@/components/shared/PageHeader";
 import { QueryError } from "@/components/shared/QueryError";
 import { ShareDocumentDialog } from "@/components/shared/ShareDialog";
 import { StatusChip, WatchHitChip } from "@/components/shared/StatusChip";
-import { OwnerByline, VisibilityBadge } from "@/components/shared/Visibility";
+import {
+  OwnerByline,
+  VisibilityBadge,
+  VisibilityToggle,
+} from "@/components/shared/Visibility";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -28,13 +33,24 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Textarea } from "@/components/ui/textarea";
 import type {
   Document,
   DocumentEnrichment,
   DocumentLink,
   DocumentLinkStatus,
   EnrichmentClaim,
+  Visibility,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import {
@@ -44,7 +60,13 @@ import {
   shortHash,
   urlHost,
 } from "@/lib/format";
-import { useDocument, useFetchDocumentLink, useMe } from "@/lib/queries";
+import {
+  useAskDocument,
+  useCreatePost,
+  useDocument,
+  useFetchDocumentLink,
+  useMe,
+} from "@/lib/queries";
 
 function MetaRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -343,9 +365,107 @@ function VisibilityRow({ document }: { document: Document }) {
   );
 }
 
-function MetadataSidebar({ document }: { document: Document }) {
+function PostFindingDialog({
+  documentId,
+  documentTitle,
+  open,
+  onOpenChange,
+}: {
+  documentId: number;
+  documentTitle: string | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [visibility, setVisibility] = useState<Visibility>("shared");
+  const create = useCreatePost();
+
+  const submit = () => {
+    if (!title.trim() || !body.trim()) return;
+    create.mutate(
+      {
+        title: title.trim(),
+        body: body.trim(),
+        document_id: documentId,
+        visibility,
+      },
+      {
+        onSuccess: () => {
+          toast.success("Finding posted");
+          onOpenChange(false);
+          setTitle("");
+          setBody("");
+          setVisibility("shared");
+        },
+        onError: (e) =>
+          toast.error("Could not post finding", { description: e.message }),
+      },
+    );
+  };
+
   return (
-    <aside className="w-full shrink-0 lg:w-64">
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Post a finding</DialogTitle>
+          <DialogDescription className="truncate">
+            From “{documentTitle ?? "this document"}”
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <Input
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            placeholder="Headline of your finding"
+            maxLength={300}
+          />
+          <Textarea
+            value={body}
+            onChange={(e) => setBody(e.target.value)}
+            placeholder="What did you find in this article?"
+            className="min-h-28"
+          />
+          <VisibilityToggle
+            value={visibility}
+            onChange={setVisibility}
+            kind="finding"
+          />
+        </div>
+        <DialogFooter>
+          <Button
+            onClick={submit}
+            disabled={!title.trim() || !body.trim() || create.isPending}
+          >
+            {create.isPending ? (
+              <Loader2Icon className="animate-spin" data-icon="inline-start" />
+            ) : null}
+            Post finding
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function MetadataSidebar({ document }: { document: Document }) {
+  const [postOpen, setPostOpen] = useState(false);
+  return (
+    <aside className="w-full shrink-0 space-y-3 lg:w-64">
+      <Button
+        variant="outline"
+        className="w-full"
+        onClick={() => setPostOpen(true)}
+      >
+        <NotebookPenIcon data-icon="inline-start" />
+        Post a finding
+      </Button>
+      <PostFindingDialog
+        documentId={document.id}
+        documentTitle={document.title}
+        open={postOpen}
+        onOpenChange={setPostOpen}
+      />
       <dl className="space-y-4 rounded-xl border bg-card p-4">
         <MetaRow label="Source">{document.source_name ?? "Manual ingest"}</MetaRow>
         <VisibilityRow document={document} />
@@ -444,6 +564,69 @@ function DocumentSkeleton() {
   );
 }
 
+function AskCard({ documentId }: { documentId: number }) {
+  const [question, setQuestion] = useState("");
+  const ask = useAskDocument(documentId);
+
+  const submit = () => {
+    const q = question.trim();
+    if (q) ask.mutate(q);
+  };
+
+  return (
+    <Card className="mb-6">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <FileQuestionIcon className="size-4" />
+          Ask this document
+        </CardTitle>
+        <CardDescription>
+          Get a grounded answer drawn only from this document’s text.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <Textarea
+          value={question}
+          onChange={(e) => setQuestion(e.target.value)}
+          placeholder="e.g. What did the RBI decide on the repo rate?"
+          className="min-h-20"
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+        />
+        <div className="flex items-center gap-2">
+          <Button onClick={submit} disabled={!question.trim() || ask.isPending}>
+            {ask.isPending ? (
+              <Loader2Icon className="animate-spin" data-icon="inline-start" />
+            ) : null}
+            Ask
+          </Button>
+          <span className="text-xs text-muted-foreground">⌘/Ctrl + Enter</span>
+        </div>
+        {ask.isError ? (
+          <p className="text-sm text-destructive">{ask.error.message}</p>
+        ) : null}
+        {ask.data ? (
+          <div className="space-y-2 rounded-md border bg-muted/40 p-3">
+            <Badge variant={ask.data.grounded ? "default" : "outline"}>
+              {ask.data.grounded ? "Grounded in document" : "Not in document"}
+            </Badge>
+            <p className="text-sm whitespace-pre-wrap">{ask.data.answer}</p>
+            {ask.data.quote ? (
+              <blockquote className="border-l-2 pl-3 text-sm text-muted-foreground italic">
+                “{ask.data.quote}”
+              </blockquote>
+            ) : null}
+          </div>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function DocumentPage({
   params,
 }: {
@@ -482,6 +665,7 @@ export default function DocumentPage({
           <PageHeader title={document.data.title ?? "(untitled document)"} />
           <div className="flex flex-col gap-6 lg:flex-row">
             <article className="min-w-0 flex-1">
+              <AskCard documentId={documentId} />
               {document.data.enrichment ? (
                 <EnrichmentCard enrichment={document.data.enrichment} />
               ) : null}

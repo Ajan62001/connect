@@ -27,6 +27,7 @@ import type {
   BriefSectionKey,
   ContradictionListParams,
   CursorCreate,
+  DocumentAnswer,
   DocumentListParams,
   EntityListParams,
   FeedParams,
@@ -37,6 +38,8 @@ import type {
   InvestigationEvent,
   InvestigationListParams,
   InviteCreate,
+  PostCreate,
+  PostUpdate,
   SearchKind,
   SourceCreate,
   SourceTestRequest,
@@ -58,6 +61,9 @@ export const queryKeys = {
   feed: (params: FeedParams) => ["feed", params] as const,
   watches: ["watches"] as const,
   watchBadges: ["watches", "badges"] as const,
+  posts: ["posts"] as const,
+  postList: (documentId?: number) =>
+    ["posts", "list", documentId ?? null] as const,
   entities: ["entities"] as const,
   entityList: (params: EntityListParams) => ["entities", "list", params] as const,
   entity: (id: number) => ["entities", "detail", id] as const,
@@ -254,6 +260,14 @@ export function useDocument(id: number) {
     queryKey: queryKeys.document(id),
     queryFn: () => api.getDocument(id),
     enabled: Number.isFinite(id),
+  });
+}
+
+/** Ask a grounded question about one document — a synchronous single LLM
+ *  call, so this is a plain mutation (no cache to invalidate). */
+export function useAskDocument(id: number) {
+  return useMutation<DocumentAnswer, Error, string>({
+    mutationFn: (question: string) => api.askDocument(id, question),
   });
 }
 
@@ -625,6 +639,50 @@ export function useMarkWatchSeen() {
   const invalidate = useInvalidateWatches();
   return useMutation({
     mutationFn: (id: number) => api.markWatchSeen(id),
+    onSuccess: invalidate,
+  });
+}
+
+// --------------------------------------------------------------------------
+// Findings board (posts)
+// --------------------------------------------------------------------------
+
+export function usePosts(documentId?: number) {
+  return useQuery({
+    queryKey: queryKeys.postList(documentId),
+    queryFn: () => api.listPosts(documentId),
+    placeholderData: keepPreviousData,
+  });
+}
+
+function useInvalidatePosts() {
+  const queryClient = useQueryClient();
+  return () => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.posts });
+  };
+}
+
+export function useCreatePost() {
+  const invalidate = useInvalidatePosts();
+  return useMutation({
+    mutationFn: (payload: PostCreate) => api.createPost(payload),
+    onSuccess: invalidate,
+  });
+}
+
+export function useUpdatePost() {
+  const invalidate = useInvalidatePosts();
+  return useMutation({
+    mutationFn: ({ id, payload }: { id: number; payload: PostUpdate }) =>
+      api.updatePost(id, payload),
+    onSuccess: invalidate,
+  });
+}
+
+export function useDeletePost() {
+  const invalidate = useInvalidatePosts();
+  return useMutation({
+    mutationFn: (id: number) => api.deletePost(id),
     onSuccess: invalidate,
   });
 }

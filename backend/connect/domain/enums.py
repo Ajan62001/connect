@@ -101,7 +101,7 @@ FINDING_KINDS = (
 # --- jobs ------------------------------------------------------------------
 
 JOB_KINDS = (
-    "poll_source", "ingest_url", "analysis",
+    "poll_source", "backfill_source", "ingest_url", "analysis",
     "enrich_t1_sync", "enrich_t1_batch", "enrich_t2", "reverify_claim",
     "brief_generate", "investigation")
 JOB_STATUSES = ("queued", "running", "done", "failed", "cancelled")
@@ -162,9 +162,9 @@ ROLES = ("admin", "member")
 Role = Literal["admin", "member"]
 
 DOCUMENT_ORIGINS = ("polled", "link_follow", "investigation_fetch",
-                    "user_url", "user_upload", "user_text")
+                    "user_url", "user_upload", "user_text", "backfill")
 DocumentOrigin = Literal["polled", "link_follow", "investigation_fetch",
-                         "user_url", "user_upload", "user_text"]
+                         "user_url", "user_upload", "user_text", "backfill"]
 
 # --- vector backends (health reporting) -------------------------------------
 

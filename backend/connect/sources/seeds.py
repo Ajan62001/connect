@@ -81,6 +81,146 @@ SEED_SOURCES: tuple[dict, ...] = (
                  "and excludes nav/category links. Tier 2 (established national "
                  "financial media).",
     },
+    # --- SEBI (tier 1) ----------------------------------------------------------
+    {
+        "name": "SEBI Press Releases",
+        "type": "rss",
+        "config": {"feed_url": "https://www.sebi.gov.in/sebirss.xml",
+                   "poll_interval_minutes": 60},
+        "credibility_tier": 1,
+        "notes": "Securities and Exchange Board of India — official circulars, "
+                 "orders, press releases. URL needs live-verification on first deploy.",
+    },
+    # --- national media, tier 2 (RSS) -----------------------------------------
+    {
+        "name": "The Wire",
+        "type": "rss",
+        "config": {"feed_url": "https://thewire.in/feed",
+                   "poll_interval_minutes": 60},
+        "credibility_tier": 2,
+        "notes": "Independent national news. URL needs live-verification on first deploy.",
+    },
+    {
+        "name": "The Print",
+        "type": "rss",
+        "config": {"feed_url": "https://theprint.in/feed/",
+                   "poll_interval_minutes": 60},
+        "credibility_tier": 2,
+        "notes": "Independent national news. URL needs live-verification on first deploy.",
+    },
+    {
+        "name": "The Hindu — Business",
+        "type": "rss",
+        "config": {"feed_url": "https://www.thehindu.com/business/Economy/?service=rss",
+                   "poll_interval_minutes": 120},
+        "credibility_tier": 2,
+        "notes": "The Hindu economy/business section RSS. "
+                 "URL needs live-verification on first deploy.",
+    },
+    {
+        "name": "NDTV — Top Stories",
+        "type": "rss",
+        "config": {"feed_url": "https://feeds.feedburner.com/ndtvnews-top-stories",
+                   "poll_interval_minutes": 60},
+        "credibility_tier": 2,
+        "notes": "NDTV top-stories feed via FeedBurner. "
+                 "URL needs live-verification on first deploy.",
+    },
+    {
+        "name": "India Today",
+        "type": "rss",
+        "config": {"feed_url": "https://www.indiatoday.in/feed",
+                   "poll_interval_minutes": 60},
+        "credibility_tier": 2,
+        "notes": "India Today top feed. URL needs live-verification on first deploy.",
+    },
+    {
+        "name": "Financial Express",
+        "type": "rss",
+        "config": {"feed_url": "https://www.financialexpress.com/feed/",
+                   "poll_interval_minutes": 60},
+        "credibility_tier": 2,
+        "notes": "Financial Express. URL needs live-verification on first deploy.",
+    },
+    {
+        "name": "Factly",
+        "type": "rss",
+        "config": {"feed_url": "https://factly.in/feed/",
+                   "poll_interval_minutes": 120},
+        "credibility_tier": 2,
+        "notes": "Fact-checker (data-driven, policy focus). "
+                 "URL needs live-verification on first deploy.",
+    },
+    {
+        "name": "Vishvas News",
+        "type": "rss",
+        "config": {"feed_url": "https://www.vishvasnews.com/feed/",
+                   "poll_interval_minutes": 120},
+        "credibility_tier": 2,
+        "notes": "Fact-checker (Hindi/English). "
+                 "URL needs live-verification on first deploy.",
+    },
+    # --- aggregator tier 3 (RSS, t1_exempt) ------------------------------------
+    {
+        "name": "Times of India — Top Stories",
+        "type": "rss",
+        "config": {"feed_url": "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
+                   "poll_interval_minutes": 60},
+        "credibility_tier": 3,
+        "t1_exempt": True,
+        "notes": "ToI top-stories feed; high volume + syndication => T1-exempt. "
+                 "URL needs live-verification on first deploy.",
+    },
+    # --- web_news (tier 2, no RSS) --------------------------------------------
+    {
+        "name": "Business Standard — Economy",
+        "type": "web_news",
+        "config": {
+            "index_url": "https://www.business-standard.com/economy-policy",
+            "link_pattern": r"business-standard\.com/[a-z-]+/[a-z0-9-]+-\d+_\d+\.html",
+            "poll_interval_minutes": 60,
+        },
+        "credibility_tier": 2,
+        "notes": "Business Standard economy/policy section — HTML scraping. "
+                 "URL needs live-verification on first deploy.",
+    },
+    {
+        "name": "BQ Prime — Economy",
+        "type": "web_news",
+        "config": {
+            "index_url": "https://www.bqprime.com/economy",
+            "link_pattern": r"bqprime\.com/[a-z-]+/[a-z0-9-]{25,}",
+            "poll_interval_minutes": 60,
+        },
+        "credibility_tier": 2,
+        "notes": "BQ Prime (Bloomberg Quint) economy section — HTML scraping. "
+                 "URL needs live-verification on first deploy.",
+    },
+    {
+        "name": "CNBCTV18 — Economy",
+        "type": "web_news",
+        "config": {
+            "index_url": "https://www.cnbctv18.com/economy/",
+            "link_pattern": r"cnbctv18\.com/[a-z-]+/[a-z0-9-]+-\d+\.htm",
+            "poll_interval_minutes": 60,
+        },
+        "credibility_tier": 2,
+        "notes": "CNBCTV18 economy section — HTML scraping. "
+                 "URL needs live-verification on first deploy.",
+    },
+    {
+        "name": "Hindustan Times — India",
+        "type": "web_news",
+        "config": {
+            "index_url": "https://www.hindustantimes.com/india-news/",
+            "link_pattern": r"hindustantimes\.com/[a-z-]+/[a-z0-9-]+-\d{10,}\.html",
+            "poll_interval_minutes": 60,
+        },
+        "credibility_tier": 2,
+        "notes": "Hindustan Times India section — HTML scraping. "
+                 "URL needs live-verification on first deploy.",
+    },
+    # --------------------------------------------------------------------------
     {
         "name": "LiveMint News",
         "type": "rss",

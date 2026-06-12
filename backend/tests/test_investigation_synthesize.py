@@ -6,7 +6,7 @@ budget-skip path."""
 from __future__ import annotations
 
 import pytest
-from kb_factories import insert_doc
+from kb_factories import ensure_user, insert_doc
 from mock_llm import MockProvider
 
 from connect.analysis.budget import AnalysisBudget
@@ -44,9 +44,10 @@ async def env(db, pool):
     doc_id = await insert_doc(conn, title="doc",
                               text="The committee objected to the draft.")
     await conn.execute(
-        "INSERT INTO dossier (kind, input_text, status, created_at)"
-        " VALUES ('investigation', 'draft rules', 'running', %s)",
-        (utc_now(),))
+        "INSERT INTO dossier (kind, input_text, status, created_at,"
+        " owner_id) VALUES ('investigation', 'draft rules', 'running',"
+        " %s, %s)",
+        (utc_now(), await ensure_user(conn)))
     await conn.execute(
         "INSERT INTO question (dossier_id, qtype, text, status,"
         " created_at) VALUES (1, 'why_now', 'Why now?', 'open', %s)",

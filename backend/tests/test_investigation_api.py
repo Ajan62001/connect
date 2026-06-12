@@ -17,6 +17,7 @@ from kb_factories import insert_doc
 from mock_llm import MockProvider, tool_turn
 
 from connect.api.main import create_app
+from conftest import login
 from connect.investigation.schema import (
     GeneratedQuestion,
     GeneratedQuestions,
@@ -35,6 +36,7 @@ QUOTE = ("The RBI tightened the rules in response to the payment fraud "
 def env(settings):
     app = create_app(settings)
     with TestClient(app) as client:
+        login(client)
         yield client, app.state.container
 
 
@@ -142,10 +144,15 @@ async def test_governor_429(env, db):
     client, container = env
     container.investigations.provider = MockProvider()
     from connect.llm import spend
-    # exhaust today's investigation envelope (~$10.2 on sonnet input)
+    from connect.storage import app_settings as app_settings_dao
+    # exhaust today's investigation ENVELOPE while staying under the $10
+    # GLOBAL backstop (Phase D layers it above both envelopes): ~$1.2 of
+    # investigation spend against a $1 envelope
+    await app_settings_dao.set_value(
+        db, "investigation_daily_budget_usd", "1.0")
     await spend.record_call(db, purpose="investigation",
                             model="claude-sonnet-4-6",
-                            usage=Usage(input_tokens=3_400_000))
+                            usage=Usage(input_tokens=400_000))
     res = client.post("/api/investigations", json={"topic": "x"})
     assert res.status_code == 429
     # the GENERAL surface is not gated by investigation spend: an analysis

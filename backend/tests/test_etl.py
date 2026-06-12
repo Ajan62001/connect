@@ -467,16 +467,14 @@ def test_identity_sequences_realigned(v9_path, pg_database):
         assert new_user == report.admin_user_id + 1
 
 
-def test_runs_without_owner_email_single_user_nulls(v9_path, pg_database):
-    """Without --owner-email the baseline stays single-user-safe: user/owner
-    columns NULL, visibility/origin still backfilled."""
-    report = run_etl(v9_path, pg_database, fts_queries=FTS_QUERIES)
-    assert report.ok, report.render()
-    assert report.admin_user_id is None
+def test_refuses_without_owner_email_when_rows_need_an_owner(
+        v9_path, pg_database):
+    """v3 tenancy: dossier.owner_id and watch/brief/view_cursor.user_id are
+    NOT NULL — a source carrying such rows must be migrated WITH
+    --owner-email; the run refuses loudly rather than guessing an owner."""
+    with pytest.raises(SystemExit, match="--owner-email is required"):
+        run_etl(v9_path, pg_database, fts_queries=FTS_QUERIES)
     with _pg(pg_database) as pg:
+        # refused before any copy: the target stayed empty
         assert _one(pg, "SELECT count(*) FROM app_user")[0] == 0
-        assert _one(pg, "SELECT user_id FROM watch")[0] is None
-        assert _one(pg, "SELECT owner_id, visibility FROM dossier"
-                        " WHERE id = 1") == (None, "shared")
-        assert _one(pg, "SELECT owner_id, origin FROM document WHERE id = 6"
-                    ) == (None, "user_text")
+        assert _one(pg, "SELECT count(*) FROM document")[0] == 0

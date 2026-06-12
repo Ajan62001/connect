@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from kb_factories import add_mentions, insert_doc, insert_source
 
 from connect.api.main import create_app
+from conftest import login
 from connect.knowledge import briefing, contradictions
 from connect.llm.spend import today_utc
 from connect.storage.pg import utc_now
@@ -18,6 +19,7 @@ from connect.storage.pg import utc_now
 def env(settings):
     app = create_app(settings)
     with TestClient(app) as client:
+        login(client)
         yield client, app.state.container
 
 
@@ -159,9 +161,12 @@ async def test_suggestion_scoring_components_and_reason(env, db):
     await add_mentions(conn, d1, ("SEBI",))
     cur = await conn.execute("SELECT id FROM entity WHERE name='SEBI'")
     entity_id = (await cur.fetchone())["id"]
+    from conftest import TEST_USER_EMAIL
+    from kb_factories import ensure_user
     await conn.execute(
-        "INSERT INTO watch (kind, label, entity_id, created_at)"
-        " VALUES ('entity', 'SEBI', %s, %s)", (entity_id, utc_now()))
+        "INSERT INTO watch (user_id, kind, label, entity_id, created_at)"
+        " VALUES (%s, 'entity', 'SEBI', %s, %s)",
+        (await ensure_user(conn, TEST_USER_EMAIL), entity_id, utc_now()))
 
     warm = await make_claim(conn, "Two-source trending claim")
     await add_sighting(conn, warm, await insert_doc(conn, source_id=et))
@@ -213,7 +218,10 @@ async def test_suggestion_calendar_and_tier1_components(container, db):
         " VALUES ('election', 'BR', %s::date + 30, 'Bihar election')",
         (today,))
 
-    drafts = await briefing._suggestion_items(conn, today)
+    from conftest import TEST_USER_EMAIL
+    from kb_factories import ensure_user
+    me = await ensure_user(conn, TEST_USER_EMAIL)
+    drafts = await briefing._suggestion_items(conn, me, today)
     assert len(drafts) == 1
     draft = drafts[0]
     # trending(1) + calendar(1); tier-1 source present -> NO official gap

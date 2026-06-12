@@ -21,6 +21,7 @@ from connect.analysis.schema import (
     StanceJudgment,
 )
 from connect.api.main import create_app
+from conftest import login
 from dbutil import q1, qall, qv
 
 
@@ -28,6 +29,7 @@ from dbutil import q1, qall, qv
 def env(settings):
     app = create_app(settings)
     with TestClient(app) as client:
+        login(client)
         yield client, app.state.container
 
 

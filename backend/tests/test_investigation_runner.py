@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 
 from dbutil import q1, qall, qv
-from kb_factories import insert_doc
+from kb_factories import ensure_user, insert_doc
 from mock_llm import MockProvider, tool_turn
 
 from connect.investigation.runner import InvestigationService
@@ -61,10 +61,16 @@ def make_service(container, provider, *, daily_budget=10.0,
 
 
 async def run_to_completion(container, service, seed, options):
-    dossier_id, job_id = await service.start(seed, options)
+    owner = await _owner(container)
+    dossier_id, job_id = await service.start(seed, options, owner_id=owner)
     await asyncio.gather(*list(container.jobs._tasks),
                          return_exceptions=True)
     return dossier_id, job_id
+
+
+async def _owner(container) -> int:
+    async with container.pool.connection() as conn:
+        return await ensure_user(conn)
 
 
 async def events_of(conn, job_id):
@@ -310,7 +316,8 @@ async def test_cancel_mid_loop(container, db):
     service = make_service(container, provider)
     dossier_id, job_id = await service.start(
         InvestigationSeed(topic="cancel drill"),
-        InvestigationOptions(budget_usd=1.0))
+        InvestigationOptions(budget_usd=1.0),
+        owner_id=await _owner(container))
 
     for _ in range(200):  # let the job start and hang on the first turn
         await asyncio.sleep(0.01)

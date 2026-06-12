@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+from kb_factories import ensure_user
+
 from connect.knowledge import watches as watch_logic
 from connect.storage import watches as watch_dao
 from connect.storage.pg import utc_now
@@ -28,8 +30,9 @@ async def _ingest(container, db, text, title):
 
 
 async def test_topic_watch_sets_watch_hit(container, db):
+    user = await ensure_user(db)
     watch = await watch_dao.insert(
-        db, kind="topic", label="FPI disclosure",
+        db, user_id=user, kind="topic", label="FPI disclosure",
         query_fts='"portfolio investors"')
     doc = await _ingest(container, db, DOC, "SEBI tightens FPI norms")
 
@@ -52,7 +55,8 @@ async def test_entity_alias_watch_matches_word_boundary(container, db):
     cur = await db.execute("SELECT id FROM entity")
     entity_id = (await cur.fetchone())["id"]
     watch = await watch_dao.insert(
-        db, kind="entity", label="SEBI", entity_id=entity_id)
+        db, user_id=await ensure_user(db), kind="entity", label="SEBI",
+        entity_id=entity_id)
 
     doc = await _ingest(container, db, DOC, "SEBI tightens FPI norms")
     other = await _ingest(container, db, OTHER,
@@ -67,7 +71,8 @@ async def test_entity_alias_watch_matches_word_boundary(container, db):
 
 
 async def test_non_matching_doc_gets_no_hits(container, db):
-    await watch_dao.insert(db, kind="topic", label="crypto",
+    await watch_dao.insert(db, user_id=await ensure_user(db),
+                           kind="topic", label="crypto",
                            query_fts="cryptocurrency")
     doc = await _ingest(container, db, OTHER,
                         "Irrigation project approved")
@@ -77,7 +82,8 @@ async def test_non_matching_doc_gets_no_hits(container, db):
 
 
 async def test_muted_watch_does_not_match(container, db):
-    await watch_dao.insert(db, kind="topic", label="muted",
+    await watch_dao.insert(db, user_id=await ensure_user(db),
+                           kind="topic", label="muted",
                            query_fts="irrigation", muted=True)
     await _ingest(container, db, OTHER, "Irrigation project approved")
     cur = await db.execute("SELECT COUNT(*) AS n FROM watch_hit")
@@ -85,10 +91,12 @@ async def test_muted_watch_does_not_match(container, db):
 
 
 async def test_badges_and_seen_cursor(container, db):
+    user = await ensure_user(db)
     watch = await watch_dao.insert(
-        db, kind="topic", label="FPI", query_fts='"portfolio investors"')
+        db, user_id=user, kind="topic", label="FPI",
+        query_fts='"portfolio investors"')
     await _ingest(container, db, DOC, "SEBI tightens FPI norms")
 
-    assert await watch_logic.badges(db) == {watch.id: 1}
-    await watch_logic.mark_seen(db, watch.id)
-    assert await watch_logic.badges(db) == {watch.id: 0}
+    assert await watch_logic.badges(db, user) == {watch.id: 1}
+    await watch_logic.mark_seen(db, watch.id, user)
+    assert await watch_logic.badges(db, user) == {watch.id: 0}

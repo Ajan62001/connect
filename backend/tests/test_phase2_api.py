@@ -12,6 +12,7 @@ from kb_factories import add_mentions, t1_doc
 from mock_llm import MockProvider
 
 from connect.api.main import create_app
+from conftest import login
 from connect.knowledge.calendar import CALENDAR_SEED, seed_calendar_events
 from connect.knowledge.enrichment.t1 import EnrichmentT1, T1Entity
 from connect.knowledge.linking import event_clusterer as ec
@@ -24,6 +25,7 @@ from dbutil import q1, qv
 def env(settings):
     app = create_app(settings)
     with TestClient(app) as client:
+        login(client)
         yield client, app.state.container
 
 

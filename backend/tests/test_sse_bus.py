@@ -14,7 +14,10 @@ import pytest
 from dbutil import qv
 from fastapi.testclient import TestClient
 
+from kb_factories import ensure_user
+
 from connect.api.main import create_app
+from conftest import login
 from connect.orchestration import events
 from connect.orchestration.bus import EventBus
 from connect.storage import jobs as job_dao
@@ -76,6 +79,7 @@ def parse_sse(text: str) -> list[tuple[int, str, dict]]:
 def client_env(settings):
     app = create_app(settings)
     with TestClient(app) as client:
+        login(client)
         yield client, app.state.container
 
 
@@ -83,8 +87,9 @@ async def seed_finished_analysis(db) -> tuple[int, list[int]]:
     """A completed analysis dossier + job + its event rows, written
     directly (replay must work for jobs no live process remembers)."""
     cur = await db.execute(
-        "INSERT INTO dossier (input_text, input_type, status, created_at)"
-        " VALUES ('x', 'claim', 'completed', %s) RETURNING id", (utc_now(),))
+        "INSERT INTO dossier (input_text, input_type, status, created_at,"
+        " owner_id) VALUES ('x', 'claim', 'completed', %s, %s)"
+        " RETURNING id", (utc_now(), await ensure_user(db)))
     dossier_id = int((await cur.fetchone())["id"])
     job_id = await job_dao.create(db, "analysis", {}, dossier_id=dossier_id)
     await job_dao.claim_one(db, job_id, "w1")
@@ -141,8 +146,9 @@ async def test_sse_terminal_row_safety_valve(client_env, db):
     stream rather than hang — the v0.1 safety valve on the bus path."""
     client, _container = client_env
     cur = await db.execute(
-        "INSERT INTO dossier (input_text, input_type, status, created_at)"
-        " VALUES ('x', 'claim', 'failed', %s) RETURNING id", (utc_now(),))
+        "INSERT INTO dossier (input_text, input_type, status, created_at,"
+        " owner_id) VALUES ('x', 'claim', 'failed', %s, %s)"
+        " RETURNING id", (utc_now(), await ensure_user(db)))
     dossier_id = int((await cur.fetchone())["id"])
     job_id = await job_dao.create(db, "analysis", {},
                                   dossier_id=dossier_id)

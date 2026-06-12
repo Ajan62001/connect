@@ -32,6 +32,12 @@ from connect.orchestration.config import Settings
 from connect.orchestration.container import Container
 
 
+# The dev-login escape hatch doubles as the test login: the `client`
+# fixture signs in through the REAL auth path (user row + session row +
+# cookie), so every API test runs authenticated exactly like production.
+TEST_USER_EMAIL = "dev@test.local"
+
+
 @pytest.fixture()
 def settings(tmp_path, pg_database) -> Settings:
     return Settings(
@@ -42,6 +48,18 @@ def settings(tmp_path, pg_database) -> Settings:
         # never auto-queue LLM work in tests (backend/.env may carry a real
         # ANTHROPIC_API_KEY); tests inject MockProvider explicitly instead
         enrich_fast_path_enabled=False,
+        # deterministic suites hammer the API far past 120 req/min; the
+        # dedicated rate-limit tests opt back in with their own Settings
+        rate_limit_enabled=False,
+        # auth: deterministic oauth_state signing + the dev-login hatch
+        # (backend/.env may carry real Google credentials — never let them
+        # leak into tests)
+        session_secret="test-secret",
+        dev_login_email=TEST_USER_EMAIL,
+        google_oauth_client_id=None,
+        google_oauth_client_secret=None,
+        admin_emails=[],
+        frontend_origin="",
     )
 
 
@@ -53,8 +71,27 @@ async def container(settings) -> Container:
     await c.shutdown()
 
 
+def login(test_client: TestClient) -> dict:
+    """Dev-login on this client (cookie persists in its jar); returns the
+    /api/me payload. First login in a fresh DB creates the admin user."""
+    resp = test_client.post("/api/auth/dev-login")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
 @pytest.fixture()
 def client(settings):
+    """An AUTHENTICATED TestClient (first user => admin). Tests that need
+    the signed-out state use `anon_client` or clear the cookie jar."""
+    app = create_app(settings)
+    with TestClient(app) as test_client:
+        login(test_client)
+        yield test_client
+
+
+@pytest.fixture()
+def anon_client(settings):
+    """A signed-out TestClient on the same app/database wiring."""
     app = create_app(settings)
     with TestClient(app) as test_client:
         yield test_client

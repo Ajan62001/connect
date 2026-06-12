@@ -61,7 +61,7 @@ async def _insert_document(conn, content_hash: str, *, title=None,
 
 async def test_fresh_init_creates_full_schema(pg_fresh_dsn):
     version = await pg.init_db(pg_fresh_dsn)
-    assert version == PG_SCHEMA_VERSION == 2
+    assert version == PG_SCHEMA_VERSION == 3
 
     conn = await pg.connect(pg_fresh_dsn)
     try:
@@ -121,8 +121,8 @@ async def test_init_db_idempotent_and_version_round_trip(pg_fresh_dsn):
 async def test_migrate_1_to_2_walks_a_v1_database_forward(pg_fresh_dsn):
     """Forward-only migration coverage: reconstruct a v1 job table (drop
     the v2 queue columns/state tables), stamp version 1, and let init_db
-    walk it to v2 — columns appear, run_at backfills from created_at, the
-    runtime tables exist."""
+    walk it forward (1 -> 2 -> 3) — columns appear, run_at backfills from
+    created_at, the runtime tables exist."""
     await pg.init_db(pg_fresh_dsn)
     conn = await pg.connect(pg_fresh_dsn)
     try:
@@ -138,7 +138,7 @@ async def test_migrate_1_to_2_walks_a_v1_database_forward(pg_fresh_dsn):
         await conn.execute(
             "INSERT INTO job (kind, created_at) VALUES ('analysis', %s)",
             ("2026-01-02T03:04:05.000Z",))
-        assert await pg.init_db(pg_fresh_dsn) == PG_SCHEMA_VERSION == 2
+        assert await pg.init_db(pg_fresh_dsn) == PG_SCHEMA_VERSION
         cur = await conn.execute(
             "SELECT priority, max_attempts, run_at, created_at,"
             " claimed_by, heartbeat_at FROM job")
@@ -450,30 +450,106 @@ async def test_tenancy_tables_and_session_cascade(pg_conn):
     assert (await cur.fetchone())["n"] == 0  # ON DELETE CASCADE
 
 
-async def test_brief_unique_nulls_not_distinct(pg_conn):
-    """Single-user rows (user_id NULL) keep the v0.1 one-brief-per-day
-    dedupe: UNIQUE NULLS NOT DISTINCT treats NULL user_ids as equal."""
-    insert = ("INSERT INTO brief (brief_date, generated_at)"
-              " VALUES (%s, %s) ON CONFLICT (user_id, brief_date) DO NOTHING")
-    cur = await pg_conn.execute(insert, ("2026-06-11", pg.utc_now()))
+async def _make_user(pg_conn, email: str, role: str = "member") -> int:
+    cur = await pg_conn.execute(
+        "INSERT INTO app_user (email, role, created_at)"
+        " VALUES (%s, %s, %s) RETURNING id", (email, role, pg.utc_now()))
+    return int((await cur.fetchone())["id"])
+
+
+async def test_brief_unique_per_user_day(pg_conn):
+    """v3: one brief per (user, day) — the conflict target guarding
+    concurrent first-GET generation; different users coexist on a day."""
+    alice = await _make_user(pg_conn, "alice@example.org")
+    bob = await _make_user(pg_conn, "bob@example.org")
+    insert = ("INSERT INTO brief (user_id, brief_date, generated_at)"
+              " VALUES (%s, %s, %s)"
+              " ON CONFLICT (user_id, brief_date) DO NOTHING")
+    cur = await pg_conn.execute(insert, (alice, "2026-06-11", pg.utc_now()))
     assert cur.rowcount == 1
-    cur = await pg_conn.execute(insert, ("2026-06-11", pg.utc_now()))
+    cur = await pg_conn.execute(insert, (alice, "2026-06-11", pg.utc_now()))
     assert cur.rowcount == 0                 # loser of the race no-ops
+    cur = await pg_conn.execute(insert, (bob, "2026-06-11", pg.utc_now()))
+    assert cur.rowcount == 1                 # per-user, not global
     cur = await pg_conn.execute("SELECT count(*) AS n FROM brief")
-    assert (await cur.fetchone())["n"] == 1
+    assert (await cur.fetchone())["n"] == 2
 
 
 async def test_view_cursor_upsert_shape(pg_conn):
-    """The baseline keeps PK (surface, ref_id) — the v0.1 upsert key; the
-    tenancy workstream swaps the PK once user_id is backfilled."""
-    upsert = ("INSERT INTO view_cursor (surface, ref_id, last_seen_at)"
-              " VALUES ('entity', 7, %s) ON CONFLICT (surface, ref_id)"
+    """v3: the PK is (user_id, surface, ref_id) — per-user cursors that
+    never collide across users."""
+    alice = await _make_user(pg_conn, "alice@example.org")
+    bob = await _make_user(pg_conn, "bob@example.org")
+    upsert = ("INSERT INTO view_cursor (user_id, surface, ref_id,"
+              " last_seen_at) VALUES (%s, 'entity', 7, %s)"
+              " ON CONFLICT (user_id, surface, ref_id)"
               " DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at")
     t1, t2 = pg.utc_now(), pg.utc_now()
-    await pg_conn.execute(upsert, (t1,))
-    await pg_conn.execute(upsert, (t2,))
+    await pg_conn.execute(upsert, (alice, t1))
+    await pg_conn.execute(upsert, (alice, t2))
+    await pg_conn.execute(upsert, (bob, t1))
     cur = await pg_conn.execute(
-        "SELECT last_seen_at, user_id FROM view_cursor")
+        "SELECT user_id, last_seen_at FROM view_cursor ORDER BY user_id")
     rows = await cur.fetchall()
-    assert len(rows) == 1
-    assert rows[0]["last_seen_at"] == t2 and rows[0]["user_id"] is None
+    assert len(rows) == 2                    # alice upserted, bob separate
+    assert rows[0]["user_id"] == alice and rows[0]["last_seen_at"] == t2
+    assert rows[1]["user_id"] == bob
+
+
+async def test_migrate_2_to_3_backfills_to_first_admin(pg_fresh_dsn):
+    """The v2 -> v3 tenancy tightening: pre-tenancy NULL owner/user rows
+    backfill to the FIRST ADMIN, the columns go NOT NULL, view_cursor's PK
+    becomes (user_id, surface, ref_id)."""
+    await pg.init_db(pg_fresh_dsn)
+    conn = await pg.connect(pg_fresh_dsn)
+    try:
+        # downgrade to the v2 shape: old PK first (user_id must leave the
+        # PK before it can go nullable), then nullable columns
+        await conn.execute(
+            "ALTER TABLE view_cursor DROP CONSTRAINT view_cursor_pkey")
+        await conn.execute(
+            "ALTER TABLE view_cursor ADD PRIMARY KEY (surface, ref_id)")
+        await conn.execute(
+            "ALTER TABLE dossier ALTER COLUMN owner_id DROP NOT NULL")
+        for table in ("watch", "brief", "view_cursor"):
+            await conn.execute(
+                f"ALTER TABLE {table} ALTER COLUMN user_id DROP NOT NULL")
+        await conn.execute(
+            "UPDATE meta SET value = '2' WHERE key = 'schema_version'")
+        # single-user-era rows with NULL ownership + the admin to inherit
+        admin = await _make_user(conn, "admin@example.org", role="admin")
+        await conn.execute(
+            "INSERT INTO dossier (input_text, status, created_at)"
+            " VALUES ('orphan', 'completed', %s)", (pg.utc_now(),))
+        await conn.execute(
+            "INSERT INTO watch (kind, label, query_fts, created_at)"
+            " VALUES ('topic', 'w', 'q', %s)", (pg.utc_now(),))
+        await conn.execute(
+            "INSERT INTO brief (brief_date, generated_at) VALUES (%s, %s)",
+            ("2026-06-10", pg.utc_now()))
+        await conn.execute(
+            "INSERT INTO view_cursor (surface, ref_id, last_seen_at)"
+            " VALUES ('entity', 1, %s)", (pg.utc_now(),))
+
+        assert await pg.init_db(pg_fresh_dsn) == PG_SCHEMA_VERSION == 3
+
+        for table, col in (("dossier", "owner_id"), ("watch", "user_id"),
+                           ("brief", "user_id"),
+                           ("view_cursor", "user_id")):
+            cur = await conn.execute(f"SELECT {col} AS v FROM {table}")
+            assert (await cur.fetchone())["v"] == admin, table
+            cur = await conn.execute(
+                "SELECT is_nullable FROM information_schema.columns"
+                " WHERE table_name = %s AND column_name = %s",
+                (table, col))
+            assert (await cur.fetchone())["is_nullable"] == "NO", table
+        # the PK swap landed: same user+surface+ref upserts, users coexist
+        cur = await conn.execute(
+            "SELECT a.attname FROM pg_index i"
+            " JOIN pg_attribute a ON a.attrelid = i.indrelid"
+            "   AND a.attnum = ANY(i.indkey)"
+            " WHERE i.indrelid = 'view_cursor'::regclass AND i.indisprimary")
+        pk_cols = {r["attname"] for r in await cur.fetchall()}
+        assert pk_cols == {"user_id", "surface", "ref_id"}
+    finally:
+        await conn.close()

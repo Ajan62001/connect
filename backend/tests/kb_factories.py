@@ -20,6 +20,42 @@ _seq = count(1)
 VECTOR_DIM = 384
 
 
+async def ensure_user(conn: psycopg.AsyncConnection,
+                      email: str = "owner@test.local", *,
+                      role: str = "admin") -> int:
+    """Idempotent app_user row (v3 tenancy: dossier.owner_id and
+    watch/brief/view_cursor.user_id are NOT NULL — direct row factories
+    need a real user). Returns the user id."""
+    cur = await conn.execute(
+        "SELECT id FROM app_user WHERE email = %s", (email,))
+    row = await cur.fetchone()
+    if row is not None:
+        return int(row["id"])
+    cur = await conn.execute(
+        "INSERT INTO app_user (email, role, created_at)"
+        " VALUES (%s, %s, %s) RETURNING id", (email, role, utc_now()))
+    return int((await cur.fetchone())["id"])
+
+
+async def insert_dossier(conn: psycopg.AsyncConnection, *,
+                         kind: str = "investigation",
+                         input_text: str = "why?",
+                         input_type: str | None = None,
+                         status: str = "running",
+                         visibility: str = "shared",
+                         owner_id: int | None = None) -> int:
+    """One dossier row with a valid owner (created when not supplied)."""
+    if owner_id is None:
+        owner_id = await ensure_user(conn)
+    cur = await conn.execute(
+        "INSERT INTO dossier (kind, input_text, input_type, status,"
+        " created_at, owner_id, visibility)"
+        " VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (kind, input_text, input_type, status, utc_now(), owner_id,
+         visibility))
+    return int((await cur.fetchone())["id"])
+
+
 def pad(vec: list[float]) -> list[float]:
     """Zero-pad a synthetic test vector to the schema's 384 dims."""
     assert len(vec) <= VECTOR_DIM

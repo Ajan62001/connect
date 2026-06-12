@@ -12,6 +12,8 @@ from types import SimpleNamespace
 import pytest
 from dbutil import q1, qall, qv
 
+from kb_factories import ensure_user
+
 from connect.storage import jobs as job_dao
 from connect.workers.registry import CancelToken
 from connect.workers.testing import ImmediateQueue
@@ -142,8 +144,9 @@ async def test_asyncio_queue_enqueue_carries_dossier_id(container, db):
     container.enrichment = StubEnrichment()
     cur = await conn.execute(
         "INSERT INTO dossier (input_text, input_type, status,"
-        " created_at) VALUES ('x', 'claim', 'pending',"
-        " '2026-06-11T00:00:00Z') RETURNING id")
+        " created_at, owner_id) VALUES ('x', 'claim', 'pending',"
+        " '2026-06-11T00:00:00Z', %s) RETURNING id",
+        (await ensure_user(db),))
     dossier_id = int((await cur.fetchone())["id"])
     job_id = await container.jobs.enqueue(
         "enrich_t2", {"document_id": 9}, dossier_id=dossier_id)

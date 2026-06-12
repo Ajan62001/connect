@@ -19,6 +19,7 @@ from kb_factories import insert_doc, insert_source
 from mock_llm import MockProvider
 
 from connect.api.main import create_app
+from conftest import login
 from connect.knowledge.enrichment import persist, sweep
 from connect.knowledge.enrichment.prompts import T1_PROMPT_VERSION, T1_SYSTEM
 from connect.knowledge.enrichment.t1 import (
@@ -76,6 +77,7 @@ async def add_statement(conn, *, doc_id, entity_id, quote,
 def env(settings):
     app = create_app(settings)
     with TestClient(app) as client:
+        login(client)
         yield client, app.state.container
 
 
@@ -654,9 +656,12 @@ async def test_brief_position_shift_section(env, db):
         " from_statement_id, to_statement_id, kind, detected_at)"
         " VALUES (%s, 'banking', %s, %s, 'shifted', %s)",
         (watched, w1, w2, utc_now()))
+    from conftest import TEST_USER_EMAIL
+    from kb_factories import ensure_user
     await conn.execute(
-        "INSERT INTO watch (kind, label, entity_id, created_at)"
-        " VALUES ('entity', 'Rao watch', %s, %s)", (watched, utc_now()))
+        "INSERT INTO watch (user_id, kind, label, entity_id, created_at)"
+        " VALUES (%s, 'entity', 'Rao watch', %s, %s)",
+        (await ensure_user(conn, TEST_USER_EMAIL), watched, utc_now()))
     # a dismissed shift never reaches the brief
     await conn.execute(
         "INSERT INTO position_shift (entity_id, topic,"
@@ -695,7 +700,10 @@ async def test_brief_position_shift_only_since_last_brief(env, db):
     from datetime import date, timedelta
     tomorrow = (date.today() + timedelta(days=1)).isoformat()
     from connect.knowledge import briefing
-    await briefing._generate(conn, tomorrow)
+    from conftest import TEST_USER_EMAIL
+    from kb_factories import ensure_user
+    me = await ensure_user(conn, TEST_USER_EMAIL)
+    await briefing._generate(conn, me, tomorrow)
     row = await q1(
         conn,
         "SELECT bi.section, COUNT(*) AS n FROM brief_item bi"

@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from mock_llm import MockProvider
 
 from connect.api.main import create_app
+from conftest import login
 from connect.llm import spend
 from connect.llm.provider import Usage
 from connect.llm.spend import BudgetExceeded, Governor
@@ -19,6 +20,7 @@ from connect.orchestration.config import Settings
 def env(settings):
     app = create_app(settings)
     with TestClient(app) as client:
+        login(client)
         yield client, app.state.container
 
 
@@ -133,13 +135,20 @@ async def test_enrichment_sweep_endpoint_runs_job(env, db):
     assert resp.status_code == 503
     assert "ANTHROPIC_API_KEY" in resp.json()["detail"]
 
-    # inject the mock provider and ingest one eligible doc
+    # inject the mock provider and ingest one eligible doc — pasted text
+    # is PRIVATE by default (tenancy §1), so share it to make it
+    # enrichment-eligible (I1 gate 1)
     from test_enrichment import t1_result
     container.enrichment.provider = MockProvider(respond=t1_result())
     created = client.post("/api/documents", json={
         "text": "The Reserve Bank of India raised the repo rate by 25 basis"
                 " points to 6.75 percent on Friday."})
     doc_id = created.json()["id"]
+    assert created.json()["visibility"] == "private"
+    shared = client.patch(f"/api/documents/{doc_id}",
+                          json={"visibility": "shared"})
+    assert shared.status_code == 200
+    assert shared.json()["visibility"] == "shared"
 
     resp = client.post("/api/enrichment/sweep",
                        json={"mode": "sync", "limit": 10})

@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from connect.api.main import create_app
+from conftest import login
 from connect.knowledge.enrichment import persist
 from connect.knowledge.enrichment.t1 import EnrichmentT1, T1Claim, T1Entity
 
@@ -16,6 +17,7 @@ from connect.knowledge.enrichment.t1 import EnrichmentT1, T1Claim, T1Entity
 def env(settings):
     app = create_app(settings)
     with TestClient(app) as client:
+        login(client)
         yield client, app.state.container
 
 

@@ -407,9 +407,11 @@ async def test_batch_failed_items_marked_failed(container, db):
 
 async def test_pipeline_fast_path_fires_on_watch_hit(container, db):
     conn = db
+    from kb_factories import ensure_user
     await conn.execute(
-        "INSERT INTO watch (kind, label, query_fts, created_at)"
-        " VALUES ('topic', 'GST', 'GST', %s)", (utc_now(),))
+        "INSERT INTO watch (user_id, kind, label, query_fts, created_at)"
+        " VALUES (%s, 'topic', 'GST', 'GST', %s)",
+        (await ensure_user(conn), utc_now()))
     seen: list[tuple] = []
 
     async def hook(_conn, doc_id, source_id, watch_hit):
@@ -454,9 +456,11 @@ async def test_entity_watch_matches_real_aliases(container, db):
     await conn.execute("UPDATE entity SET aliases=%s WHERE id=%s",
                        (Jsonb(["Reserve Bank of India", "RBI"]),
                         entity_id))
+    from kb_factories import ensure_user
     await conn.execute(
-        "INSERT INTO watch (kind, label, entity_id, created_at)"
-        " VALUES ('entity', 'RBI watch', %s, %s)", (entity_id, utc_now()))
+        "INSERT INTO watch (user_id, kind, label, entity_id, created_at)"
+        " VALUES (%s, 'entity', 'RBI watch', %s, %s)",
+        (await ensure_user(conn), entity_id, utc_now()))
 
     hit_doc = await ingest_text(container, db,
                                 "RBI announced a new framework today.")

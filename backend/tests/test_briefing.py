@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import pytest
 from fastapi.testclient import TestClient
-from kb_factories import insert_doc, insert_source, t1_doc
+from kb_factories import ensure_user, insert_doc, insert_source, t1_doc
 
 from connect.api.main import create_app
+from conftest import TEST_USER_EMAIL, login
 from connect.llm.spend import today_utc
 from connect.storage.pg import utc_now
 
@@ -20,14 +21,17 @@ ALL_SECTIONS = ("watch_dev", "thread_move", "contradiction",
 def env(settings):
     app = create_app(settings)
     with TestClient(app) as client:
+        login(client)
         yield client, app.state.container
 
 
 async def add_watch(conn, label, query, *, last_seen_at=None):
+    """A watch owned by the signed-in test user (briefs are per-user)."""
+    user_id = await ensure_user(conn, TEST_USER_EMAIL)
     cur = await conn.execute(
-        "INSERT INTO watch (kind, label, query_fts, last_seen_at,"
-        " created_at) VALUES ('topic', %s, %s, %s, %s) RETURNING id",
-        (label, query, last_seen_at, utc_now()))
+        "INSERT INTO watch (user_id, kind, label, query_fts, last_seen_at,"
+        " created_at) VALUES (%s, 'topic', %s, %s, %s, %s) RETURNING id",
+        (user_id, label, query, last_seen_at, utc_now()))
     return int((await cur.fetchone())["id"])
 
 

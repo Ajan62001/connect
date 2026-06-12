@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import pytest
 
+from kb_factories import ensure_user
+
 from connect.investigation import scoping
 from connect.investigation.schema import InvestigationSeed, ScopeDoc
 from connect.investigation.scoping import (
@@ -153,9 +155,10 @@ class TestResolveSeed:
         await conn.execute("INSERT INTO story (title, created_at)"
                            " VALUES ('Rate cycle', %s)", (utc_now(),))
         cur = await conn.execute(
-            "INSERT INTO dossier (kind, input_text, status, created_at)"
-            " VALUES ('investigation', 'x', 'pending', %s) RETURNING id",
-            (utc_now(),))
+            "INSERT INTO dossier (kind, input_text, status, created_at,"
+            " owner_id) VALUES ('investigation', 'x', 'pending', %s, %s)"
+            " RETURNING id",
+            (utc_now(), await ensure_user(conn)))
         dossier_id = (await cur.fetchone())["id"]
         cur = await conn.execute(
             "INSERT INTO question (dossier_id, qtype, text, created_at)"

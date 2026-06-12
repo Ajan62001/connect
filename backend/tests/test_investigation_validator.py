@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 from dbutil import q1, qv
-from kb_factories import insert_doc
+from kb_factories import ensure_user, insert_doc
 
 from connect.investigation.schema import ReactionCandidate, ScopePack
 from connect.investigation.writeback import (
@@ -31,9 +31,10 @@ async def env(db):
     doc_id = await insert_doc(conn, title="Withdrawal report",
                               text=DOC_TEXT)
     await conn.execute(
-        "INSERT INTO dossier (kind, input_text, status, created_at)"
-        " VALUES ('investigation', 'draft rules', 'running', %s)",
-        (utc_now(),))
+        "INSERT INTO dossier (kind, input_text, status, created_at,"
+        " owner_id) VALUES ('investigation', 'draft rules', 'running',"
+        " %s, %s)",
+        (utc_now(), await ensure_user(conn)))
     await conn.execute("INSERT INTO event (title, occurred_on, created_at)"
                        " VALUES ('Committee objections', '2026-05-20', %s)",
                        (utc_now(),))

@@ -68,6 +68,16 @@ SEED_SOURCES: tuple[dict, ...] = (
         "notes": "ET economy section feed (feed id verified via aggregator).",
     },
     {
+        "name": "Moneycontrol News",
+        "type": "rss",
+        "config": {"feed_url": "https://www.moneycontrol.com/rss/latestnews.xml",
+                   "poll_interval_minutes": 60},
+        "credibility_tier": 2,
+        "notes": "Moneycontrol latest-news feed — Indian markets, economy, "
+                 "corporate. Tier 2 (established national financial media). "
+                 "URL needs live-verification on first deploy.",
+    },
+    {
         "name": "LiveMint News",
         "type": "rss",
         "config": {"feed_url": "https://www.livemint.com/rss/news",

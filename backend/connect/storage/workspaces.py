@@ -22,7 +22,7 @@ VISIBLE_SQL = "(w.visibility = 'shared' OR w.owner_id = %s)"
 
 _SELECT = """
 SELECT w.id, w.name, w.description, w.topics, w.source_ids, w.query_fts,
-       w.visibility, w.owner_id, w.created_at, w.updated_at,
+       w.visibility, w.post_settings, w.owner_id, w.created_at, w.updated_at,
        u.name AS owner_name
 FROM workspace w
 LEFT JOIN app_user u ON u.id = w.owner_id
@@ -38,6 +38,7 @@ def _to_model(row: Mapping[str, Any]) -> Workspace:
         source_ids=list(row["source_ids"] or []),
         query_fts=row["query_fts"],
         visibility=row["visibility"],
+        post_settings=dict(row["post_settings"] or {}),
         owner_id=row["owner_id"],
         owner_name=row.get("owner_name"),
         created_at=row["created_at"],
@@ -88,7 +89,7 @@ async def list_visible(conn: psycopg.AsyncConnection, *,
 
 
 _PATCHABLE = ("name", "description", "query_fts", "visibility")
-_PATCHABLE_JSON = ("topics", "source_ids")
+_PATCHABLE_JSON = ("topics", "source_ids", "post_settings")
 
 
 async def update(conn: psycopg.AsyncConnection, workspace_id: int,
@@ -103,7 +104,7 @@ async def update(conn: psycopg.AsyncConnection, workspace_id: int,
     for col in _PATCHABLE_JSON:
         if col in fields and fields[col] is not None:
             sets.append(f"{col} = %s")
-            params.append(Jsonb(list(fields[col])))
+            params.append(Jsonb(fields[col]))   # list (topics/sources) or dict
     if sets:
         sets.append("updated_at = %s")
         params.append(utc_now())
@@ -153,6 +154,9 @@ async def focused_feed(conn: psycopg.AsyncConnection, workspace: Workspace, *,
         focus.append("d.search_tsv @@ websearch_to_tsquery('english', %s)")
         params.append(workspace.query_fts)
     if focus:
+        # include the workspace's OWN KB docs alongside the shared-corpus lens
+        focus.append("d.workspace_id = %s")
+        params.append(workspace.id)
         where.append("(" + " OR ".join(focus) + ")")
 
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""

@@ -8,7 +8,10 @@ viewer-scoped document corpus.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+import json
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 
 import psycopg
 
@@ -17,7 +20,10 @@ from connect.api.deps import get_container, get_current_user, get_db
 from connect.domain.models import (
     ChatTurn,
     CurrentUser,
+    Document,
     DocumentPage,
+    PostSettings,
+    SocialDraft,
     Workspace,
     WorkspaceChatDetail,
     WorkspaceChatRequest,
@@ -26,9 +32,14 @@ from connect.domain.models import (
     WorkspaceCreate,
     WorkspaceUpdate,
 )
+from connect.ingestion.extract_html import ExtractionError
+from connect.ingestion.fetcher import FetchDisallowed, FetchError
 from connect.llm.provider import LLMError
 from connect.llm.spend import BudgetExceeded
 from connect.orchestration.container import Container
+from connect.social import settings as post_settings
+from connect.storage import documents as doc_dao
+from connect.storage import social_drafts as social_draft_dao
 from connect.storage import workspace_chats as chat_dao
 from connect.storage import workspaces as workspace_dao
 
@@ -92,6 +103,18 @@ async def delete_workspace(workspace_id: int,
     return Response(status_code=204)
 
 
+@router.get("/{workspace_id}/post-settings", response_model=PostSettings)
+async def workspace_post_settings(workspace_id: int,
+                                  db: psycopg.AsyncConnection = Depends(get_db),
+                                  user: CurrentUser = Depends(get_current_user)):
+    """The effective post-generation settings for this workspace (the global
+    default with the workspace's overrides applied)."""
+    ws = await workspace_dao.get(db, workspace_id, viewer=user.id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    return await post_settings.effective(db, ws)
+
+
 @router.get("/{workspace_id}/feed", response_model=DocumentPage)
 async def workspace_feed(workspace_id: int,
                          page: int = Query(default=1, ge=1),
@@ -108,6 +131,79 @@ async def workspace_feed(workspace_id: int,
         db, ws, viewer=user.id, page=page, page_size=page_size)
     return DocumentPage(items=items, total=total, page=page,
                         page_size=page_size)
+
+
+@router.get("/{workspace_id}/documents", response_model=DocumentPage)
+async def list_workspace_documents(workspace_id: int,
+                                   page: int = Query(default=1, ge=1),
+                                   page_size: int = Query(default=20, ge=1,
+                                                          le=MAX_PAGE_SIZE),
+                                   db: psycopg.AsyncConnection = Depends(get_db),
+                                   user: CurrentUser = Depends(get_current_user)):
+    """The workspace's OWN knowledge-base documents (added to it directly)."""
+    ws = await workspace_dao.get(db, workspace_id, viewer=user.id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    items, total = await doc_dao.list_in_workspace(
+        db, workspace_id, viewer=user.id, page=page, page_size=page_size)
+    return DocumentPage(items=items, total=total, page=page,
+                        page_size=page_size)
+
+
+@router.post("/{workspace_id}/documents", response_model=Document)
+async def add_workspace_document(workspace_id: int, request: Request,
+                                 container: Container = Depends(get_container),
+                                 db: psycopg.AsyncConnection = Depends(get_db),
+                                 user: CurrentUser = Depends(get_current_user)):
+    """Add a document to this workspace's knowledge base. Same three forms as
+    POST /documents (multipart 'file'; JSON {url}; JSON {text, title?}); the
+    ingested document is tagged into the workspace."""
+    ws = await workspace_dao.get(db, workspace_id, viewer=user.id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    pipeline = container.pipeline
+    assert pipeline is not None
+    content_type = request.headers.get("content-type", "")
+
+    try:
+        if content_type.startswith("multipart/form-data"):
+            form = await request.form()
+            upload = form.get("file")
+            if upload is None or isinstance(upload, str):
+                raise HTTPException(status_code=422,
+                                    detail="multipart field 'file' is required")
+            result = await pipeline.ingest_file(
+                db, upload.filename or "upload", await upload.read(),
+                upload.content_type, owner_id=user.id, visibility="private")
+        else:
+            try:
+                body = await request.json()
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise HTTPException(status_code=422, detail="invalid JSON body")
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=422, detail="JSON object expected")
+            if body.get("url"):
+                result = await pipeline.ingest_url(db, str(body["url"]),
+                                                   origin="user_url")
+            elif body.get("text"):
+                result = await pipeline.ingest_text(
+                    db, str(body["text"]), title=body.get("title"),
+                    owner_id=user.id, visibility="private")
+            else:
+                raise HTTPException(
+                    status_code=422,
+                    detail="provide multipart 'file', JSON {url} or {text}")
+    except FetchDisallowed as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except FetchError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    except ExtractionError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+    await doc_dao.set_workspace(db, result.document.id, workspace_id)
+    return JSONResponse(
+        status_code=201 if result.created else 200,
+        content=result.document.model_dump())
 
 
 def _turn_dict(role: str, text: str, *, tools_used: list[str] | None = None,
@@ -153,7 +249,9 @@ async def workspace_chat(workspace_id: int, body: WorkspaceChatRequest,
         result = await run_workspace_agent(
             db, llm=container.llm, governor=container.governor,
             embedder=container.embedder, vectors=container.vectors,
-            workspace=ws, viewer=user.id, messages=wire)
+            workspace=ws, viewer=user.id, messages=wire,
+            card_store=container.card_store,
+            post_settings=await post_settings.effective(db, ws))
     except BudgetExceeded as e:
         raise HTTPException(status_code=429, detail=str(e)) from e
     except LLMError as e:
@@ -214,4 +312,23 @@ async def delete_chat(workspace_id: int, chat_id: int,
                       user: CurrentUser = Depends(get_current_user)):
     if not await chat_dao.delete(db, chat_id, owner_id=user.id):
         raise HTTPException(status_code=404, detail="chat not found")
+    return Response(status_code=204)
+
+
+@router.get("/{workspace_id}/social-drafts", response_model=list[SocialDraft])
+async def list_social_drafts(workspace_id: int,
+                             db: psycopg.AsyncConnection = Depends(get_db),
+                             user: CurrentUser = Depends(get_current_user)):
+    """The social-post drafts the agent generated for this workspace (yours,
+    newest first). Each card is at /api/social/card/{card_sha}.jpg."""
+    return await social_draft_dao.list_for(db, workspace_id, owner_id=user.id)
+
+
+@router.delete("/{workspace_id}/social-drafts/{draft_id}", status_code=204,
+               response_class=Response)
+async def delete_social_draft(workspace_id: int, draft_id: int,
+                              db: psycopg.AsyncConnection = Depends(get_db),
+                              user: CurrentUser = Depends(get_current_user)):
+    if not await social_draft_dao.delete(db, draft_id, owner_id=user.id):
+        raise HTTPException(status_code=404, detail="draft not found")
     return Response(status_code=204)

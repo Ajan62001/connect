@@ -198,6 +198,35 @@ async def recent_simhashes(
             for r in rows]
 
 
+async def set_workspace(conn: psycopg.AsyncConnection, doc_id: int,
+                        workspace_id: int | None) -> None:
+    """Tag (or untag) a document into a workspace's knowledge base."""
+    async with conn.transaction():
+        await conn.execute(
+            "UPDATE document SET workspace_id = %s WHERE id = %s",
+            (workspace_id, doc_id))
+
+
+async def list_in_workspace(conn: psycopg.AsyncConnection, workspace_id: int,
+                            *, viewer: int | None = None, page: int = 1,
+                            page_size: int = 20,
+                            ) -> tuple[list[DocumentListItem], int]:
+    """A workspace's own KB documents, newest first, viewer-scoped."""
+    where = ["d.workspace_id = %s"]
+    params: list = [workspace_id]
+    if viewer is not None:
+        where.append(VISIBLE_SQL)
+        params.append(viewer)
+    where_sql = " WHERE " + " AND ".join(where)
+    cur = await conn.execute("SELECT COUNT(*) AS n" + _FROM + where_sql, params)
+    total = (await cur.fetchone())["n"]
+    cur = await conn.execute(
+        "SELECT " + _LIST_COLS + _FROM + where_sql
+        + " ORDER BY d.fetched_at DESC, d.id DESC LIMIT %s OFFSET %s",
+        (*params, page_size, (page - 1) * page_size))
+    return [_to_list_item(r) for r in await cur.fetchall()], int(total)
+
+
 async def list_page(conn: psycopg.AsyncConnection, *, page: int,
                     page_size: int, source_id: int | None = None,
                     enrichment_status: str | None = None,

@@ -11,7 +11,9 @@ from connect.agents.workspace_agent import (
     WorkspaceAgentState,
     WorkspaceToolExecutor,
 )
+from connect.domain.models import SocialPost
 from connect.llm.provider import LLMError, Usage
+from connect.storage import documents as doc_dao
 from connect.storage import workspaces as workspace_dao
 from connect.storage.pg import utc_now
 from dbutil import q1, qv
@@ -84,6 +86,45 @@ async def test_chat_posts_finding_to_workspace(client, db):
     assert [p["id"] for p in scoped] == [body["finding"]["id"]]
 
 
+async def test_chat_drafts_a_social_post(client, db):
+    src = await insert_source(db, "RBI", tier=1)
+    doc_id = await insert_doc(db, title="RBI holds repo rate", source_id=src,
+                              text="The RBI kept the repo rate at 6.5%.")
+    wid = client.post("/api/workspaces", json={
+        "name": "Rates", "query_fts": "repo rate"}).json()["id"]
+
+    sample = SocialPost(headline="RBI holds at 6.5%",
+                        caption="The RBI held rates. Source: RBI.",
+                        hashtags=["RBI"], key_points=["Repo at 6.5%"],
+                        source_label="Source: RBI", alt_text="card")
+    _set_llm(client, MockProvider(
+        tool_turns=[
+            tool_turn(("search_workspace", {"query": "repo rate"})),
+            tool_turn(("draft_social_post", {"document_id": doc_id})),
+            tool_turn(("final_answer", {"answer": "Drafted a post."})),
+        ],
+        respond_by_schema={SocialPost: sample}))
+    r = _chat(client, wid, "make an instagram post about this")
+    assert r.status_code == 200, r.text
+    assert r.json()["reply"] == "Drafted a post."
+
+    # the draft is saved and listed, with a rendered card
+    drafts = client.get(f"/api/workspaces/{wid}/social-drafts").json()
+    assert len(drafts) == 1
+    draft = drafts[0]
+    assert draft["content"]["headline"] == "RBI holds at 6.5%"
+    assert draft["document_id"] == doc_id
+    # the card is fetchable (public endpoint)
+    sha = draft["card_sha"]
+    card = client.get(f"/api/social/card/{sha}.jpg")
+    assert card.status_code == 200 and card.headers["content-type"] == "image/jpeg"
+
+    # delete it
+    assert client.delete(
+        f"/api/workspaces/{wid}/social-drafts/{draft['id']}").status_code == 204
+    assert client.get(f"/api/workspaces/{wid}/social-drafts").json() == []
+
+
 # ---------------------------------------------------------------------------
 # tool scoping (executor unit tests)
 # ---------------------------------------------------------------------------
@@ -111,6 +152,26 @@ async def test_search_scoped_to_workspace_focus(container, db):
     ids = {r["document_id"] for r in out["results"]}
     assert in_focus in ids
     assert off_focus not in ids   # different source -> outside the lens
+
+
+async def test_workspace_kb_doc_in_scope_even_outside_focus(container, db):
+    """A doc added to the workspace's KB is in the agent's scope even when it
+    doesn't match the focus lens."""
+    me = await ensure_user(db, email="kbscope@test.local")
+    src = await insert_source(db, "Other", tier=3)
+    kb_doc = await insert_doc(db, title="KB note", source_id=src,
+                              text="an internal note mentioning the RBI")
+    # focus is 'tariffs' — the KB doc is about the RBI, outside the lens
+    ws = await workspace_dao.insert(db, owner_id=me, name="KB",
+                                    query_fts="tariffs")
+    await doc_dao.set_workspace(db, kb_doc, ws.id)
+
+    state = WorkspaceAgentState()
+    ex = WorkspaceToolExecutor(
+        db, embedder=container.embedder, vectors=container.vectors,
+        workspace=ws, viewer=me, state=state)
+    out = await ex._tool_search_workspace({"query": "RBI note"})
+    assert kb_doc in {r["document_id"] for r in out["results"]}
 
 
 async def test_search_respects_tenancy(container, db):

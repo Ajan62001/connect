@@ -1904,6 +1904,7 @@ export interface Workspace {
   source_ids: number[];
   query_fts: string | null;
   visibility: Visibility;
+  post_settings: Record<string, unknown>;
   owner_id: number | null;
   owner_name: string | null;
   created_at: string;
@@ -1926,6 +1927,102 @@ export interface WorkspaceUpdate {
   source_ids?: number[];
   query_fts?: string | null;
   visibility?: Visibility;
+  post_settings?: Record<string, unknown>;
+}
+
+/** How posts are generated (global default, overridable per workspace). */
+export interface PostSettings {
+  tone: string;
+  hashtag_count: number;
+  brand_handle: string;
+  caption_max_chars: number;
+  default_visibility: Visibility;
+  card_accent: string;
+  sign_off: string;
+}
+
+export function getWorkspacePostSettings(id: number): Promise<PostSettings> {
+  return request<PostSettings>(`/api/workspaces/${id}/post-settings`);
+}
+
+/** A social-post draft the workspace agent generated. */
+export interface SocialDraft {
+  id: number;
+  workspace_id: number;
+  document_id: number | null;
+  content: SocialPost;
+  card_sha: string;
+  created_at: string;
+}
+
+export function listWorkspaceSocialDrafts(id: number): Promise<SocialDraft[]> {
+  return request<SocialDraft[]>(`/api/workspaces/${id}/social-drafts`);
+}
+
+export function deleteWorkspaceSocialDraft(
+  id: number,
+  draftId: number,
+): Promise<void> {
+  return request<void>(`/api/workspaces/${id}/social-drafts/${draftId}`, {
+    method: "DELETE",
+  });
+}
+
+// --- workspace knowledge base (the workspace's own documents) ---------------
+
+async function ingestToWorkspace(
+  id: number,
+  init: RequestInit,
+): Promise<IngestResult> {
+  let res: Response;
+  try {
+    res = await fetch(`/api/workspaces/${id}/documents`, init);
+  } catch {
+    throw new ApiError(0, "Backend unreachable — is the API server running?");
+  }
+  if (!res.ok) await raise(res);
+  const document = (await parseBody(res)) as Document;
+  return { document, deduped: res.status === 200 };
+}
+
+export function addWorkspaceText(
+  id: number,
+  payload: IngestText,
+): Promise<IngestResult> {
+  return ingestToWorkspace(id, jsonInit("POST", payload));
+}
+
+export function addWorkspaceUrl(id: number, url: string): Promise<IngestResult> {
+  return ingestToWorkspace(id, jsonInit("POST", { url }));
+}
+
+export function addWorkspaceFile(
+  id: number,
+  file: File,
+): Promise<IngestResult> {
+  const form = new FormData();
+  form.append("file", file);
+  return ingestToWorkspace(id, { method: "POST", body: form });
+}
+
+export function listWorkspaceDocuments(
+  id: number,
+  page = 1,
+  pageSize = 20,
+): Promise<Page<DocumentListItem>> {
+  return request<Page<DocumentListItem>>(
+    `/api/workspaces/${id}/documents${qs({ page, page_size: pageSize })}`,
+  );
+}
+
+export function getGlobalPostSettings(): Promise<PostSettings> {
+  return request<PostSettings>("/api/social/settings");
+}
+
+export function updateGlobalPostSettings(
+  patch: Partial<PostSettings>,
+): Promise<PostSettings> {
+  return request<PostSettings>("/api/social/settings", jsonInit("PUT", patch));
 }
 
 export function listWorkspaces(): Promise<Workspace[]> {

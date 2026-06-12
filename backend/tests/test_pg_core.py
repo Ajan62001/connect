@@ -35,7 +35,7 @@ EXPECTED_TABLES = {
     "edge", "story", "claim_sighting", "verdict_history", "contradiction",
     "dossier", "dossier_section", "question", "finding", "finding_evidence",
     "statement", "position_shift", "view_summary",
-    "job", "job_event", "watch", "watch_hit", "post", "workspace", "workspace_chat",
+    "job", "job_event", "watch", "watch_hit", "post", "workspace", "workspace_chat", "social_draft",
     "brief", "brief_item", "view_cursor", "calendar_event", "llm_call",
     "source_stats", "document_embedding", "event_embedding",
     "claim_embedding",
@@ -61,7 +61,7 @@ async def _insert_document(conn, content_hash: str, *, title=None,
 
 async def test_fresh_init_creates_full_schema(pg_fresh_dsn):
     version = await pg.init_db(pg_fresh_dsn)
-    assert version == PG_SCHEMA_VERSION == 8
+    assert version == PG_SCHEMA_VERSION == 11
 
     conn = await pg.connect(pg_fresh_dsn)
     try:
@@ -531,7 +531,7 @@ async def test_migrate_2_to_3_backfills_to_first_admin(pg_fresh_dsn):
             "INSERT INTO view_cursor (surface, ref_id, last_seen_at)"
             " VALUES ('entity', 1, %s)", (pg.utc_now(),))
 
-        assert await pg.init_db(pg_fresh_dsn) == PG_SCHEMA_VERSION == 8
+        assert await pg.init_db(pg_fresh_dsn) == PG_SCHEMA_VERSION == 11
 
         for table, col in (("dossier", "owner_id"), ("watch", "user_id"),
                            ("brief", "user_id"),

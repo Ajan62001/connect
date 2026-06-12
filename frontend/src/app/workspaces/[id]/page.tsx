@@ -5,11 +5,14 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   ArrowLeftIcon,
+  DatabaseIcon,
+  ImageIcon,
   LayoutGridIcon,
   Loader2Icon,
   NotebookPenIcon,
   RssIcon,
   SearchIcon,
+  Settings2Icon,
   SparklesIcon,
   TagIcon,
   Trash2Icon,
@@ -20,7 +23,10 @@ import { EmptyState } from "@/components/shared/EmptyState";
 import { PageHeader } from "@/components/shared/PageHeader";
 import { QueryError } from "@/components/shared/QueryError";
 import { VisibilityBadge } from "@/components/shared/Visibility";
+import { PostSettingsDialog } from "@/components/workspace/PostSettingsDialog";
 import { WorkspaceChatPanel } from "@/components/workspace/WorkspaceChatPanel";
+import { WorkspaceDrafts } from "@/components/workspace/WorkspaceDrafts";
+import { WorkspaceKnowledgeBase } from "@/components/workspace/WorkspaceKnowledgeBase";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -205,6 +211,7 @@ export default function WorkspacePage({
   const workspace = useWorkspace(workspaceId);
   const del = useDeleteWorkspace();
   const router = useRouter();
+  const [postSettingsOpen, setPostSettingsOpen] = useState(false);
 
   if (!Number.isFinite(workspaceId)) {
     return (
@@ -239,26 +246,41 @@ export default function WorkspacePage({
             title={workspace.data.name}
             description={workspace.data.description || undefined}
             actions={
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() =>
-                  del.mutate(workspaceId, {
-                    onSuccess: () => {
-                      toast.success("Workspace deleted");
-                      router.push("/workspaces");
-                    },
-                    onError: (e) =>
-                      toast.error("Could not delete", {
-                        description: e.message,
-                      }),
-                  })
-                }
-              >
-                <Trash2Icon data-icon="inline-start" />
-                Delete
-              </Button>
+              <span className="flex gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setPostSettingsOpen(true)}
+                >
+                  <Settings2Icon data-icon="inline-start" />
+                  Post settings
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    del.mutate(workspaceId, {
+                      onSuccess: () => {
+                        toast.success("Workspace deleted");
+                        router.push("/workspaces");
+                      },
+                      onError: (e) =>
+                        toast.error("Could not delete", {
+                          description: e.message,
+                        }),
+                    })
+                  }
+                >
+                  <Trash2Icon data-icon="inline-start" />
+                  Delete
+                </Button>
+              </span>
             }
+          />
+          <PostSettingsDialog
+            workspaceId={workspaceId}
+            open={postSettingsOpen}
+            onOpenChange={setPostSettingsOpen}
           />
 
           <div className="mb-4 flex flex-wrap items-center gap-1.5">
@@ -278,12 +300,21 @@ export default function WorkspacePage({
           </div>
 
           <div className="flex flex-col gap-6 lg:flex-row">
-            <section className="min-w-0 flex-1">
-              <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold">
-                <RssIcon className="size-4" />
-                Focused feed
-              </h2>
-              <FocusedFeed workspaceId={workspaceId} />
+            <section className="min-w-0 flex-1 space-y-6">
+              <div>
+                <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold">
+                  <RssIcon className="size-4" />
+                  Focused feed
+                </h2>
+                <FocusedFeed workspaceId={workspaceId} />
+              </div>
+              <div>
+                <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold">
+                  <DatabaseIcon className="size-4" />
+                  Knowledge base
+                </h2>
+                <WorkspaceKnowledgeBase workspaceId={workspaceId} />
+              </div>
             </section>
             <section className="w-full shrink-0 space-y-6 lg:w-96">
               <div>
@@ -292,6 +323,13 @@ export default function WorkspacePage({
                   Assistant
                 </h2>
                 <WorkspaceChatPanel workspaceId={workspaceId} />
+              </div>
+              <div>
+                <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold">
+                  <ImageIcon className="size-4" />
+                  Post drafts
+                </h2>
+                <WorkspaceDrafts workspaceId={workspaceId} />
               </div>
               <div>
                 <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold">

@@ -25,9 +25,10 @@ from typing import Any
 import psycopg
 
 from connect.analysis.budget import AnalysisBudget
-from connect.domain.models import Post, Workspace
+from connect.domain.models import Post, PostSettings, SocialPost, Workspace
 from connect.llm import spend
 from connect.llm.provider import (
+    LLMError,
     LLMProvider,
     ToolCall,
     ToolDef,
@@ -38,7 +39,10 @@ from connect.llm.provider import (
 from connect.llm.spend import BudgetExceeded
 from connect.llm.tiers import ModelTier
 from connect.retrieval.search import hybrid_document_ids
+from connect.social import generate
+from connect.social.card import render_card
 from connect.storage import posts as post_dao
+from connect.storage import social_drafts as social_draft_dao
 
 log = logging.getLogger(__name__)
 
@@ -109,6 +113,17 @@ WS_TOOL_DEFS: tuple[ToolDef, ...] = (
             "required": ["title", "body"],
         }),
     ToolDef(
+        name="draft_social_post",
+        description="Draft an Instagram post (caption + hashtags + a rendered"
+                    " image card) from a workspace document, in the workspace's"
+                    " post style. Saves it to the workspace's drafts. Use when"
+                    " the user asks to make/draft/create a post.",
+        input_schema={
+            "type": "object",
+            "properties": {"document_id": {"type": "integer"}},
+            "required": ["document_id"],
+        }),
+    ToolDef(
         name="final_answer",
         description="TERMINAL — give your complete reply to the user.",
         input_schema={
@@ -136,7 +151,11 @@ def _build_focus(workspace: Workspace) -> tuple[str | None, list[Any]]:
         clauses.append("d.search_tsv @@ websearch_to_tsquery('english', %s)")
         params.append(workspace.query_fts)
     if not clauses:
-        return None, []
+        return None, []   # no focus -> the whole visible corpus is in scope
+    # the workspace's OWN knowledge-base docs are always in scope alongside the
+    # shared-corpus lens (design: own docs + shared lens).
+    clauses.append("d.workspace_id = %s")
+    params.append(workspace.id)
     return "(" + " OR ".join(clauses) + ")", params
 
 
@@ -145,6 +164,7 @@ class WorkspaceAgentState:
     concluded: bool = False
     final_answer: str | None = None
     finding: Post | None = None
+    drafts: list[int] = field(default_factory=list)   # social_draft ids made
     touched_doc_ids: set[int] = field(default_factory=set)
     tools_used: list[str] = field(default_factory=list)
 
@@ -156,13 +176,20 @@ class WorkspaceToolExecutor:
 
     def __init__(self, conn: psycopg.AsyncConnection, *, embedder: Any,
                  vectors: Any, workspace: Workspace, viewer: int,
-                 state: WorkspaceAgentState):
+                 state: WorkspaceAgentState, llm: LLMProvider | None = None,
+                 governor: Any = None, card_store: Any = None,
+                 post_settings: PostSettings | None = None):
         self.conn = conn
         self.embedder = embedder
         self.vectors = vectors
         self.workspace = workspace
         self.viewer = viewer
         self.state = state
+        # for the draft_social_post tool (a nested governed LLM call):
+        self.llm = llm
+        self.governor = governor
+        self.card_store = card_store
+        self.post_settings = post_settings
         self.focus_clause, self.focus_params = _build_focus(workspace)
 
     async def __call__(self, call: ToolCall) -> ToolOutcome:
@@ -269,6 +296,56 @@ class WorkspaceToolExecutor:
         self.state.finding = post
         return {"ok": True, "post_id": post.id, "title": post.title}
 
+    async def _tool_draft_social_post(self, args: dict[str, Any]) -> Any:
+        if (self.llm is None or self.card_store is None
+                or self.post_settings is None):
+            return ToolOutcome(content="post drafting is unavailable",
+                               is_error=True)
+        doc_id = args.get("document_id")
+        if not isinstance(doc_id, int):
+            return ToolOutcome(content="document_id must be an integer",
+                               is_error=True)
+        row = await self._fetch_in_scope(doc_id)
+        if row is None:
+            return ToolOutcome(
+                content=f"document {doc_id} is not in this workspace",
+                is_error=True)
+        s = self.post_settings
+        system = generate.system_for(s)
+        user = generate.build_prompt(
+            title=row["title"], source_name=row["source_name"],
+            content_text=row["content_text"])
+        proj = spend.cost_usd(self.llm.model_for(ModelTier.BALANCED),
+                              input_tokens=2000, output_tokens=600)
+        try:
+            if self.governor is not None:
+                await self.governor.check(proj, user_id=self.viewer)
+        except BudgetExceeded:
+            return ToolOutcome(
+                content="daily budget reached; could not draft a post",
+                is_error=True)
+        try:
+            completion = await self.llm.complete_structured(
+                system=system,
+                messages=[{"role": "user", "content": user}],
+                schema=SocialPost, tier=ModelTier.BALANCED, max_tokens=800)
+        except LLMError as e:
+            return ToolOutcome(content=f"draft failed: {e}", is_error=True)
+        await spend.record_call(self.conn, purpose="social_post",
+                                model=completion.model,
+                                usage=completion.usage, user_id=self.viewer)
+        content = completion.output
+        image = render_card(content, accent=s.card_accent,
+                            sign_off=s.sign_off)
+        rel = self.card_store.put(image)
+        sha = rel.rsplit("/", 1)[-1]
+        draft_id = await social_draft_dao.insert(
+            self.conn, workspace_id=self.workspace.id, owner_id=self.viewer,
+            document_id=doc_id, content=content.model_dump(), card_sha=sha)
+        self.state.drafts.append(draft_id)
+        return {"draft_id": draft_id, "headline": content.headline,
+                "caption": content.caption, "hashtags": content.hashtags}
+
     async def _tool_final_answer(self, args: dict[str, Any]) -> Any:
         self.state.concluded = True
         self.state.final_answer = str(args.get("answer", "")).strip()
@@ -281,6 +358,7 @@ class WorkspaceAgentResult:
     messages: list[dict[str, Any]]
     tools_used: list[str]
     finding: Post | None
+    drafts: list[int]
     turns_completed: int
     spent_usd: float
     budget_remaining_usd: float
@@ -290,6 +368,7 @@ async def run_workspace_agent(
         conn: psycopg.AsyncConnection, *, llm: LLMProvider, governor: Any,
         embedder: Any, vectors: Any, workspace: Workspace, viewer: int,
         messages: list[dict[str, Any]],
+        card_store: Any = None, post_settings: PostSettings | None = None,
         max_iters: int = WS_AGENT_MAX_ITERS,
         cap_usd: float = WS_AGENT_REQUEST_CAP_USD) -> WorkspaceAgentResult:
     """Drive the bounded tool-loop for one user turn. Raises BudgetExceeded
@@ -298,7 +377,8 @@ async def run_workspace_agent(
     state = WorkspaceAgentState()
     executor = WorkspaceToolExecutor(
         conn, embedder=embedder, vectors=vectors, workspace=workspace,
-        viewer=viewer, state=state)
+        viewer=viewer, state=state, llm=llm, governor=governor,
+        card_store=card_store, post_settings=post_settings)
     budget = AnalysisBudget(cap_usd=cap_usd)
     model = llm.model_for(ModelTier.BALANCED)
     turn_proj = spend.cost_usd(model, input_tokens=_EST_IN,
@@ -343,5 +423,6 @@ async def run_workspace_agent(
     return WorkspaceAgentResult(
         final_answer=state.final_answer or "",
         messages=msgs, tools_used=state.tools_used, finding=state.finding,
-        turns_completed=turns, spent_usd=round(budget.spent_usd, 6),
+        drafts=state.drafts, turns_completed=turns,
+        spent_usd=round(budget.spent_usd, 6),
         budget_remaining_usd=round(budget.remaining_usd, 6))

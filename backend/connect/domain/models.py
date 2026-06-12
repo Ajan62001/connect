@@ -500,6 +500,39 @@ class SocialPublishResult(_Frozen):
     permalink: str | None = None
 
 
+class PostSettings(_Frozen):
+    """How posts are generated. A global default lives in app_setting; a
+    workspace can override any subset (merged at use time)."""
+    tone: str = "neutral, factual, engaging"
+    hashtag_count: int = Field(default=8, ge=0, le=30)
+    brand_handle: str = ""
+    caption_max_chars: int = Field(default=400, ge=50, le=2200)
+    default_visibility: Visibility = "shared"
+    card_accent: str = "#38bdf8"
+    sign_off: str = "via connect"
+
+
+class PostSettingsUpdate(_Frozen):
+    tone: str | None = None
+    hashtag_count: int | None = Field(default=None, ge=0, le=30)
+    brand_handle: str | None = None
+    caption_max_chars: int | None = Field(default=None, ge=50, le=2200)
+    default_visibility: Visibility | None = None
+    card_accent: str | None = None
+    sign_off: str | None = None
+
+
+class SocialDraft(_Frozen):
+    """A social-post draft the workspace agent generated and saved. The card
+    is served at /api/social/card/{card_sha}.jpg."""
+    id: int
+    workspace_id: int
+    document_id: int | None = None
+    content: SocialPost
+    card_sha: str
+    created_at: str
+
+
 # --- entities (Phase 1) --------------------------------------------------------
 
 class EntityListItem(_Frozen):
@@ -804,6 +837,7 @@ class Workspace(_Frozen):
     source_ids: list[int] = Field(default_factory=list)
     query_fts: str | None = None
     visibility: Visibility = "shared"
+    post_settings: dict[str, Any] = Field(default_factory=dict)
     owner_id: int | None = None
     owner_name: str | None = None
     created_at: str
@@ -826,6 +860,7 @@ class WorkspaceUpdate(_Frozen):
     source_ids: list[int] | None = None
     query_fts: str | None = None
     visibility: Visibility | None = None
+    post_settings: dict[str, Any] | None = None
 
 
 # --- workspace agent (chat) ----------------------------------------------------

@@ -74,6 +74,11 @@ export const queryKeys = {
   workspaceFeed: (id: number, page: number) =>
     ["workspaces", "feed", id, page] as const,
   workspaceChats: (id: number) => ["workspaces", "chats", id] as const,
+  workspacePostSettings: (id: number) =>
+    ["workspaces", "post-settings", id] as const,
+  workspaceDrafts: (id: number) => ["workspaces", "drafts", id] as const,
+  workspaceDocuments: (id: number, page: number) =>
+    ["workspaces", "documents", id, page] as const,
   entities: ["entities"] as const,
   entityList: (params: EntityListParams) => ["entities", "list", params] as const,
   entity: (id: number) => ["entities", "detail", id] as const,
@@ -779,6 +784,70 @@ export function useDeleteWorkspace() {
   });
 }
 
+/** The effective post-generation settings for a workspace (global + overrides). */
+export function useWorkspacePostSettings(id: number) {
+  return useQuery({
+    queryKey: queryKeys.workspacePostSettings(id),
+    queryFn: () => api.getWorkspacePostSettings(id),
+    enabled: Number.isFinite(id),
+  });
+}
+
+export function useWorkspaceSocialDrafts(id: number) {
+  return useQuery({
+    queryKey: queryKeys.workspaceDrafts(id),
+    queryFn: () => api.listWorkspaceSocialDrafts(id),
+    enabled: Number.isFinite(id),
+  });
+}
+
+export function useDeleteSocialDraft(id: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (draftId: number) =>
+      api.deleteWorkspaceSocialDraft(id, draftId),
+    onSuccess: () =>
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.workspaceDrafts(id),
+      }),
+  });
+}
+
+export function useWorkspaceDocuments(id: number, page: number) {
+  return useQuery({
+    queryKey: queryKeys.workspaceDocuments(id, page),
+    queryFn: () => api.listWorkspaceDocuments(id, page),
+    enabled: Number.isFinite(id),
+    placeholderData: keepPreviousData,
+  });
+}
+
+/** Add a document to a workspace's knowledge base; refreshes the KB list and
+ *  the focused feed (workspace docs appear in both). */
+export function useAddWorkspaceDocument(id: number) {
+  const queryClient = useQueryClient();
+  return useMutation<IngestResult, Error, IngestInput>({
+    mutationFn: (input: IngestInput) => {
+      switch (input.mode) {
+        case "text":
+          return api.addWorkspaceText(id, input.payload);
+        case "url":
+          return api.addWorkspaceUrl(id, input.url);
+        case "file":
+          return api.addWorkspaceFile(id, input.file);
+      }
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: ["workspaces", "documents", id],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["workspaces", "feed", id],
+      });
+    },
+  });
+}
+
 /** Send one message to a workspace's agent (saved server-side); a posted
  *  finding invalidates the findings list, every turn invalidates the chat
  *  list (title/updated_at). */
@@ -790,6 +859,10 @@ export function useWorkspaceChat(id: number) {
     onSuccess: (resp) => {
       void queryClient.invalidateQueries({
         queryKey: queryKeys.workspaceChats(id),
+      });
+      // the agent may have posted a finding and/or drafted a social post
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.workspaceDrafts(id),
       });
       if (resp.finding) {
         void queryClient.invalidateQueries({ queryKey: queryKeys.posts });

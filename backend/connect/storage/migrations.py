@@ -161,6 +161,34 @@ async def pg_migrate_7_to_8(conn: "psycopg.AsyncConnection") -> None:
         await conn.execute(ddl)
 
 
+async def pg_migrate_8_to_9(conn: "psycopg.AsyncConnection") -> None:
+    """v9 — per-workspace post-generation settings: an overrides jsonb on
+    workspace (merged over the global default at use time)."""
+    await conn.execute(
+        "ALTER TABLE workspace ADD COLUMN IF NOT EXISTS post_settings jsonb"
+        " NOT NULL DEFAULT '{}'::jsonb")
+
+
+async def pg_migrate_9_to_10(conn: "psycopg.AsyncConnection") -> None:
+    """v10 — social-post drafts the workspace agent generates (new
+    ``social_draft`` table; workspace/app_user/document already exist)."""
+    for ddl in (schema._PG_DDL_SOCIAL_DRAFT,
+                *schema._PG_DDL_SOCIAL_DRAFT_INDEXES):
+        await conn.execute(ddl)
+
+
+async def pg_migrate_10_to_11(conn: "psycopg.AsyncConnection") -> None:
+    """v11 — per-workspace knowledge base: tag documents with a workspace
+    (a plain bigint column — stale ids after a workspace delete are inert
+    since reads filter by a live workspace id)."""
+    await conn.execute(
+        "ALTER TABLE document ADD COLUMN IF NOT EXISTS workspace_id bigint")
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_document_workspace"
+        " ON document(workspace_id, fetched_at DESC)"
+        " WHERE workspace_id IS NOT NULL")
+
+
 # Registry: version N -> async function taking N's schema to N+1's.
 # Forward-only.
 PG_MIGRATIONS: dict[
@@ -172,6 +200,9 @@ PG_MIGRATIONS: dict[
     5: pg_migrate_5_to_6,
     6: pg_migrate_6_to_7,
     7: pg_migrate_7_to_8,
+    8: pg_migrate_8_to_9,
+    9: pg_migrate_9_to_10,
+    10: pg_migrate_10_to_11,
 }
 
 

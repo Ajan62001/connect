@@ -40,6 +40,16 @@ def _font(paths: Sequence[str], size: int):
     return ImageFont.load_default()
 
 
+def _hex_to_rgb(value: str | None) -> tuple[int, int, int]:
+    v = (value or "").lstrip("#")
+    if len(v) == 6:
+        try:
+            return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16))
+        except ValueError:
+            pass
+    return ACCENT
+
+
 def _wrap(draw, text: str, font, max_width: int) -> list[str]:
     lines: list[str] = []
     cur = ""
@@ -55,21 +65,24 @@ def _wrap(draw, text: str, font, max_width: int) -> list[str]:
     return lines
 
 
-def render_card(content: SocialPost) -> bytes:
+def render_card(content: SocialPost, *, accent: str | None = None,
+                sign_off: str = "via connect") -> bytes:
     """Render the post's headline + key points + source onto a branded square
-    card; returns JPEG bytes ready for download or the Instagram Graph API."""
+    card; returns JPEG bytes ready for download or the Instagram Graph API.
+    ``accent`` (hex) + ``sign_off`` come from the effective post settings."""
     from PIL import Image, ImageDraw
 
+    accent_rgb = _hex_to_rgb(accent) if accent else ACCENT
     img = Image.new("RGB", (SIZE, SIZE), BG)
     draw = ImageDraw.Draw(img)
-    draw.rectangle([0, 0, SIZE, 14], fill=ACCENT)   # accent bar
+    draw.rectangle([0, 0, SIZE, 14], fill=accent_rgb)   # accent bar
 
     inner = SIZE - 2 * MARGIN
     y = MARGIN + 12
 
     # source chip
     label = (content.source_label or "connect").strip().upper()[:48]
-    draw.text((MARGIN, y), label, font=_font(_BOLD, 30), fill=ACCENT)
+    draw.text((MARGIN, y), label, font=_font(_BOLD, 30), fill=accent_rgb)
     y += 66
 
     # headline (wrapped, bounded so the card never overflows)
@@ -85,7 +98,7 @@ def render_card(content: SocialPost) -> bytes:
         kp = kp.strip()
         if not kp:
             continue
-        draw.ellipse([MARGIN, y + 16, MARGIN + 14, y + 30], fill=ACCENT)
+        draw.ellipse([MARGIN, y + 16, MARGIN + 14, y + 30], fill=accent_rgb)
         for line in _wrap(draw, kp, body_font, inner - 48)[:2]:
             draw.text((MARGIN + 42, y), line, font=body_font, fill=MUTED)
             y += 50
@@ -93,7 +106,7 @@ def render_card(content: SocialPost) -> bytes:
         if y > SIZE - MARGIN - 80:
             break
 
-    draw.text((MARGIN, SIZE - MARGIN + 6), "via connect",
+    draw.text((MARGIN, SIZE - MARGIN + 6), (sign_off or "via connect")[:60],
               font=_font(_REG, 28), fill=MUTED)
 
     buf = io.BytesIO()

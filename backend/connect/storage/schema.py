@@ -65,7 +65,7 @@ class StorageVersionError(StorageError):
 # PostgreSQL baseline schema (v0.2, the canonical DDL) — fresh lineage, v1.
 # ==============================================================================
 
-PG_SCHEMA_VERSION = 8
+PG_SCHEMA_VERSION = 11
 
 # Extensions first: the compose image is pgvector/pgvector:pg17, so both are
 # present; IF NOT EXISTS keeps re-entry harmless.
@@ -191,6 +191,7 @@ CREATE TABLE IF NOT EXISTS document (
     origin                text NOT NULL DEFAULT 'polled'
                           CONSTRAINT ck_document_origin
                           CHECK (origin IN {E.sql_in(E.DOCUMENT_ORIGINS)}),
+    workspace_id          bigint,
     search_tsv            tsvector GENERATED ALWAYS AS (
         setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
         setweight(to_tsvector('english', left(content_text, 200000)), 'B')
@@ -208,6 +209,9 @@ _PG_DDL_DOCUMENT_INDEXES = (
     " WHERE owner_id IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_document_visibility_fetched"
     " ON document(visibility, fetched_at DESC)",
+    # v11: a workspace's own knowledge-base documents
+    "CREATE INDEX IF NOT EXISTS idx_document_workspace"
+    " ON document(workspace_id, fetched_at DESC) WHERE workspace_id IS NOT NULL",
 )
 
 _PG_DDL_DOCUMENT_LINK = f"""
@@ -900,9 +904,12 @@ CREATE TABLE IF NOT EXISTS workspace (
     visibility  text NOT NULL DEFAULT 'shared'
                 CONSTRAINT ck_workspace_visibility
                 CHECK (visibility IN {E.sql_in(E.VISIBILITIES)}),
+    post_settings jsonb NOT NULL DEFAULT '{{}}'::jsonb,
     created_at  timestamptz NOT NULL,
     updated_at  timestamptz
 )"""
+# post_settings (v9): per-workspace overrides of the global post-generation
+# settings (tone, hashtags, brand, length, card accent), merged at use time.
 
 _PG_DDL_WORKSPACE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_workspace_owner"
@@ -929,6 +936,25 @@ CREATE TABLE IF NOT EXISTS workspace_chat (
 _PG_DDL_WORKSPACE_CHAT_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_workspace_chat_owner"
     " ON workspace_chat(workspace_id, owner_id, updated_at DESC)",
+)
+
+# Social-post drafts the workspace agent generates (v10). ``content`` is the
+# SocialPost; ``card_sha`` references the rendered card in the social card
+# store (served by GET /social/card/<sha>.jpg).
+_PG_DDL_SOCIAL_DRAFT = """
+CREATE TABLE IF NOT EXISTS social_draft (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    workspace_id bigint NOT NULL REFERENCES workspace(id) ON DELETE CASCADE,
+    owner_id     bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    document_id  bigint REFERENCES document(id) ON DELETE SET NULL,
+    content      jsonb NOT NULL,
+    card_sha     text NOT NULL,
+    created_at   timestamptz NOT NULL
+)"""
+
+_PG_DDL_SOCIAL_DRAFT_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_social_draft_workspace"
+    " ON social_draft(workspace_id, created_at DESC)",
 )
 
 # One brief per (user, day) — the UNIQUE doubles as the ON CONFLICT target
@@ -1121,6 +1147,8 @@ PG_DDL: tuple[str, ...] = (
     *_PG_DDL_WORKSPACE_INDEXES,
     _PG_DDL_WORKSPACE_CHAT,
     *_PG_DDL_WORKSPACE_CHAT_INDEXES,
+    _PG_DDL_SOCIAL_DRAFT,
+    *_PG_DDL_SOCIAL_DRAFT_INDEXES,
     _PG_DDL_WATCH,
     *_PG_DDL_WATCH_INDEXES,
     _PG_DDL_WATCH_HIT,

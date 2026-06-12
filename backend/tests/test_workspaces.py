@@ -93,6 +93,26 @@ def test_finding_tagged_and_filtered_by_workspace(client):
     assert [p["id"] for p in scoped] == [p1["id"]]
 
 
+def test_add_text_document_to_workspace_kb(client):
+    # a focused workspace; the added doc is OUTSIDE the focus (about RBI)
+    wid = client.post("/api/workspaces",
+                      json={"name": "KB", "query_fts": "tariffs"}).json()["id"]
+    r = client.post(f"/api/workspaces/{wid}/documents", json={
+        "text": "An internal note about the RBI repo decision.",
+        "title": "My KB note"})
+    assert r.status_code == 201, r.text
+
+    # it lists in the workspace's knowledge base
+    kb = client.get(f"/api/workspaces/{wid}/documents").json()
+    assert kb["total"] == 1 and kb["items"][0]["title"] == "My KB note"
+    # and it shows in the focused feed even though it's outside the lens
+    feed = client.get(f"/api/workspaces/{wid}/feed").json()
+    assert any(i["title"] == "My KB note" for i in feed["items"])
+    # a different workspace does NOT see it in its KB
+    other = client.post("/api/workspaces", json={"name": "Other"}).json()["id"]
+    assert client.get(f"/api/workspaces/{other}/documents").json()["total"] == 0
+
+
 def test_watch_tagged_and_filtered_by_workspace(client):
     wid = client.post("/api/workspaces",
                       json={"name": "WS2"}).json()["id"]

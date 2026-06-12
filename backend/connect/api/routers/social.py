@@ -18,10 +18,17 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 
 import psycopg
 
-from connect.api.deps import get_container, get_current_user, get_db
+from connect.api.deps import (
+    get_container,
+    get_current_user,
+    get_db,
+    require_admin,
+)
 from connect.domain.models import (
     CurrentUser,
     InstagramStatus,
+    PostSettings,
+    PostSettingsUpdate,
     SocialPost,
     SocialPostDraft,
     SocialPublishRequest,
@@ -32,7 +39,8 @@ from connect.llm.provider import LLMError
 from connect.llm.spend import BudgetExceeded
 from connect.llm.tiers import ModelTier
 from connect.orchestration.container import Container
-from connect.social import instagram
+from connect.social import generate, instagram
+from connect.social import settings as post_settings
 from connect.social.card import render_card
 from connect.storage import documents as doc_dao
 from connect.storage import enrichment as enrichment_dao
@@ -48,28 +56,19 @@ GEN_MAX_TOKENS = 800
 GEN_EST_OUT_TOKENS = 500
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
-_SYSTEM = (
-    "You turn ONE news document into an Instagram post. Use ONLY the supplied"
-    " document and its enrichment — never invent figures, dates, or claims."
-    " Tone: factual, neutral, engaging; no hype, no opinion. Always credit the"
-    " source. Produce a punchy headline, 2-4 short factual key points for the"
-    " image card, a 1-3 sentence caption that ends by crediting the source,"
-    " and relevant hashtags.")
+# caption/card prompt construction is shared with the workspace agent's draft
+# tool (connect/social/generate.py) so the style stays consistent.
+_system_for = generate.system_for
 
 
 def _build_prompt(doc, enrichment) -> str:
-    parts = [f"TITLE: {doc.title or 'untitled'}"]
-    if doc.source_name:
-        parts.append(f"SOURCE: {doc.source_name}")
-    if enrichment is not None and enrichment.summary:
-        parts.append(f"SUMMARY: {enrichment.summary}")
-    if enrichment is not None and enrichment.claims:
-        parts.append("KEY CLAIMS:\n"
-                     + "\n".join(f"- {c.text}" for c in enrichment.claims[:6]))
-    if enrichment is not None and enrichment.topics:
-        parts.append("TOPICS: " + ", ".join(enrichment.topics))
-    parts.append(f"DOCUMENT:\n{(doc.content_text or '')[:DOC_CAP]}")
-    return "\n\n".join(parts)
+    return generate.build_prompt(
+        title=doc.title, source_name=doc.source_name,
+        summary=enrichment.summary if enrichment is not None else None,
+        claims=[c.text for c in enrichment.claims]
+        if enrichment is not None else None,
+        topics=enrichment.topics if enrichment is not None else None,
+        content_text=doc.content_text)
 
 
 def _caption_with_tags(content: SocialPost) -> str:
@@ -93,9 +92,11 @@ async def draft_social_post(document_id: int,
         raise HTTPException(status_code=422,
                             detail="document has no text to summarize")
 
+    settings = await post_settings.effective(db)
     enrichment = await enrichment_dao.get_for_document(db, document_id)
     user_prompt = _build_prompt(doc, enrichment)
-    est_in = (len(_SYSTEM) + len(user_prompt)) // 4 + 200
+    system = _system_for(settings)
+    est_in = (len(system) + len(user_prompt)) // 4 + 200
     projected = spend.cost_usd(
         container.llm.model_for(ModelTier.BALANCED),
         input_tokens=est_in, output_tokens=GEN_EST_OUT_TOKENS)
@@ -106,7 +107,7 @@ async def draft_social_post(document_id: int,
 
     try:
         completion = await container.llm.complete_structured(
-            system=_SYSTEM,
+            system=system,
             messages=[{"role": "user", "content": user_prompt}],
             schema=SocialPost, tier=ModelTier.BALANCED,
             max_tokens=GEN_MAX_TOKENS)
@@ -117,10 +118,30 @@ async def draft_social_post(document_id: int,
                             model=completion.model, usage=completion.usage,
                             user_id=user.id)
 
-    image = await asyncio.to_thread(render_card, completion.output)
+    image = await asyncio.to_thread(
+        render_card, completion.output,
+        accent=settings.card_accent, sign_off=settings.sign_off)
     return SocialPostDraft(
         content=completion.output,
         image_b64=base64.b64encode(image).decode("ascii"))
+
+
+@router.get("/settings", response_model=PostSettings)
+async def get_post_settings(db: psycopg.AsyncConnection = Depends(get_db),
+                            user: CurrentUser = Depends(get_current_user)):
+    """The global default post-generation settings (readable by any user)."""
+    return await post_settings.get_global(db)
+
+
+@router.put("/settings", response_model=PostSettings,
+            dependencies=[Depends(require_admin)])
+async def put_post_settings(body: PostSettingsUpdate,
+                            db: psycopg.AsyncConnection = Depends(get_db)):
+    """Update the global default post-generation settings (admin)."""
+    current = await post_settings.get_global(db)
+    merged = post_settings._merge(current, body.model_dump(exclude_unset=True))
+    await post_settings.set_global(db, merged)
+    return merged
 
 
 @router.get("/instagram/status", response_model=InstagramStatus)
@@ -151,7 +172,10 @@ async def publish_social_post(document_id: int, body: SocialPublishRequest,
             detail="Instagram is not connected (set INSTAGRAM_ACCESS_TOKEN, "
                    "INSTAGRAM_BUSINESS_ACCOUNT_ID and CONNECT_PUBLIC_BASE_URL)")
 
-    image = await asyncio.to_thread(render_card, body.content)
+    settings = await post_settings.effective(db)
+    image = await asyncio.to_thread(
+        render_card, body.content,
+        accent=settings.card_accent, sign_off=settings.sign_off)
     rel = container.card_store.put(image)
     sha = rel.rsplit("/", 1)[-1]
     image_url = f"{s.public_base_url.rstrip('/')}/api/social/card/{sha}.jpg"

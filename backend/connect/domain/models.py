@@ -446,6 +446,60 @@ class DocumentAnswer(_Frozen):
                     " the answer; null when grounded=false.")
 
 
+# --- social posts (turn a document's enrichment into an Instagram post) -------
+
+class SocialPost(_Frozen):
+    """Instagram-ready content generated from a document's enrichment. Doubles
+    as the LLM output schema — the field descriptions ARE the instructions. The
+    caption/hashtags are the post text; headline + key_points render onto the
+    image card. Everything must be grounded in the source document; never
+    invent figures."""
+    headline: str = Field(
+        description="A short, punchy headline for the image card (<=70 chars),"
+                    " factual and grounded in the document.")
+    caption: str = Field(
+        description="The Instagram caption: an engaging but factual 1-3"
+                    " sentence summary of the news, neutral in tone, no"
+                    " fabricated numbers. End by crediting the source.")
+    hashtags: list[str] = Field(
+        default_factory=list,
+        description="5-12 relevant hashtags WITHOUT the '#' (e.g. 'RBI',"
+                    " 'IndianEconomy').")
+    key_points: list[str] = Field(
+        default_factory=list,
+        description="2-4 very short factual bullet points for the card"
+                    " (<=60 chars each), each grounded in the document.")
+    source_label: str = Field(
+        default="",
+        description="Short source credit for the card footer, e.g."
+                    " 'Source: RBI' or 'Source: Moneycontrol'.")
+    alt_text: str = Field(
+        default="",
+        description="One-sentence accessibility description of the card.")
+
+
+class SocialPostDraft(_Frozen):
+    """A generated post plus its rendered card (base64 JPEG) for instant
+    preview/download."""
+    content: SocialPost
+    image_b64: str
+
+
+class SocialPublishRequest(_Frozen):
+    content: SocialPost
+
+
+class InstagramStatus(_Frozen):
+    """Whether direct posting is available (tokens + public base URL set)."""
+    connected: bool
+    account_id: str | None = None
+
+
+class SocialPublishResult(_Frozen):
+    media_id: str
+    permalink: str | None = None
+
+
 # --- entities (Phase 1) --------------------------------------------------------
 
 class EntityListItem(_Frozen):
@@ -685,6 +739,7 @@ class Watch(_Frozen):
     last_seen_at: str | None = None
     created_at: str
     user_id: int | None = None
+    workspace_id: int | None = None
 
 
 class WatchCreate(_Frozen):
@@ -694,6 +749,7 @@ class WatchCreate(_Frozen):
     entity_id: int | None = None
     promote: bool = True
     muted: bool = False
+    workspace_id: int | None = None
 
 
 class WatchUpdate(_Frozen):
@@ -714,6 +770,7 @@ class Post(_Frozen):
     body: str
     document_id: int | None = None
     document_title: str | None = None   # joined from the linked document
+    workspace_id: int | None = None     # the workspace this finding belongs to
     visibility: Visibility = "shared"
     owner_id: int | None = None
     owner_name: str | None = None
@@ -725,6 +782,7 @@ class PostCreate(_Frozen):
     title: str = Field(min_length=1, max_length=300)
     body: str = Field(min_length=1, max_length=20_000)
     document_id: int | None = None
+    workspace_id: int | None = None
     visibility: Visibility = "shared"
 
 
@@ -732,6 +790,88 @@ class PostUpdate(_Frozen):
     title: str | None = Field(default=None, min_length=1, max_length=300)
     body: str | None = Field(default=None, min_length=1, max_length=20_000)
     visibility: Visibility | None = None
+
+
+# --- workspaces (v7): a saved lens over the shared corpus ----------------------
+
+class Workspace(_Frozen):
+    """A named focus (topics / sources / FTS query) that drives a focused feed
+    and groups a user's findings + watches. Owned + shared/private."""
+    id: int
+    name: str
+    description: str = ""
+    topics: list[str] = Field(default_factory=list)
+    source_ids: list[int] = Field(default_factory=list)
+    query_fts: str | None = None
+    visibility: Visibility = "shared"
+    owner_id: int | None = None
+    owner_name: str | None = None
+    created_at: str
+    updated_at: str | None = None
+
+
+class WorkspaceCreate(_Frozen):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = ""
+    topics: list[str] = Field(default_factory=list)
+    source_ids: list[int] = Field(default_factory=list)
+    query_fts: str | None = None
+    visibility: Visibility = "shared"
+
+
+class WorkspaceUpdate(_Frozen):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = None
+    topics: list[str] | None = None
+    source_ids: list[int] | None = None
+    query_fts: str | None = None
+    visibility: Visibility | None = None
+
+
+# --- workspace agent (chat) ----------------------------------------------------
+
+class ChatTurn(_Frozen):
+    """One human-readable conversation turn (what the UI renders). The
+    provider-shaped wire messages that resume the agent are kept server-side,
+    not exposed here."""
+    role: str
+    text: str
+    tools_used: list[str] = Field(default_factory=list)
+    finding_id: int | None = None
+    finding_title: str | None = None
+
+
+class WorkspaceChatRequest(_Frozen):
+    """Send a message to a workspace's agent. Omit ``chat_id`` to start a new
+    conversation; pass it to continue a saved one."""
+    chat_id: int | None = None
+    message: str = Field(min_length=1, max_length=4000)
+
+
+class WorkspaceChatResponse(_Frozen):
+    chat_id: int
+    reply: str
+    transcript: list[ChatTurn]
+    tools_used: list[str] = Field(default_factory=list)
+    finding: Post | None = None
+    turns_completed: int
+    spent_usd: float
+    budget_remaining_usd: float
+
+
+class WorkspaceChatSummary(_Frozen):
+    id: int
+    title: str
+    created_at: str
+    updated_at: str | None = None
+
+
+class WorkspaceChatDetail(_Frozen):
+    id: int
+    title: str
+    transcript: list[ChatTurn]
+    created_at: str
+    updated_at: str | None = None
 
 
 # --- jobs --------------------------------------------------------------------

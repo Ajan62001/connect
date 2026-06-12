@@ -19,8 +19,8 @@ from connect.storage.pg import utc_now
 VISIBLE_SQL = "(p.visibility = 'shared' OR p.owner_id = %s)"
 
 _SELECT = """
-SELECT p.id, p.title, p.body, p.document_id, p.visibility, p.owner_id,
-       p.created_at, p.updated_at,
+SELECT p.id, p.title, p.body, p.document_id, p.workspace_id, p.visibility,
+       p.owner_id, p.created_at, p.updated_at,
        d.title AS document_title, u.name AS owner_name
 FROM post p
 LEFT JOIN document d ON d.id = p.document_id
@@ -35,6 +35,7 @@ def _to_model(row: Mapping[str, Any]) -> Post:
         body=row["body"],
         document_id=row["document_id"],
         document_title=row.get("document_title"),
+        workspace_id=row.get("workspace_id"),
         visibility=row["visibility"],
         owner_id=row["owner_id"],
         owner_name=row.get("owner_name"),
@@ -45,12 +46,15 @@ def _to_model(row: Mapping[str, Any]) -> Post:
 
 async def insert(conn: psycopg.AsyncConnection, *, owner_id: int, title: str,
                  body: str, document_id: int | None = None,
+                 workspace_id: int | None = None,
                  visibility: str = "shared") -> Post:
     async with conn.transaction():
         cur = await conn.execute(
             "INSERT INTO post (owner_id, title, body, document_id,"
-            " visibility, created_at) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
-            (owner_id, title, body, document_id, visibility, utc_now()))
+            " workspace_id, visibility, created_at)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (owner_id, title, body, document_id, workspace_id, visibility,
+             utc_now()))
         post_id = (await cur.fetchone())["id"]
     got = await get(conn, post_id)
     assert got is not None
@@ -72,9 +76,10 @@ async def get(conn: psycopg.AsyncConnection, post_id: int, *,
 async def list_visible(conn: psycopg.AsyncConnection, *,
                        viewer: int | None = None,
                        document_id: int | None = None,
+                       workspace_id: int | None = None,
                        limit: int = 100, offset: int = 0) -> list[Post]:
     """Newest-first posts the viewer may see, optionally only those tied to
-    one document."""
+    one document or one workspace."""
     sql = _SELECT
     where: list[str] = []
     params: list[Any] = []
@@ -84,6 +89,9 @@ async def list_visible(conn: psycopg.AsyncConnection, *,
     if document_id is not None:
         where.append("p.document_id = %s")
         params.append(document_id)
+    if workspace_id is not None:
+        where.append("p.workspace_id = %s")
+        params.append(workspace_id)
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY p.created_at DESC, p.id DESC LIMIT %s OFFSET %s"

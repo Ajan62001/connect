@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 import psycopg
 
@@ -26,9 +26,10 @@ def _validate(kind: str, query_fts: str | None, entity_id: int | None) -> None:
 
 
 @router.get("", response_model=list[Watch])
-async def list_watches(db: psycopg.AsyncConnection = Depends(get_db),
+async def list_watches(workspace_id: int | None = Query(default=None),
+                       db: psycopg.AsyncConnection = Depends(get_db),
                        user: CurrentUser = Depends(get_current_user)):
-    return await watch_dao.list_all(db, user.id)
+    return await watch_dao.list_all(db, user.id, workspace_id=workspace_id)
 
 
 @router.post("", response_model=Watch, status_code=201)
@@ -39,7 +40,8 @@ async def create_watch(body: WatchCreate,
     return await watch_dao.insert(
         db, user_id=user.id, kind=body.kind, label=body.label,
         query_fts=body.query_fts, entity_id=body.entity_id,
-        promote=body.promote, muted=body.muted)
+        promote=body.promote, muted=body.muted,
+        workspace_id=body.workspace_id)
 
 
 @router.get("/badges")

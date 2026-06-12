@@ -16,6 +16,7 @@ dependencies = [
     "feedparser",
     "lxml",
     "rapidfuzz",
+    "pillow",
     "sse-starlette",
     "pydantic>=2",
     "pydantic-settings",

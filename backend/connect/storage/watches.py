@@ -29,20 +29,22 @@ def _to_model(row: Mapping[str, Any]) -> Watch:
         last_seen_at=row["last_seen_at"],
         created_at=row["created_at"],
         user_id=row["user_id"],
+        workspace_id=row.get("workspace_id"),
     )
 
 
 async def insert(conn: psycopg.AsyncConnection, *, user_id: int, kind: str,
                  label: str, query_fts: str | None = None,
                  entity_id: int | None = None,
-                 promote: bool = True, muted: bool = False) -> Watch:
+                 promote: bool = True, muted: bool = False,
+                 workspace_id: int | None = None) -> Watch:
     async with conn.transaction():
         cur = await conn.execute(
             "INSERT INTO watch (user_id, kind, label, query_fts, entity_id,"
-            " promote, muted, created_at)"
-            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            " promote, muted, created_at, workspace_id)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             (user_id, kind, label, query_fts, entity_id, bool(promote),
-             bool(muted), utc_now()))
+             bool(muted), utc_now(), workspace_id))
         watch_id = (await cur.fetchone())["id"]
     return await get(conn, watch_id)  # type: ignore[return-value]
 
@@ -58,10 +60,14 @@ async def get(conn: psycopg.AsyncConnection, watch_id: int, *,
     return _to_model(row) if row else None
 
 
-async def list_all(conn: psycopg.AsyncConnection,
-                   user_id: int) -> list[Watch]:
-    cur = await conn.execute(
-        "SELECT * FROM watch WHERE user_id = %s ORDER BY id", (user_id,))
+async def list_all(conn: psycopg.AsyncConnection, user_id: int, *,
+                   workspace_id: int | None = None) -> list[Watch]:
+    sql = "SELECT * FROM watch WHERE user_id = %s"
+    params: list[Any] = [user_id]
+    if workspace_id is not None:
+        sql += " AND workspace_id = %s"
+        params.append(workspace_id)
+    cur = await conn.execute(sql + " ORDER BY id", params)
     return [_to_model(r) for r in await cur.fetchall()]
 
 

@@ -65,7 +65,7 @@ class StorageVersionError(StorageError):
 # PostgreSQL baseline schema (v0.2, the canonical DDL) — fresh lineage, v1.
 # ==============================================================================
 
-PG_SCHEMA_VERSION = 6
+PG_SCHEMA_VERSION = 8
 
 # Extensions first: the compose image is pgvector/pgvector:pg17, so both are
 # present; IF NOT EXISTS keeps re-entry harmless.
@@ -830,10 +830,12 @@ CREATE TABLE IF NOT EXISTS watch (
     muted        boolean NOT NULL DEFAULT false,
     last_seen_at timestamptz,
     created_at   timestamptz NOT NULL,
-    user_id      bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE
+    user_id      bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    workspace_id bigint REFERENCES workspace(id) ON DELETE SET NULL
 )"""
 # user_id NOT NULL since v3 (watches are personal); pre-tenancy rows were
 # backfilled to the first admin by the v2->v3 migration.
+# workspace_id (v7): optional tag grouping a watch into a workspace.
 
 _PG_DDL_WATCH_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_watch_user ON watch(user_id)",
@@ -869,6 +871,7 @@ CREATE TABLE IF NOT EXISTS post (
     visibility  text NOT NULL DEFAULT 'shared'
                 CONSTRAINT ck_post_visibility
                 CHECK (visibility IN {E.sql_in(E.VISIBILITIES)}),
+    workspace_id bigint REFERENCES workspace(id) ON DELETE SET NULL,
     created_at  timestamptz NOT NULL,
     updated_at  timestamptz
 )"""
@@ -879,6 +882,53 @@ _PG_DDL_POST_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_post_visibility"
     " ON post(visibility, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_post_document ON post(document_id)",
+)
+
+# Workspaces (v7): a SAVED LENS over the shared corpus — a named focus
+# (topics / sources / FTS query) that drives a focused feed, and a tag that
+# groups a user's findings/watches. Owned + shared/private like dossiers. The
+# focus is stored as jsonb (topics: list[str], source_ids: list[int]).
+_PG_DDL_WORKSPACE = f"""
+CREATE TABLE IF NOT EXISTS workspace (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    owner_id    bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    name        text NOT NULL,
+    description text NOT NULL DEFAULT '',
+    topics      jsonb NOT NULL DEFAULT '[]'::jsonb,
+    source_ids  jsonb NOT NULL DEFAULT '[]'::jsonb,
+    query_fts   text,
+    visibility  text NOT NULL DEFAULT 'shared'
+                CONSTRAINT ck_workspace_visibility
+                CHECK (visibility IN {E.sql_in(E.VISIBILITIES)}),
+    created_at  timestamptz NOT NULL,
+    updated_at  timestamptz
+)"""
+
+_PG_DDL_WORKSPACE_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_workspace_owner"
+    " ON workspace(owner_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_workspace_visibility"
+    " ON workspace(visibility, created_at DESC)",
+)
+
+# Saved workspace-agent conversations (v8): per-user, per-workspace. ``messages``
+# is the provider-shaped wire transcript (replayed to resume the agent);
+# ``transcript`` is the human-readable display turns the UI renders.
+_PG_DDL_WORKSPACE_CHAT = """
+CREATE TABLE IF NOT EXISTS workspace_chat (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    workspace_id bigint NOT NULL REFERENCES workspace(id) ON DELETE CASCADE,
+    owner_id     bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    title        text NOT NULL DEFAULT '',
+    messages     jsonb NOT NULL DEFAULT '[]'::jsonb,
+    transcript   jsonb NOT NULL DEFAULT '[]'::jsonb,
+    created_at   timestamptz NOT NULL,
+    updated_at   timestamptz
+)"""
+
+_PG_DDL_WORKSPACE_CHAT_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_workspace_chat_owner"
+    " ON workspace_chat(workspace_id, owner_id, updated_at DESC)",
 )
 
 # One brief per (user, day) — the UNIQUE doubles as the ON CONFLICT target
@@ -1067,6 +1117,10 @@ PG_DDL: tuple[str, ...] = (
     _PG_DDL_FETCH_DOMAIN,
     _PG_DDL_ROBOTS_CACHE,
     _PG_DDL_BEAT_RUN,
+    _PG_DDL_WORKSPACE,
+    *_PG_DDL_WORKSPACE_INDEXES,
+    _PG_DDL_WORKSPACE_CHAT,
+    *_PG_DDL_WORKSPACE_CHAT_INDEXES,
     _PG_DDL_WATCH,
     *_PG_DDL_WATCH_INDEXES,
     _PG_DDL_WATCH_HIT,

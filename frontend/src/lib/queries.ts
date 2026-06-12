@@ -39,8 +39,12 @@ import type {
   InvestigationListParams,
   InviteCreate,
   PostCreate,
+  PostFilter,
   PostUpdate,
   SearchKind,
+  SocialPost,
+  WorkspaceCreate,
+  WorkspaceUpdate,
   SourceCreate,
   SourceTestRequest,
   SourceUpdate,
@@ -62,8 +66,14 @@ export const queryKeys = {
   watches: ["watches"] as const,
   watchBadges: ["watches", "badges"] as const,
   posts: ["posts"] as const,
-  postList: (documentId?: number) =>
-    ["posts", "list", documentId ?? null] as const,
+  postList: (filter: PostFilter = {}) =>
+    ["posts", "list", filter] as const,
+  instagramStatus: ["social", "instagram", "status"] as const,
+  workspaces: ["workspaces"] as const,
+  workspace: (id: number) => ["workspaces", "detail", id] as const,
+  workspaceFeed: (id: number, page: number) =>
+    ["workspaces", "feed", id, page] as const,
+  workspaceChats: (id: number) => ["workspaces", "chats", id] as const,
   entities: ["entities"] as const,
   entityList: (params: EntityListParams) => ["entities", "list", params] as const,
   entity: (id: number) => ["entities", "detail", id] as const,
@@ -268,6 +278,26 @@ export function useDocument(id: number) {
 export function useAskDocument(id: number) {
   return useMutation<DocumentAnswer, Error, string>({
     mutationFn: (question: string) => api.askDocument(id, question),
+  });
+}
+
+/** Generate an Instagram caption + card from a document's enrichment. */
+export function useDraftSocialPost(id: number) {
+  return useMutation({ mutationFn: () => api.draftSocialPost(id) });
+}
+
+/** Whether direct Instagram posting is available on this deployment. */
+export function useInstagramStatus() {
+  return useQuery({
+    queryKey: queryKeys.instagramStatus,
+    queryFn: api.getInstagramStatus,
+    staleTime: 5 * 60_000,
+  });
+}
+
+export function usePublishSocialPost(id: number) {
+  return useMutation({
+    mutationFn: (content: SocialPost) => api.publishSocialPost(id, content),
   });
 }
 
@@ -647,10 +677,10 @@ export function useMarkWatchSeen() {
 // Findings board (posts)
 // --------------------------------------------------------------------------
 
-export function usePosts(documentId?: number) {
+export function usePosts(filter: PostFilter = {}) {
   return useQuery({
-    queryKey: queryKeys.postList(documentId),
-    queryFn: () => api.listPosts(documentId),
+    queryKey: queryKeys.postList(filter),
+    queryFn: () => api.listPosts(filter),
     placeholderData: keepPreviousData,
   });
 }
@@ -684,6 +714,106 @@ export function useDeletePost() {
   return useMutation({
     mutationFn: (id: number) => api.deletePost(id),
     onSuccess: invalidate,
+  });
+}
+
+// --------------------------------------------------------------------------
+// Workspaces (a saved lens over the shared corpus)
+// --------------------------------------------------------------------------
+
+export function useWorkspaces() {
+  return useQuery({
+    queryKey: queryKeys.workspaces,
+    queryFn: api.listWorkspaces,
+  });
+}
+
+export function useWorkspace(id: number) {
+  return useQuery({
+    queryKey: queryKeys.workspace(id),
+    queryFn: () => api.getWorkspace(id),
+    enabled: Number.isFinite(id),
+  });
+}
+
+export function useWorkspaceFeed(id: number, page: number) {
+  return useQuery({
+    queryKey: queryKeys.workspaceFeed(id, page),
+    queryFn: () => api.getWorkspaceFeed(id, page),
+    enabled: Number.isFinite(id),
+    placeholderData: keepPreviousData,
+  });
+}
+
+function useInvalidateWorkspaces() {
+  const queryClient = useQueryClient();
+  return () => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces });
+  };
+}
+
+export function useCreateWorkspace() {
+  const invalidate = useInvalidateWorkspaces();
+  return useMutation({
+    mutationFn: (payload: WorkspaceCreate) => api.createWorkspace(payload),
+    onSuccess: invalidate,
+  });
+}
+
+export function useUpdateWorkspace(id: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: WorkspaceUpdate) => api.updateWorkspace(id, payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.workspace(id) });
+    },
+  });
+}
+
+export function useDeleteWorkspace() {
+  const invalidate = useInvalidateWorkspaces();
+  return useMutation({
+    mutationFn: (id: number) => api.deleteWorkspace(id),
+    onSuccess: invalidate,
+  });
+}
+
+/** Send one message to a workspace's agent (saved server-side); a posted
+ *  finding invalidates the findings list, every turn invalidates the chat
+ *  list (title/updated_at). */
+export function useWorkspaceChat(id: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: { message: string; chatId?: number }) =>
+      api.workspaceChat(id, vars.message, vars.chatId),
+    onSuccess: (resp) => {
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.workspaceChats(id),
+      });
+      if (resp.finding) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.posts });
+      }
+    },
+  });
+}
+
+export function useWorkspaceChats(id: number) {
+  return useQuery({
+    queryKey: queryKeys.workspaceChats(id),
+    queryFn: () => api.listWorkspaceChats(id),
+    enabled: Number.isFinite(id),
+  });
+}
+
+export function useDeleteWorkspaceChat(id: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (chatId: number) => api.deleteWorkspaceChat(id, chatId),
+    onSuccess: () =>
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.workspaceChats(id),
+      }),
   });
 }
 

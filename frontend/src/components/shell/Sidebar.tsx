@@ -6,6 +6,7 @@ import {
   DatabaseIcon,
   EyeIcon,
   FlaskConicalIcon,
+  LayoutGridIcon,
   LibraryBigIcon,
   NotebookPenIcon,
   RssIcon,
@@ -22,6 +23,7 @@ import { cn } from "@/lib/utils";
 
 const NAV_ITEMS = [
   { href: "/today", label: "Today", icon: SunIcon },
+  { href: "/workspaces", label: "Workspaces", icon: LayoutGridIcon },
   { href: "/feed", label: "Feed", icon: RssIcon },
   { href: "/library", label: "Library", icon: LibraryBigIcon },
   { href: "/search", label: "Search", icon: SearchIcon },

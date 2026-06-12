@@ -367,6 +367,54 @@ export interface DocumentAnswer {
   quote: string | null;
 }
 
+// --- social posts (turn a document's enrichment into an Instagram post) -----
+
+export interface SocialPost {
+  headline: string;
+  caption: string;
+  hashtags: string[];
+  key_points: string[];
+  source_label: string;
+  alt_text: string;
+}
+
+export interface SocialPostDraft {
+  content: SocialPost;
+  /** base64 JPEG of the rendered 1080×1080 card. */
+  image_b64: string;
+}
+
+export interface InstagramStatus {
+  connected: boolean;
+  account_id: string | null;
+}
+
+export interface SocialPublishResult {
+  media_id: string;
+  permalink: string | null;
+}
+
+export function draftSocialPost(documentId: number): Promise<SocialPostDraft> {
+  return request<SocialPostDraft>(
+    `/api/social/documents/${documentId}/draft`,
+    { method: "POST" },
+  );
+}
+
+export function getInstagramStatus(): Promise<InstagramStatus> {
+  return request<InstagramStatus>("/api/social/instagram/status");
+}
+
+export function publishSocialPost(
+  documentId: number,
+  content: SocialPost,
+): Promise<SocialPublishResult> {
+  return request<SocialPublishResult>(
+    `/api/social/documents/${documentId}/publish`,
+    jsonInit("POST", { content }),
+  );
+}
+
 // --- Phase 2: events / threads / briefs / cursors / calendar ----------------
 
 /** Minimal event reference hung off a document detail. */
@@ -1246,6 +1294,7 @@ export interface Watch {
   muted: boolean;
   last_seen_at: string | null;
   created_at: string;
+  workspace_id: number | null;
 }
 
 export interface WatchCreate {
@@ -1255,6 +1304,7 @@ export interface WatchCreate {
   entity_id?: number | null;
   promote?: boolean;
   muted?: boolean;
+  workspace_id?: number | null;
 }
 
 export interface WatchUpdate {
@@ -1274,6 +1324,8 @@ export interface Post {
   /** the news document this finding was posted from, if any. */
   document_id: number | null;
   document_title: string | null;
+  /** the workspace this finding belongs to, if any. */
+  workspace_id: number | null;
   visibility: Visibility;
   owner_id: number | null;
   owner_name: string | null;
@@ -1285,6 +1337,7 @@ export interface PostCreate {
   title: string;
   body: string;
   document_id?: number | null;
+  workspace_id?: number | null;
   visibility?: Visibility;
 }
 
@@ -1818,8 +1871,13 @@ export function markWatchSeen(id: number): Promise<Watch> {
 // Findings board (posts)
 // ---------------------------------------------------------------------------
 
-export function listPosts(documentId?: number): Promise<Post[]> {
-  return request<Post[]>(`/api/posts${qs({ document_id: documentId })}`);
+export interface PostFilter {
+  document_id?: number;
+  workspace_id?: number;
+}
+
+export function listPosts(filter: PostFilter = {}): Promise<Post[]> {
+  return request<Post[]>(`/api/posts${qs({ ...filter })}`);
 }
 
 export function createPost(payload: PostCreate): Promise<Post> {
@@ -1832,6 +1890,140 @@ export function updatePost(id: number, payload: PostUpdate): Promise<Post> {
 
 export function deletePost(id: number): Promise<void> {
   return request<void>(`/api/posts/${id}`, { method: "DELETE" });
+}
+
+// ---------------------------------------------------------------------------
+// Workspaces (a saved lens over the shared corpus)
+// ---------------------------------------------------------------------------
+
+export interface Workspace {
+  id: number;
+  name: string;
+  description: string;
+  topics: string[];
+  source_ids: number[];
+  query_fts: string | null;
+  visibility: Visibility;
+  owner_id: number | null;
+  owner_name: string | null;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface WorkspaceCreate {
+  name: string;
+  description?: string;
+  topics?: string[];
+  source_ids?: number[];
+  query_fts?: string | null;
+  visibility?: Visibility;
+}
+
+export interface WorkspaceUpdate {
+  name?: string;
+  description?: string;
+  topics?: string[];
+  source_ids?: number[];
+  query_fts?: string | null;
+  visibility?: Visibility;
+}
+
+export function listWorkspaces(): Promise<Workspace[]> {
+  return request<Workspace[]>("/api/workspaces");
+}
+
+export function getWorkspace(id: number): Promise<Workspace> {
+  return request<Workspace>(`/api/workspaces/${id}`);
+}
+
+export function createWorkspace(payload: WorkspaceCreate): Promise<Workspace> {
+  return request<Workspace>("/api/workspaces", jsonInit("POST", payload));
+}
+
+export function updateWorkspace(
+  id: number,
+  payload: WorkspaceUpdate,
+): Promise<Workspace> {
+  return request<Workspace>(`/api/workspaces/${id}`, jsonInit("PATCH", payload));
+}
+
+export function deleteWorkspace(id: number): Promise<void> {
+  return request<void>(`/api/workspaces/${id}`, { method: "DELETE" });
+}
+
+export function getWorkspaceFeed(
+  id: number,
+  page = 1,
+  pageSize = 20,
+): Promise<Page<DocumentListItem>> {
+  return request<Page<DocumentListItem>>(
+    `/api/workspaces/${id}/feed${qs({ page, page_size: pageSize })}`,
+  );
+}
+
+// --- workspace agent (chat) -------------------------------------------------
+
+export interface ChatTurn {
+  role: string;
+  text: string;
+  tools_used: string[];
+  finding_id: number | null;
+  finding_title: string | null;
+}
+
+export interface WorkspaceChatResponse {
+  chat_id: number;
+  reply: string;
+  transcript: ChatTurn[];
+  tools_used: string[];
+  finding: Post | null;
+  turns_completed: number;
+  spent_usd: number;
+  budget_remaining_usd: number;
+}
+
+export interface WorkspaceChatSummary {
+  id: number;
+  title: string;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface WorkspaceChatDetail {
+  id: number;
+  title: string;
+  transcript: ChatTurn[];
+  created_at: string;
+  updated_at: string | null;
+}
+
+/** Send one message; omit chatId to start a new conversation. */
+export function workspaceChat(
+  id: number,
+  message: string,
+  chatId?: number,
+): Promise<WorkspaceChatResponse> {
+  return request<WorkspaceChatResponse>(
+    `/api/workspaces/${id}/chat`,
+    jsonInit("POST", { message, chat_id: chatId }),
+  );
+}
+
+export function listWorkspaceChats(id: number): Promise<WorkspaceChatSummary[]> {
+  return request<WorkspaceChatSummary[]>(`/api/workspaces/${id}/chats`);
+}
+
+export function getWorkspaceChat(
+  id: number,
+  chatId: number,
+): Promise<WorkspaceChatDetail> {
+  return request<WorkspaceChatDetail>(`/api/workspaces/${id}/chats/${chatId}`);
+}
+
+export function deleteWorkspaceChat(id: number, chatId: number): Promise<void> {
+  return request<void>(`/api/workspaces/${id}/chats/${chatId}`, {
+    method: "DELETE",
+  });
 }
 
 // ---------------------------------------------------------------------------

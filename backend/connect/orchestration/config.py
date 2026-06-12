@@ -63,6 +63,26 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices(
             "TWITTERAPI_IO_API_KEY", "CONNECT_TWITTERAPI_IO_API_KEY"),
     )
+    # Instagram direct posting (optional): when BOTH are set AND public_base_url
+    # is configured, the social-post feature offers "Post to Instagram" via the
+    # Graph API; otherwise it falls back to manual download. The token is a
+    # long-lived IG Graph API access token for the business/creator account.
+    instagram_access_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "INSTAGRAM_ACCESS_TOKEN", "CONNECT_INSTAGRAM_ACCESS_TOKEN"),
+    )
+    instagram_business_account_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "INSTAGRAM_BUSINESS_ACCOUNT_ID",
+            "CONNECT_INSTAGRAM_BUSINESS_ACCOUNT_ID"),
+    )
+    # Public origin of THIS backend (e.g. https://connect.example.com).
+    # Instagram's servers fetch the rendered card from
+    # {public_base_url}/api/social/card/<id>.jpg, so direct posting needs a
+    # publicly reachable URL (localhost is unreachable by Instagram).
+    public_base_url: str | None = None
 
     # --- auth (tenancy design §3, Phase B) -----------------------------------
     # Google OAuth client credentials (Google Cloud Console — see README

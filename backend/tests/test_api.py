@@ -12,7 +12,7 @@ TEXT = (
 def test_health(client):
     body = client.get("/api/health").json()
     assert body["ok"] is True
-    assert body["schema_version"] == 6   # PG lineage (v6: posts/findings board)
+    assert body["schema_version"] == 8   # PG lineage (v8: workspace chats)
     assert body["vector_backend"] == "disabled"  # embeddings off in tests
     assert body["db_path"].startswith("postgresql://")
     # the DSN's password must never leak through the unauthenticated

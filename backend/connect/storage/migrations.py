@@ -139,6 +139,28 @@ async def pg_migrate_5_to_6(conn: "psycopg.AsyncConnection") -> None:
         await conn.execute(ddl)
 
 
+async def pg_migrate_6_to_7(conn: "psycopg.AsyncConnection") -> None:
+    """v7 — workspaces (saved lens over the shared corpus): the new
+    ``workspace`` table, plus an optional ``workspace_id`` tag on post and
+    watch (FK ON DELETE SET NULL — deleting a workspace untags, never drops,
+    its findings/watches)."""
+    for ddl in (schema._PG_DDL_WORKSPACE, *schema._PG_DDL_WORKSPACE_INDEXES):
+        await conn.execute(ddl)
+    for table in ("post", "watch"):
+        await conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS workspace_id bigint"
+            " REFERENCES workspace(id) ON DELETE SET NULL")
+
+
+async def pg_migrate_7_to_8(conn: "psycopg.AsyncConnection") -> None:
+    """v8 — persisted workspace-agent conversations: the new
+    ``workspace_chat`` table (CREATE from schema's DDL — workspace/app_user
+    already exist)."""
+    for ddl in (schema._PG_DDL_WORKSPACE_CHAT,
+                *schema._PG_DDL_WORKSPACE_CHAT_INDEXES):
+        await conn.execute(ddl)
+
+
 # Registry: version N -> async function taking N's schema to N+1's.
 # Forward-only.
 PG_MIGRATIONS: dict[
@@ -148,6 +170,8 @@ PG_MIGRATIONS: dict[
     3: pg_migrate_3_to_4,
     4: pg_migrate_4_to_5,
     5: pg_migrate_5_to_6,
+    6: pg_migrate_6_to_7,
+    7: pg_migrate_7_to_8,
 }
 
 

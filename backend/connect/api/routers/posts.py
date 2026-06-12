@@ -25,15 +25,16 @@ MAX_LIMIT = 100
 
 @router.get("", response_model=list[Post])
 async def list_posts(document_id: int | None = Query(default=None),
+                     workspace_id: int | None = Query(default=None),
                      limit: int = Query(default=50, ge=1, le=MAX_LIMIT),
                      offset: int = Query(default=0, ge=0),
                      db: psycopg.AsyncConnection = Depends(get_db),
                      user: CurrentUser = Depends(get_current_user)):
     """Newest-first findings the caller may see; ``document_id`` narrows to
-    the findings posted from one article."""
+    the findings posted from one article, ``workspace_id`` to one workspace."""
     return await post_dao.list_visible(
-        db, viewer=user.id, document_id=document_id, limit=limit,
-        offset=offset)
+        db, viewer=user.id, document_id=document_id,
+        workspace_id=workspace_id, limit=limit, offset=offset)
 
 
 @router.post("", response_model=Post, status_code=201)
@@ -52,6 +53,7 @@ async def create_post(body: PostCreate,
     return await post_dao.insert(
         db, owner_id=user.id, title=body.title.strip(),
         body=body.body.strip(), document_id=body.document_id,
+        workspace_id=body.workspace_id,
         visibility=body.visibility or "shared")
 
 

@@ -3,11 +3,16 @@
 import { use, useState } from "react";
 import {
   ArrowLeftIcon,
+  CopyIcon,
+  DownloadIcon,
   ExternalLinkIcon,
   FileQuestionIcon,
+  ImageIcon,
   Loader2Icon,
   NotebookPenIcon,
+  SendIcon,
   Share2Icon,
+  SparklesIcon,
 } from "lucide-react";
 import Link from "next/link";
 import { toast } from "sonner";
@@ -50,6 +55,7 @@ import type {
   DocumentLink,
   DocumentLinkStatus,
   EnrichmentClaim,
+  SocialPost,
   Visibility,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -64,8 +70,11 @@ import {
   useAskDocument,
   useCreatePost,
   useDocument,
+  useDraftSocialPost,
   useFetchDocumentLink,
+  useInstagramStatus,
   useMe,
+  usePublishSocialPost,
 } from "@/lib/queries";
 
 function MetaRow({ label, children }: { label: string; children: React.ReactNode }) {
@@ -448,8 +457,152 @@ function PostFindingDialog({
   );
 }
 
+function SocialPostDialog({
+  documentId,
+  open,
+  onOpenChange,
+}: {
+  documentId: number;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const draft = useDraftSocialPost(documentId);
+  const igStatus = useInstagramStatus();
+  const publish = usePublishSocialPost(documentId);
+  const [caption, setCaption] = useState("");
+
+  const data = draft.data;
+  const hashtagLine = data
+    ? data.content.hashtags.map((h) => `#${h}`).join(" ")
+    : "";
+  const captionWithTags = [caption, hashtagLine].filter(Boolean).join("\n\n");
+
+  const generate = () =>
+    draft.mutate(undefined, {
+      onSuccess: (d) => setCaption(d.content.caption),
+      onError: (e) =>
+        toast.error("Could not generate post", { description: e.message }),
+    });
+
+  const copyCaption = async () => {
+    await navigator.clipboard.writeText(captionWithTags);
+    toast.success("Caption copied");
+  };
+
+  const downloadImage = () => {
+    if (!data) return;
+    const a = document.createElement("a");
+    a.href = `data:image/jpeg;base64,${data.image_b64}`;
+    a.download = `connect-post-${documentId}.jpg`;
+    a.click();
+  };
+
+  const postToInstagram = () => {
+    if (!data) return;
+    const content: SocialPost = { ...data.content, caption };
+    publish.mutate(content, {
+      onSuccess: (r) => {
+        toast.success("Posted to Instagram", {
+          description: r.permalink ?? `media ${r.media_id}`,
+        });
+        onOpenChange(false);
+      },
+      onError: (e) =>
+        toast.error("Could not post to Instagram", { description: e.message }),
+    });
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Create Instagram post</DialogTitle>
+          <DialogDescription>
+            Generated from this document’s enrichment.
+          </DialogDescription>
+        </DialogHeader>
+
+        {draft.isPending ? (
+          <div className="flex items-center gap-2 py-10 text-sm text-muted-foreground">
+            <Loader2Icon className="size-4 animate-spin" />
+            Generating caption + card…
+          </div>
+        ) : data ? (
+          <div className="space-y-3">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={`data:image/jpeg;base64,${data.image_b64}`}
+              alt={data.content.alt_text || "Instagram card"}
+              className="w-full rounded-lg border"
+            />
+            <Textarea
+              value={caption}
+              onChange={(e) => setCaption(e.target.value)}
+              className="min-h-24"
+              aria-label="Caption"
+            />
+            {hashtagLine ? (
+              <p className="text-xs text-muted-foreground">{hashtagLine}</p>
+            ) : null}
+            <div className="flex flex-wrap gap-2">
+              <Button variant="outline" size="sm" onClick={copyCaption}>
+                <CopyIcon data-icon="inline-start" />
+                Copy caption
+              </Button>
+              <Button variant="outline" size="sm" onClick={downloadImage}>
+                <DownloadIcon data-icon="inline-start" />
+                Download image
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={generate}
+                disabled={draft.isPending}
+              >
+                Regenerate
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3 py-2">
+            <p className="text-sm text-muted-foreground">
+              Turn this article into an Instagram-ready caption and image card.
+            </p>
+            <Button onClick={generate} disabled={draft.isPending}>
+              <SparklesIcon data-icon="inline-start" />
+              Generate post
+            </Button>
+          </div>
+        )}
+
+        <DialogFooter>
+          {igStatus.data?.connected ? (
+            <Button
+              onClick={postToInstagram}
+              disabled={!data || publish.isPending}
+            >
+              {publish.isPending ? (
+                <Loader2Icon className="animate-spin" data-icon="inline-start" />
+              ) : (
+                <SendIcon data-icon="inline-start" />
+              )}
+              Post to Instagram
+            </Button>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              Connect Instagram to post directly — for now, download the image
+              and post it from the app.
+            </p>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function MetadataSidebar({ document }: { document: Document }) {
   const [postOpen, setPostOpen] = useState(false);
+  const [socialOpen, setSocialOpen] = useState(false);
   return (
     <aside className="w-full shrink-0 space-y-3 lg:w-64">
       <Button
@@ -460,11 +613,24 @@ function MetadataSidebar({ document }: { document: Document }) {
         <NotebookPenIcon data-icon="inline-start" />
         Post a finding
       </Button>
+      <Button
+        variant="outline"
+        className="w-full"
+        onClick={() => setSocialOpen(true)}
+      >
+        <ImageIcon data-icon="inline-start" />
+        Create Instagram post
+      </Button>
       <PostFindingDialog
         documentId={document.id}
         documentTitle={document.title}
         open={postOpen}
         onOpenChange={setPostOpen}
+      />
+      <SocialPostDialog
+        documentId={document.id}
+        open={socialOpen}
+        onOpenChange={setSocialOpen}
       />
       <dl className="space-y-4 rounded-xl border bg-card p-4">
         <MetaRow label="Source">{document.source_name ?? "Manual ingest"}</MetaRow>

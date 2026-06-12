@@ -81,6 +81,9 @@ class Container:
         self._pool: AsyncConnectionPool | None = None
         self.schema_version: int = 0
         self.blobs = BlobStore(settings.blob_dir)
+        # social cards live in a SEPARATE namespace from document blobs so the
+        # public card endpoint can never serve a (possibly private) doc blob.
+        self.card_store = BlobStore(settings.blob_dir / "social_cards")
         self.fetcher = Fetcher(
             per_domain_interval=settings.fetch_per_domain_interval,
             timeout_seconds=settings.fetch_timeout_seconds,

@@ -44,10 +44,12 @@ from connect.api.routers import (
     position_shifts,
     posts,
     search,
+    social,
     sources,
     spend,
     threads,
     watches,
+    workspaces,
 )
 from connect.api.security import OriginCheckMiddleware
 from connect.orchestration.config import Settings
@@ -65,6 +67,8 @@ _AUTHED_ROUTERS = (
     feed.router,
     watches.router,
     posts.router,
+    social.router,
+    workspaces.router,
     entities.router,
     enrichment.router,
     spend.router,
@@ -118,9 +122,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # (api/limits.py; SSE exempt, in-memory windows).
     app.state.rate_limiter = RateLimiter(settings)
 
-    # open: compose healthchecks + the login machinery itself
+    # open: compose healthchecks + the login machinery itself + the public
+    # social-card image (Instagram's servers fetch it unauthenticated)
     app.include_router(health.router, prefix="/api")
     app.include_router(auth.router, prefix="/api")
+    app.include_router(social.public_router, prefix="/api")
     for router in _AUTHED_ROUTERS:
         app.include_router(router, prefix="/api",
                            dependencies=[Depends(get_current_user),

@@ -74,6 +74,10 @@ export const queryKeys = {
   workspaceFeed: (id: number, page: number) =>
     ["workspaces", "feed", id, page] as const,
   workspaceChats: (id: number) => ["workspaces", "chats", id] as const,
+  stories: ["stories"] as const,
+  storyList: (params: { limit?: number; offset?: number }) =>
+    ["stories", "list", params] as const,
+  story: (id: number) => ["stories", "detail", id] as const,
   workspacePostSettings: (id: number) =>
     ["workspaces", "post-settings", id] as const,
   workspaceDrafts: (id: number) => ["workspaces", "drafts", id] as const,
@@ -311,6 +315,14 @@ export function useFeed(params: FeedParams) {
     queryKey: queryKeys.feed(params),
     queryFn: () => api.getFeed(params),
     placeholderData: keepPreviousData,
+  });
+}
+
+/** Distinct filter values (news types / topics / sources) for the feed. */
+export function useFeedFacets() {
+  return useQuery({
+    queryKey: ["feed", "facets"],
+    queryFn: () => api.getFeedFacets(),
   });
 }
 
@@ -622,6 +634,19 @@ export function usePromoteDocument() {
   });
 }
 
+/** Enrich one document (T1) — the per-document counterpart of the feed sweep. */
+export function useEnrichDocument() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.enrichDocument(id),
+    onSuccess: (_job, id) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.document(id) });
+      void queryClient.invalidateQueries({ queryKey: ["feed"] });
+      void queryClient.invalidateQueries({ queryKey: ["spend"] });
+    },
+  });
+}
+
 // --------------------------------------------------------------------------
 // Watches
 // --------------------------------------------------------------------------
@@ -784,6 +809,15 @@ export function useDeleteWorkspace() {
   });
 }
 
+/** Topic-driven source discovery for a workspace's focus. */
+export function useWorkspaceSourceSuggestions(id: number) {
+  return useQuery({
+    queryKey: ["workspaces", "source-suggestions", id],
+    queryFn: () => api.getWorkspaceSourceSuggestions(id),
+    enabled: Number.isFinite(id),
+  });
+}
+
 /** The effective post-generation settings for a workspace (global + overrides). */
 export function useWorkspacePostSettings(id: number) {
   return useQuery({
@@ -888,6 +922,139 @@ export function useDeleteWorkspaceChat(id: number) {
         queryKey: queryKeys.workspaceChats(id),
       }),
   });
+}
+
+export interface DeepRunState {
+  status: "idle" | "running" | "done" | "error";
+  chatId: number | null;
+  prompt: string;
+  lines: string[];
+  answer: api.ChatTurn | null;
+  error: string | null;
+}
+
+const DEEP_RUN_IDLE: DeepRunState = {
+  status: "idle",
+  chatId: null,
+  prompt: "",
+  lines: [],
+  answer: null,
+  error: null,
+};
+
+/**
+ * Drive one "deep" workspace-agent run: start it (a background job), stream its
+ * progress over job_event SSE (the shared analyses/investigations contract),
+ * and surface the assistant answer the run appends to the chat transcript. The
+ * job's terminal event ends the stream; a transport drop falls back to one chat
+ * refetch (the answer may already be persisted).
+ */
+export function useWorkspaceDeepRun(id: number) {
+  const queryClient = useQueryClient();
+  const [state, setState] = useState<DeepRunState>(DEEP_RUN_IDLE);
+  const sourceRef = useRef<EventSource | null>(null);
+
+  const closeStream = () => {
+    sourceRef.current?.close();
+    sourceRef.current = null;
+  };
+
+  const onTerminal = async (chatId: number) => {
+    void queryClient.invalidateQueries({
+      queryKey: queryKeys.workspaceChats(id),
+    });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.workspaceDrafts(id) });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.posts });
+    try {
+      const detail = await api.getWorkspaceChat(id, chatId);
+      const last = detail.transcript[detail.transcript.length - 1] ?? null;
+      const answer = last && last.role === "assistant" ? last : null;
+      setState((s) =>
+        s.chatId === chatId ? { ...s, status: "done", answer } : s,
+      );
+    } catch {
+      setState((s) =>
+        s.chatId === chatId ? { ...s, status: "done" } : s,
+      );
+    }
+  };
+
+  const open = (chatId: number) => {
+    const es = new EventSource(api.workspaceChatEventsUrl(id, chatId, 0));
+    sourceRef.current = es;
+    es.addEventListener("iteration", (raw) => {
+      try {
+        const d = JSON.parse((raw as MessageEvent<string>).data) as {
+          tools?: string[];
+        };
+        const label =
+          d.tools && d.tools.length > 0 ? d.tools.join(", ") : "thinking…";
+        setState((s) => ({ ...s, lines: [...s.lines, label] }));
+      } catch {
+        /* ignore malformed frame */
+      }
+    });
+    es.addEventListener("done", () => {
+      closeStream();
+      void onTerminal(chatId);
+    });
+    es.addEventListener("error", (raw) => {
+      if (isServerEvent(raw)) {
+        let message = "the assistant could not respond";
+        try {
+          message =
+            (JSON.parse(raw.data) as { message?: string }).message ?? message;
+        } catch {
+          /* keep default */
+        }
+        closeStream();
+        setState((s) => ({ ...s, status: "error", error: message }));
+        return;
+      }
+      // transport drop: the answer may already be persisted — fall back to a
+      // single chat refetch rather than reconnecting.
+      closeStream();
+      void onTerminal(chatId);
+    });
+  };
+
+  const start = async (rawPrompt: string) => {
+    const prompt = rawPrompt.trim();
+    if (!prompt || state.status === "running") return;
+    closeStream();
+    setState({
+      status: "running",
+      chatId: null,
+      prompt,
+      lines: [],
+      answer: null,
+      error: null,
+    });
+    try {
+      const { chat_id } = await api.startAsyncWorkspaceChat(id, prompt);
+      setState((s) => ({ ...s, chatId: chat_id }));
+      open(chat_id);
+    } catch (e) {
+      setState((s) => ({
+        ...s,
+        status: "error",
+        error: e instanceof Error ? e.message : "could not start the run",
+      }));
+    }
+  };
+
+  const cancel = () => {
+    if (state.chatId != null) void api.cancelAsyncWorkspaceChat(id, state.chatId);
+  };
+
+  const reset = () => {
+    closeStream();
+    setState(DEEP_RUN_IDLE);
+  };
+
+  useEffect(() => () => closeStream(), []);
+
+  return { state, start, cancel, reset };
 }
 
 // --------------------------------------------------------------------------
@@ -1252,6 +1419,115 @@ export function useDismissContradiction() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.contradictions });
     },
   });
+}
+
+// --------------------------------------------------------------------------
+// Stories (grounded narrative mode, v15)
+// --------------------------------------------------------------------------
+
+export function useStories(params: { limit?: number; offset?: number } = {}) {
+  return useQuery({
+    queryKey: queryKeys.storyList(params),
+    queryFn: () => api.listStories(params),
+  });
+}
+
+export function useCreateStory() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: api.StoryCreateInput) => api.createStory(input),
+    onSuccess: () =>
+      void queryClient.invalidateQueries({ queryKey: queryKeys.stories }),
+  });
+}
+
+export function useCancelStory(id: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.cancelStory(id),
+    onSuccess: () =>
+      void queryClient.invalidateQueries({ queryKey: queryKeys.story(id) }),
+  });
+}
+
+export function useEditStory(id: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: { title?: string; narrative_md?: string }) =>
+      api.editStory(id, payload),
+    onSuccess: (detail) => {
+      queryClient.setQueryData(queryKeys.story(id), detail);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.stories });
+    },
+  });
+}
+
+/**
+ * Story detail + live progress. A story emits only stage completions then a
+ * terminal event (it's one structured synthesis call, not a tool loop), so the
+ * stream just collects activity lines and refetches the snapshot on terminal.
+ */
+export function useStory(id: number) {
+  const queryClient = useQueryClient();
+  const query = useQuery({
+    queryKey: queryKeys.story(id),
+    queryFn: () => api.getStory(id),
+    enabled: Number.isFinite(id),
+  });
+  const status = query.data?.status;
+  const isLive = status === "pending" || status === "running";
+  const [activity, setActivity] = useState<{ id: number; lines: string[] }>({
+    id,
+    lines: [],
+  });
+  const lines = activity.id === id ? activity.lines : [];
+
+  useEffect(() => {
+    if (!isLive || !Number.isFinite(id)) return;
+    let disposed = false;
+    let source: EventSource | null = null;
+    const refetch = () =>
+      queryClient.invalidateQueries({ queryKey: queryKeys.story(id) });
+
+    const es = new EventSource(api.storyEventsUrl(id, 0));
+    source = es;
+    es.addEventListener("section_completed", (raw) => {
+      try {
+        const d = JSON.parse((raw as MessageEvent<string>).data) as {
+          summary?: string;
+          section?: string;
+        };
+        const line = d.summary || d.section || "working…";
+        setActivity((prev) => ({
+          id,
+          lines: prev.id === id ? [...prev.lines, line] : [line],
+        }));
+      } catch {
+        /* ignore malformed frame */
+      }
+    });
+    const finish = () => {
+      source?.close();
+      source = null;
+      void refetch();
+    };
+    es.addEventListener("done", finish);
+    es.addEventListener("error", (raw) => {
+      if (isServerEvent(raw)) {
+        finish();
+        return;
+      }
+      es.close();
+      if (source === es) source = null;
+      if (!disposed) void refetch();
+    });
+    return () => {
+      disposed = true;
+      source?.close();
+    };
+  }, [id, isLive, queryClient]);
+
+  return { query, activity: lines, isLive };
 }
 
 // --------------------------------------------------------------------------

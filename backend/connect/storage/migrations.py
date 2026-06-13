@@ -189,6 +189,62 @@ async def pg_migrate_10_to_11(conn: "psycopg.AsyncConnection") -> None:
         " WHERE workspace_id IS NOT NULL")
 
 
+async def pg_migrate_11_to_12(conn: "psycopg.AsyncConnection") -> None:
+    """v12 — long-running workspace-agent tasks: the new ``workspace_task``
+    table + the ``workspace_task`` job kind (extend the ck_job_kind CHECK)."""
+    for ddl in (schema._PG_DDL_WORKSPACE_TASK,
+                *schema._PG_DDL_WORKSPACE_TASK_INDEXES):
+        await conn.execute(ddl)
+    await conn.execute("ALTER TABLE job DROP CONSTRAINT ck_job_kind")
+    await conn.execute(
+        "ALTER TABLE job ADD CONSTRAINT ck_job_kind"
+        f" CHECK (kind IN {schema.E.sql_in(schema.E.JOB_KINDS)})")
+
+
+async def pg_migrate_12_to_13(conn: "psycopg.AsyncConnection") -> None:
+    """v13 — grounding gate for agent-authored findings: the ``post`` table
+    gains a verbatim-verified quote (quote + char offsets into the cited
+    document), NULL for human posts."""
+    await conn.execute(
+        "ALTER TABLE post ADD COLUMN IF NOT EXISTS quote text")
+    await conn.execute(
+        "ALTER TABLE post ADD COLUMN IF NOT EXISTS quote_start integer")
+    await conn.execute(
+        "ALTER TABLE post ADD COLUMN IF NOT EXISTS quote_end integer")
+
+
+async def pg_migrate_13_to_14(conn: "psycopg.AsyncConnection") -> None:
+    """v14 — retire the ``workspace_task`` table: deep workspace-agent runs are
+    now async chat jobs that stream job_event and append to the chat
+    transcript, so the bespoke task row (and its stuck-status failure modes)
+    is gone. The ``workspace_task`` job kind is KEPT — it is the deep-run job.
+    """
+    await conn.execute("DROP TABLE IF EXISTS workspace_task")
+
+
+async def pg_migrate_14_to_15(conn: "psycopg.AsyncConnection") -> None:
+    """v15 — story mode: extend the dossier kind + input_type and job kind
+    CHECK constraints for the new 'story' dossier/job and its
+    'investigation'/'workspace' sources. Reuses the existing 'scope' and
+    'synthesize' section stages, so no dossier_section change."""
+    await conn.execute(
+        "ALTER TABLE dossier DROP CONSTRAINT IF EXISTS ck_dossier_kind")
+    await conn.execute(
+        "ALTER TABLE dossier ADD CONSTRAINT ck_dossier_kind"
+        f" CHECK (kind IN {schema.E.sql_in(schema.E.DOSSIER_KINDS)})")
+    await conn.execute(
+        "ALTER TABLE dossier DROP CONSTRAINT IF EXISTS ck_dossier_input_type")
+    await conn.execute(
+        "ALTER TABLE dossier ADD CONSTRAINT ck_dossier_input_type"
+        " CHECK (input_type IN"
+        f" {schema.E.sql_in(schema.E.DOSSIER_INPUT_TYPES)})")
+    await conn.execute(
+        "ALTER TABLE job DROP CONSTRAINT IF EXISTS ck_job_kind")
+    await conn.execute(
+        "ALTER TABLE job ADD CONSTRAINT ck_job_kind"
+        f" CHECK (kind IN {schema.E.sql_in(schema.E.JOB_KINDS)})")
+
+
 # Registry: version N -> async function taking N's schema to N+1's.
 # Forward-only.
 PG_MIGRATIONS: dict[
@@ -203,6 +259,10 @@ PG_MIGRATIONS: dict[
     8: pg_migrate_8_to_9,
     9: pg_migrate_9_to_10,
     10: pg_migrate_10_to_11,
+    11: pg_migrate_11_to_12,
+    12: pg_migrate_12_to_13,
+    13: pg_migrate_13_to_14,
+    14: pg_migrate_14_to_15,
 }
 
 

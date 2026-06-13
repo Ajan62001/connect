@@ -14,6 +14,28 @@ import psycopg
 from connect.storage.pg import Jsonb, utc_now
 
 
+def turn_dict(role: str, text: str, *, tools_used: list[str] | None = None,
+              finding: Any = None) -> dict[str, Any]:
+    """One human-readable transcript turn (ChatTurn shape), shared by the
+    synchronous chat endpoint and the async deep-run worker handler."""
+    return {"role": role, "text": text,
+            "tools_used": tools_used or [],
+            "finding_id": finding.id if finding else None,
+            "finding_title": finding.title if finding else None}
+
+
+async def latest_job_id(conn: psycopg.AsyncConnection,
+                        chat_id: int) -> int | None:
+    """The most recent async deep-run job for a chat (job payload carries the
+    chat_id) — the handle the SSE/cancel endpoints resolve to."""
+    cur = await conn.execute(
+        "SELECT id FROM job WHERE kind = 'workspace_task'"
+        " AND (payload->>'chat_id')::bigint = %s ORDER BY id DESC LIMIT 1",
+        (chat_id,))
+    row = await cur.fetchone()
+    return int(row["id"]) if row else None
+
+
 async def create(conn: psycopg.AsyncConnection, *, workspace_id: int,
                  owner_id: int, title: str, messages: list[Any],
                  transcript: list[Any]) -> int:

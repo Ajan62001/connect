@@ -20,11 +20,18 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { DocumentListItem, EnrichmentStatus } from "@/lib/api";
 import { absoluteTime, formatUsd, mediaTypeLabel, relativeTime, urlHost } from "@/lib/format";
-import { useEnrichmentSweep, useFeed, useSpend } from "@/lib/queries";
+import { useEnrichmentSweep, useFeed, useFeedFacets, useSpend } from "@/lib/queries";
 
 const PAGE_SIZE = 25;
 const SWEEP_LIMIT = 25;
@@ -122,7 +129,16 @@ const STATUS_TABS: { value: EnrichmentStatus | "all"; label: string }[] = [
   { value: "skipped_aged", label: "Aged out" },
 ];
 
+function humanizeNewsType(type: string): string {
+  const t = type.replace(/_/g, " ").trim();
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+const MAX_TOPIC_TAGS = 4;
+
 function FeedRow({ item }: { item: DocumentListItem }) {
+  const topics = item.topics ?? [];
+  const hasTags = Boolean(item.news_type) || topics.length > 0;
   return (
     <Link
       href={`/documents/${item.id}`}
@@ -136,11 +152,35 @@ function FeedRow({ item }: { item: DocumentListItem }) {
           <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
             {item.source_name ? <span>{item.source_name}</span> : null}
             {item.url ? <span>{urlHost(item.url)}</span> : null}
+            {item.published_at ? (
+              <span title={absoluteTime(item.published_at)}>
+                published {item.published_at.slice(0, 10)}
+              </span>
+            ) : null}
             <span title={absoluteTime(item.fetched_at)}>
-              {relativeTime(item.fetched_at)}
+              fetched {relativeTime(item.fetched_at)}
             </span>
             {item.media_type ? <span>{mediaTypeLabel(item.media_type)}</span> : null}
           </p>
+          {hasTags ? (
+            <div className="flex flex-wrap items-center gap-1 pt-0.5">
+              {item.news_type ? (
+                <Badge variant="secondary">
+                  {humanizeNewsType(item.news_type)}
+                </Badge>
+              ) : null}
+              {topics.slice(0, MAX_TOPIC_TAGS).map((topic) => (
+                <Badge key={topic} variant="outline">
+                  {topic}
+                </Badge>
+              ))}
+              {topics.length > MAX_TOPIC_TAGS ? (
+                <span className="text-xs text-muted-foreground">
+                  +{topics.length - MAX_TOPIC_TAGS}
+                </span>
+              ) : null}
+            </div>
+          ) : null}
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
           {item.watch_hit ? <WatchHitChip /> : null}
@@ -172,15 +212,31 @@ function FeedSkeleton() {
   );
 }
 
+const ALL = "all";
+
 export default function FeedPage() {
   const [status, setStatus] = useState<EnrichmentStatus | "all">("all");
+  const [newsType, setNewsType] = useState<string>(ALL);
+  const [topic, setTopic] = useState<string>(ALL);
+  const [sourceId, setSourceId] = useState<string>(ALL);
   const [page, setPage] = useState(1);
 
+  const facets = useFeedFacets();
   const feed = useFeed({
     ...(status === "all" ? {} : { status }),
+    ...(newsType === ALL ? {} : { news_type: newsType }),
+    ...(topic === ALL ? {} : { topic }),
+    ...(sourceId === ALL ? {} : { source_id: Number(sourceId) }),
     page,
     page_size: PAGE_SIZE,
   });
+
+  const onFilter = (setter: (v: string) => void) => (value: string | null) => {
+    setter(value ?? ALL);
+    setPage(1);
+  };
+  const hasFilters =
+    newsType !== ALL || topic !== ALL || sourceId !== ALL || status !== "all";
 
   return (
     <>
@@ -205,6 +261,66 @@ export default function FeedPage() {
           ))}
         </TabsList>
       </Tabs>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <Select value={newsType} onValueChange={onFilter(setNewsType)}>
+          <SelectTrigger className="h-8 w-auto min-w-40 text-xs">
+            <SelectValue placeholder="News type" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL}>All news types</SelectItem>
+            {(facets.data?.news_types ?? []).map((t) => (
+              <SelectItem key={t} value={t}>
+                {humanizeNewsType(t)}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+
+        <Select value={topic} onValueChange={onFilter(setTopic)}>
+          <SelectTrigger className="h-8 w-auto min-w-40 text-xs">
+            <SelectValue placeholder="Topic" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL}>All topics</SelectItem>
+            {(facets.data?.topics ?? []).map((t) => (
+              <SelectItem key={t} value={t}>
+                {t}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+
+        <Select value={sourceId} onValueChange={onFilter(setSourceId)}>
+          <SelectTrigger className="h-8 w-auto min-w-40 text-xs">
+            <SelectValue placeholder="Source" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL}>All sources</SelectItem>
+            {(facets.data?.sources ?? []).map((s) => (
+              <SelectItem key={s.id} value={String(s.id)}>
+                {s.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+
+        {hasFilters ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setStatus("all");
+              setNewsType(ALL);
+              setTopic(ALL);
+              setSourceId(ALL);
+              setPage(1);
+            }}
+          >
+            Clear filters
+          </Button>
+        ) : null}
+      </div>
 
       {feed.isPending ? (
         <FeedSkeleton />

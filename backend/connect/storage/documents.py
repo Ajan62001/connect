@@ -18,13 +18,20 @@ from connect.domain.models import Document, DocumentListItem
 _LIST_COLS = """
 d.id, d.source_id, s.name AS source_name, d.url, d.title, d.published_at,
 d.fetched_at, d.media_type, d.enrichment_status, d.enrichment_tier,
-d.watch_hit, d.canonical_document_id, d.owner_id, d.visibility, d.origin
+d.watch_hit, d.canonical_document_id, d.owner_id, d.visibility, d.origin,
+(SELECT de.event_type FROM document_enrichment de
+ WHERE de.document_id = d.id) AS news_type,
+(SELECT array_agg(dt.topic ORDER BY dt.topic) FROM document_topic dt
+ WHERE dt.document_id = d.id) AS topics
 """
 
 _FULL_COLS = _LIST_COLS + """,
 d.author, d.language, d.content_text, d.content_hash
 """
 
+# news_type + topics are correlated subqueries on d.id (NOT joins), so
+# _LIST_COLS stays self-contained — it drops into every caller's own
+# `FROM document d …`. Both are NULL/empty until the document is enriched.
 _FROM = " FROM document d LEFT JOIN source s ON s.id = d.source_id "
 
 # the tenancy read predicate (one %s: the viewer's user id)
@@ -50,6 +57,8 @@ def _to_list_item(row: Mapping[str, Any],
         owner_id=row["owner_id"],
         visibility=row["visibility"],
         origin=row["origin"],
+        news_type=row.get("news_type"),
+        topics=list(row.get("topics") or []),
     )
 
 
@@ -230,9 +239,12 @@ async def list_in_workspace(conn: psycopg.AsyncConnection, workspace_id: int,
 async def list_page(conn: psycopg.AsyncConnection, *, page: int,
                     page_size: int, source_id: int | None = None,
                     enrichment_status: str | None = None,
+                    news_type: str | None = None,
+                    topic: str | None = None,
                     viewer: int | None = None,
                     ) -> tuple[list[DocumentListItem], int]:
-    """Newest-first listing (the /feed and unfiltered /documents view)."""
+    """Newest-first listing (the /feed and unfiltered /documents view),
+    filterable by source, enrichment status, news type, and topic."""
     where, params = [], []
     if source_id is not None:
         where.append("d.source_id = %s")
@@ -240,6 +252,14 @@ async def list_page(conn: psycopg.AsyncConnection, *, page: int,
     if enrichment_status is not None:
         where.append("d.enrichment_status = %s")
         params.append(enrichment_status)
+    if news_type is not None:
+        where.append("EXISTS (SELECT 1 FROM document_enrichment de"
+                     " WHERE de.document_id = d.id AND de.event_type = %s)")
+        params.append(news_type)
+    if topic is not None:
+        where.append("EXISTS (SELECT 1 FROM document_topic dt"
+                     " WHERE dt.document_id = d.id AND dt.topic = %s)")
+        params.append(topic)
     if viewer is not None:
         where.append(VISIBLE_SQL)
         params.append(viewer)
@@ -253,3 +273,27 @@ async def list_page(conn: psycopg.AsyncConnection, *, page: int,
         (*params, page_size, (page - 1) * page_size))
     rows = await cur.fetchall()
     return [_to_list_item(r) for r in rows], int(total)
+
+
+async def feed_facets(conn: psycopg.AsyncConnection, *,
+                      viewer: int) -> dict[str, Any]:
+    """The distinct filter values present in the viewer-visible corpus:
+    news types, top topics (by document count), and sources."""
+    cur = await conn.execute(
+        "SELECT DISTINCT de.event_type AS v FROM document_enrichment de"
+        " JOIN document d ON d.id = de.document_id"
+        f" WHERE {VISIBLE_SQL} ORDER BY de.event_type", (viewer,))
+    news_types = [r["v"] for r in await cur.fetchall()]
+    cur = await conn.execute(
+        "SELECT dt.topic AS v, count(*) AS n FROM document_topic dt"
+        " JOIN document d ON d.id = dt.document_id"
+        f" WHERE {VISIBLE_SQL} GROUP BY dt.topic"
+        " ORDER BY n DESC, dt.topic LIMIT 60", (viewer,))
+    topics = [r["v"] for r in await cur.fetchall()]
+    cur = await conn.execute(
+        "SELECT DISTINCT s.id, s.name FROM document d"
+        " JOIN source s ON s.id = d.source_id"
+        f" WHERE {VISIBLE_SQL} ORDER BY s.name", (viewer,))
+    sources = [{"id": r["id"], "name": r["name"]}
+               for r in await cur.fetchall()]
+    return {"news_types": news_types, "topics": topics, "sources": sources}

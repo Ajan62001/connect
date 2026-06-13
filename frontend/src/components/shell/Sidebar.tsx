@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
+  BookOpenIcon,
   DatabaseIcon,
   EyeIcon,
   FlaskConicalIcon,
@@ -29,6 +30,7 @@ const NAV_ITEMS = [
   { href: "/search", label: "Search", icon: SearchIcon },
   { href: "/analyze", label: "Analyze", icon: FlaskConicalIcon },
   { href: "/investigations", label: "Investigations", icon: TelescopeIcon },
+  { href: "/stories", label: "Stories", icon: BookOpenIcon },
   { href: "/findings", label: "Findings", icon: NotebookPenIcon },
   { href: "/community", label: "Community", icon: UsersIcon },
   { href: "/contradictions", label: "Contradictions", icon: ScaleIcon },
@@ -71,6 +73,7 @@ export function Sidebar() {
             (href === "/analyze" && pathname.startsWith("/analysis")) ||
             (href === "/investigations" &&
               pathname.startsWith("/investigation")) ||
+            (href === "/stories" && pathname.startsWith("/story/")) ||
             (href === "/today" &&
               (pathname.startsWith("/brief") ||
                 pathname.startsWith("/thread") ||

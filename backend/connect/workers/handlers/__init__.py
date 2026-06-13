@@ -11,4 +11,6 @@ from connect.workers.handlers import (  # noqa: F401 — registration imports
     enrichment,
     investigation,
     poll,
+    story,
+    workspace_task,
 )

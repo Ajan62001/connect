@@ -240,3 +240,53 @@ async def test_promote_endpoint_runs_t1_then_t2(env, db):
     assert job2["status"] == "done"
     assert await qv(conn, "SELECT COUNT(*) FROM event_assignment WHERE"
                           " document_id=%s", doc.id) == 1
+
+
+async def test_enrich_endpoint_runs_t1(env, db):
+    client, container = env
+    conn = db
+    container.enrichment.provider = MockProvider(respond=t1_response)
+    doc = (await container.pipeline.ingest_text(
+        db, "The GST Council cut rates on insurance premiums.")).document
+    assert client.post("/api/documents/9999/enrich").status_code == 404
+
+    res = client.post(f"/api/documents/{doc.id}/enrich")
+    assert res.status_code == 202
+    job_id = res.json()["job_id"]
+    job = await wait_for_job(conn, job_id)
+    assert job["status"] == "done", job["error"]
+    assert await qv(conn, "SELECT kind FROM job WHERE id=%s",
+                    job_id) == "enrich_t1_sync"
+
+    # T1 landed: the enrichment row carries the news type, status flipped.
+    assert await qv(conn, "SELECT enrichment_status FROM document WHERE id=%s",
+                    doc.id) == "done"
+    assert await qv(conn, "SELECT event_type FROM document_enrichment"
+                          " WHERE document_id=%s",
+                    doc.id) == "gst_council_decision"
+    # the document detail (shared _LIST_COLS) now surfaces the news type.
+    detail = client.get(f"/api/documents/{doc.id}").json()
+    assert detail["news_type"] == "gst_council_decision"
+
+
+async def test_feed_facets_and_filters(env, db):
+    client, container = env
+    conn = db
+    container.enrichment.provider = MockProvider(respond=t1_response)
+    doc = (await container.pipeline.ingest_text(
+        db, "The GST Council cut rates on insurance premiums.")).document
+    job = await wait_for_job(
+        conn, client.post(f"/api/documents/{doc.id}/enrich").json()["job_id"])
+    assert job["status"] == "done"
+
+    # facets expose the new news type as a filter option
+    facets = client.get("/api/feed/facets").json()
+    assert "gst_council_decision" in facets["news_types"]
+
+    # filtering the feed by that news type returns the doc…
+    hit = client.get("/api/feed",
+                     params={"news_type": "gst_council_decision"}).json()
+    assert doc.id in [i["id"] for i in hit["items"]]
+    # …and an unmatched news type returns nothing.
+    miss = client.get("/api/feed", params={"news_type": "no_such_type"}).json()
+    assert miss["items"] == []

@@ -15,21 +15,27 @@ from fastapi.responses import JSONResponse
 
 import psycopg
 
+from sse_starlette.sse import EventSourceResponse
+
 from connect.agents.workspace_agent import run_workspace_agent
 from connect.api.deps import get_container, get_current_user, get_db
+from connect.api.sse import job_event_stream
 from connect.domain.models import (
     ChatTurn,
     CurrentUser,
     Document,
     DocumentPage,
+    JobAccepted,
     PostSettings,
     SocialDraft,
     Workspace,
+    WorkspaceChatAsyncAccepted,
     WorkspaceChatDetail,
     WorkspaceChatRequest,
     WorkspaceChatResponse,
     WorkspaceChatSummary,
     WorkspaceCreate,
+    WorkspaceSourceSuggestions,
     WorkspaceUpdate,
 )
 from connect.ingestion.extract_html import ExtractionError
@@ -75,6 +81,22 @@ async def get_workspace(workspace_id: int,
     if ws is None:
         raise HTTPException(status_code=404, detail="workspace not found")
     return ws
+
+
+@router.get("/{workspace_id}/source-suggestions",
+            response_model=WorkspaceSourceSuggestions)
+async def workspace_source_suggestions(
+        workspace_id: int,
+        db: psycopg.AsyncConnection = Depends(get_db),
+        user: CurrentUser = Depends(get_current_user)):
+    """Sources for managing the workspace focus: those already in focus plus
+    topic-matched candidates (sources that publish on the workspace's
+    topics)."""
+    ws = await workspace_dao.get(db, workspace_id, viewer=user.id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    data = await workspace_dao.source_suggestions(db, ws, viewer=user.id)
+    return WorkspaceSourceSuggestions(**data)
 
 
 @router.patch("/{workspace_id}", response_model=Workspace)
@@ -206,14 +228,6 @@ async def add_workspace_document(workspace_id: int, request: Request,
         content=result.document.model_dump())
 
 
-def _turn_dict(role: str, text: str, *, tools_used: list[str] | None = None,
-               finding=None) -> dict:
-    return {"role": role, "text": text,
-            "tools_used": tools_used or [],
-            "finding_id": finding.id if finding else None,
-            "finding_title": finding.title if finding else None}
-
-
 @router.post("/{workspace_id}/chat", response_model=WorkspaceChatResponse)
 async def workspace_chat(workspace_id: int, body: WorkspaceChatRequest,
                          container: Container = Depends(get_container),
@@ -243,7 +257,7 @@ async def workspace_chat(workspace_id: int, body: WorkspaceChatRequest,
         wire, transcript = [], []
 
     wire.append({"role": "user", "content": message})
-    transcript.append(_turn_dict("user", message))
+    transcript.append(chat_dao.turn_dict("user", message))
 
     try:
         result = await run_workspace_agent(
@@ -251,16 +265,17 @@ async def workspace_chat(workspace_id: int, body: WorkspaceChatRequest,
             embedder=container.embedder, vectors=container.vectors,
             workspace=ws, viewer=user.id, messages=wire,
             card_store=container.card_store,
-            post_settings=await post_settings.effective(db, ws))
+            post_settings=await post_settings.effective(db, ws),
+            mode="quick")
     except BudgetExceeded as e:
         raise HTTPException(status_code=429, detail=str(e)) from e
     except LLMError as e:
         raise HTTPException(status_code=502,
                             detail=f"the assistant could not respond: {e}") from e
 
-    transcript.append(_turn_dict("assistant", result.final_answer,
-                                 tools_used=result.tools_used,
-                                 finding=result.finding))
+    transcript.append(chat_dao.turn_dict("assistant", result.final_answer,
+                                          tools_used=result.tools_used,
+                                          finding=result.finding))
     if body.chat_id is not None:
         await chat_dao.update(db, body.chat_id, owner_id=user.id,
                               messages=result.messages, transcript=transcript)
@@ -313,6 +328,115 @@ async def delete_chat(workspace_id: int, chat_id: int,
     if not await chat_dao.delete(db, chat_id, owner_id=user.id):
         raise HTTPException(status_code=404, detail="chat not found")
     return Response(status_code=204)
+
+
+@router.post("/{workspace_id}/chat/async",
+             response_model=WorkspaceChatAsyncAccepted, status_code=202)
+async def start_async_chat(workspace_id: int, body: WorkspaceChatRequest,
+                           container: Container = Depends(get_container),
+                           db: psycopg.AsyncConnection = Depends(get_db),
+                           user: CurrentUser = Depends(get_current_user)):
+    """Run a "deep" agent turn asynchronously (a background job with a higher
+    budget + iteration ceiling than the synchronous chat). The user message is
+    recorded immediately; progress streams over `/chats/{chat_id}/events` and
+    the assistant answer lands in the chat transcript on completion."""
+    ws = await workspace_dao.get(db, workspace_id, viewer=user.id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    if container.llm is None:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not set")
+    if container.jobs is None:
+        raise HTTPException(status_code=503,
+                            detail="background jobs are unavailable")
+    message = body.message.strip()
+    if not message:
+        raise HTTPException(status_code=422, detail="message is empty")
+
+    if body.chat_id is not None:
+        chat = await chat_dao.get(db, body.chat_id, workspace_id=workspace_id,
+                                  owner_id=user.id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="chat not found")
+        wire = list(chat["messages"] or [])
+        transcript = list(chat["transcript"] or [])
+    else:
+        wire, transcript = [], []
+    wire.append({"role": "user", "content": message})
+    transcript.append(chat_dao.turn_dict("user", message))
+
+    if body.chat_id is not None:
+        await chat_dao.update(db, body.chat_id, owner_id=user.id,
+                              messages=wire, transcript=transcript)
+        chat_id = body.chat_id
+    else:
+        chat_id = await chat_dao.create(
+            db, workspace_id=workspace_id, owner_id=user.id,
+            title=message[:80], messages=wire, transcript=transcript)
+
+    job_id = await container.jobs.enqueue(
+        "workspace_task",
+        {"chat_id": chat_id, "workspace_id": workspace_id,
+         "owner_id": user.id},
+        owner_id=user.id)
+    return WorkspaceChatAsyncAccepted(chat_id=chat_id, job_id=job_id)
+
+
+def _ws_chat_translate(type_: str, data: dict) -> tuple[str, dict] | None:
+    """job_event rows -> SSE contract shapes for an async deep run (mirrors the
+    investigation translate: generic queue rows mapped, 'iteration' rows pass
+    through, terminal rows close the stream)."""
+    if type_ == "started":
+        return None
+    if type_ == "cancelled":
+        return "error", {"message": "run cancelled"}
+    if type_ == "error":
+        return "error", {"message": (data.get("message") or data.get("error")
+                                     or "the assistant could not respond")}
+    if type_ == "done":
+        return "done", {}
+    return type_, data
+
+
+@router.get("/{workspace_id}/chats/{chat_id}/events")
+async def async_chat_events(workspace_id: int, chat_id: int, request: Request,
+                            after: int = Query(default=0, ge=0),
+                            container: Container = Depends(get_container),
+                            db: psycopg.AsyncConnection = Depends(get_db),
+                            user: CurrentUser = Depends(get_current_user)):
+    """SSE progress stream for a deep run (job_event replay by seq, ?after= /
+    Last-Event-ID resume) — the same contract as investigations/analyses."""
+    chat = await chat_dao.get(db, chat_id, workspace_id=workspace_id,
+                              owner_id=user.id)
+    if chat is None:
+        raise HTTPException(status_code=404, detail="chat not found")
+    job_id = await chat_dao.latest_job_id(db, chat_id)
+    if job_id is None:
+        raise HTTPException(status_code=404, detail="chat has no async run")
+    last_event_id = request.headers.get("last-event-id")
+    if last_event_id and last_event_id.isdigit():
+        after = max(after, int(last_event_id))
+    return EventSourceResponse(
+        job_event_stream(request, container, job_id, after,
+                         _ws_chat_translate))
+
+
+@router.post("/{workspace_id}/chats/{chat_id}/cancel",
+             response_model=JobAccepted, status_code=202)
+async def cancel_async_chat(workspace_id: int, chat_id: int,
+                            container: Container = Depends(get_container),
+                            db: psycopg.AsyncConnection = Depends(get_db),
+                            user: CurrentUser = Depends(get_current_user)):
+    chat = await chat_dao.get(db, chat_id, workspace_id=workspace_id,
+                              owner_id=user.id)
+    if chat is None:
+        raise HTTPException(status_code=404, detail="chat not found")
+    if container.jobs is None:
+        raise HTTPException(status_code=503,
+                            detail="background jobs are unavailable")
+    job_id = await chat_dao.latest_job_id(db, chat_id)
+    if job_id is not None:
+        await container.jobs.request_cancel(job_id)  # no-op on terminal runs
+    return JobAccepted(job_id=job_id or 0)
 
 
 @router.get("/{workspace_id}/social-drafts", response_model=list[SocialDraft])

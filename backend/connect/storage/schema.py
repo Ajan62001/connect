@@ -65,7 +65,7 @@ class StorageVersionError(StorageError):
 # PostgreSQL baseline schema (v0.2, the canonical DDL) — fresh lineage, v1.
 # ==============================================================================
 
-PG_SCHEMA_VERSION = 11
+PG_SCHEMA_VERSION = 15
 
 # Extensions first: the compose image is pgvector/pgvector:pg17, so both are
 # present; IF NOT EXISTS keeps re-entry harmless.
@@ -876,6 +876,12 @@ CREATE TABLE IF NOT EXISTS post (
                 CONSTRAINT ck_post_visibility
                 CHECK (visibility IN {E.sql_in(E.VISIBILITIES)}),
     workspace_id bigint REFERENCES workspace(id) ON DELETE SET NULL,
+    -- v13: agent-authored findings carry a verbatim-verified quote from the
+    -- cited document (the same grounding gate as investigation findings);
+    -- NULL for human-authored posts, which are not machine-grounded.
+    quote       text,
+    quote_start integer,
+    quote_end   integer,
     created_at  timestamptz NOT NULL,
     updated_at  timestamptz
 )"""
@@ -955,6 +961,31 @@ CREATE TABLE IF NOT EXISTS social_draft (
 _PG_DDL_SOCIAL_DRAFT_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_social_draft_workspace"
     " ON social_draft(workspace_id, created_at DESC)",
+)
+
+# Long-running workspace-agent tasks (v12): the async "run a task" mode. The
+# job runs the agent loop with higher budget/iteration caps and records its
+# progress steps; the UI polls this row for status + result.
+_PG_DDL_WORKSPACE_TASK = """
+CREATE TABLE IF NOT EXISTS workspace_task (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    workspace_id bigint NOT NULL REFERENCES workspace(id) ON DELETE CASCADE,
+    owner_id     bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    prompt       text NOT NULL,
+    status       text NOT NULL DEFAULT 'queued'
+                 CONSTRAINT ck_workspace_task_status
+                 CHECK (status IN ('queued','running','completed',
+                                   'failed','cancelled')),
+    steps        jsonb NOT NULL DEFAULT '[]'::jsonb,
+    result       text,
+    error        text,
+    created_at   timestamptz NOT NULL,
+    finished_at  timestamptz
+)"""
+
+_PG_DDL_WORKSPACE_TASK_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_workspace_task_owner"
+    " ON workspace_task(workspace_id, owner_id, created_at DESC)",
 )
 
 # One brief per (user, day) — the UNIQUE doubles as the ON CONFLICT target
@@ -1149,6 +1180,9 @@ PG_DDL: tuple[str, ...] = (
     *_PG_DDL_WORKSPACE_CHAT_INDEXES,
     _PG_DDL_SOCIAL_DRAFT,
     *_PG_DDL_SOCIAL_DRAFT_INDEXES,
+    # NOTE: workspace_task (v12) was dropped at v14 — deep runs are now async
+    # chat jobs streaming job_event; _PG_DDL_WORKSPACE_TASK is retained only
+    # for the historical v11->v12 migration and is NOT in the fresh baseline.
     _PG_DDL_WATCH,
     *_PG_DDL_WATCH_INDEXES,
     _PG_DDL_WATCH_HIT,

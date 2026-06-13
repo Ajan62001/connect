@@ -13,14 +13,30 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 import psycopg
 
-from connect.api.deps import get_current_user, get_db
-from connect.domain.models import CurrentUser, Post, PostCreate, PostUpdate
+from connect.api.deps import get_container, get_current_user, get_db
+from connect.api.qa import grounded_answer
+from connect.domain.models import (
+    CurrentUser,
+    DocumentAnswer,
+    DocumentAskRequest,
+    Post,
+    PostCreate,
+    PostUpdate,
+)
+from connect.orchestration.container import Container
 from connect.storage import documents as doc_dao
 from connect.storage import posts as post_dao
 
 router = APIRouter(prefix="/posts", tags=["posts"])
 
 MAX_LIMIT = 100
+
+_POST_QA_SYSTEM = (
+    "You answer the user's question about a saved FINDING and its cited source,"
+    " using ONLY the supplied finding text and document — never outside"
+    " knowledge. If they do not answer it, set grounded=false and say so."
+    " When grounded, quote a short verbatim excerpt that supports the answer."
+    " Be concise.")
 
 
 @router.get("", response_model=list[Post])
@@ -81,6 +97,36 @@ async def patch_post(post_id: int, body: PostUpdate,
     if not fields:
         return existing
     return await post_dao.update(db, post_id, fields, owner_id=user.id)
+
+
+@router.post("/{post_id}/ask", response_model=DocumentAnswer)
+async def ask_post(post_id: int, body: DocumentAskRequest,
+                   container: Container = Depends(get_container),
+                   db: psycopg.AsyncConnection = Depends(get_db),
+                   user: CurrentUser = Depends(get_current_user)):
+    """Cross-question a finding: a grounded answer from the finding text and
+    its cited source document."""
+    post = await post_dao.get(db, post_id, viewer=user.id)
+    if post is None:
+        raise HTTPException(status_code=404, detail="post not found")
+    if container.llm is None:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not set")
+    question = body.question.strip()
+    if not question:
+        raise HTTPException(status_code=422, detail="question is empty")
+
+    parts = [f"FINDING: {post.title}", post.body]
+    if post.document_id is not None:
+        doc = await doc_dao.get(db, post.document_id, viewer=user.id)
+        if doc is not None:
+            parts.append(f"\nCITED DOCUMENT ({doc.title or 'untitled'}):\n"
+                         f"{doc.content_text or ''}")
+    elif post.quote:
+        parts.append(f"\nCITED QUOTE: \"{post.quote}\"")
+    return await grounded_answer(
+        container.llm, container.governor, db, system=_POST_QA_SYSTEM,
+        context="\n".join(parts), question=question, user_id=user.id,
+        purpose="post_qa")
 
 
 @router.delete("/{post_id}", status_code=204, response_class=Response)

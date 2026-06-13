@@ -216,6 +216,10 @@ export interface DocumentListItem {
   visibility?: Visibility;
   origin?: DocumentOrigin;
   owner_id?: number | null;
+  /** Enrichment tags (empty/null until enriched): the document's classified
+   *  news type + its topics. */
+  news_type?: string | null;
+  topics?: string[];
 }
 
 export type DocumentLinkStatus =
@@ -1359,8 +1363,21 @@ export interface DocumentListParams {
 
 export interface FeedParams {
   status?: EnrichmentStatus;
+  source_id?: number;
+  news_type?: string;
+  topic?: string;
   page?: number;
   page_size?: number;
+}
+
+export interface FeedFacets {
+  news_types: string[];
+  topics: string[];
+  sources: { id: number; name: string }[];
+}
+
+export function getFeedFacets(): Promise<FeedFacets> {
+  return request<FeedFacets>("/api/feed/facets");
 }
 
 export interface IngestText {
@@ -1839,6 +1856,12 @@ export function promoteDocument(id: number): Promise<JobAccepted> {
   });
 }
 
+export function enrichDocument(id: number): Promise<JobAccepted> {
+  return request<JobAccepted>(`/api/documents/${id}/enrich`, {
+    method: "POST",
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Watches
 // ---------------------------------------------------------------------------
@@ -2015,6 +2038,183 @@ export function listWorkspaceDocuments(
   );
 }
 
+// --- async ("deep") workspace-agent runs ------------------------------------
+// A deep run is a chat turn executed as a background job: progress streams over
+// job_event (the shared SSE contract, same as analyses/investigations) and the
+// answer lands in the chat transcript on completion.
+
+export interface WorkspaceChatAsyncAccepted {
+  chat_id: number;
+  job_id: number;
+}
+
+/** SSE frames on GET /api/workspaces/{id}/chats/{chatId}/events. */
+export type WorkspaceChatEvent =
+  | { type: "iteration"; n: number; tools?: string[] }
+  | { type: "done" }
+  | { type: "error"; message: string };
+
+export const WORKSPACE_CHAT_EVENT_NAMES = ["iteration", "done", "error"] as const;
+
+/** Start a deep run; the user message is recorded immediately. */
+export function startAsyncWorkspaceChat(
+  id: number,
+  message: string,
+  chatId?: number,
+): Promise<WorkspaceChatAsyncAccepted> {
+  return request<WorkspaceChatAsyncAccepted>(
+    `/api/workspaces/${id}/chat/async`,
+    jsonInit("POST", { message, chat_id: chatId }),
+  );
+}
+
+/** EventSource URL for a deep run's progress, resuming after `afterSeq`. */
+export function workspaceChatEventsUrl(
+  id: number,
+  chatId: number,
+  afterSeq: number,
+): string {
+  return `${ANALYSIS_EVENTS_BASE}/api/workspaces/${id}/chats/${chatId}/events${qs(
+    { after: afterSeq },
+  )}`;
+}
+
+export function cancelAsyncWorkspaceChat(
+  id: number,
+  chatId: number,
+): Promise<{ job_id: number }> {
+  return request<{ job_id: number }>(
+    `/api/workspaces/${id}/chats/${chatId}/cancel`,
+    jsonInit("POST", {}),
+  );
+}
+
+// --- story mode (grounded narrative over a fact-set, schema v15) -------------
+
+export type StoryStatus = AnalysisStatus;
+export type StoryInputType = "story" | "investigation" | "workspace" | "topic";
+export type StoryLength = "brief" | "standard" | "feature";
+export type StoryTone = "neutral" | "explanatory";
+
+/** SSE frames on GET /api/stories/{id}/events (one structured synth call, so
+ *  no per-iteration events — just stage completions + terminal). */
+export const STORY_EVENT_NAMES = ["section_completed", "done", "error"] as const;
+
+export interface StorySource {
+  ref: string;
+  document_id: number | null;
+  title: string | null;
+  url: string | null;
+  source_name: string | null;
+  quote: string | null;
+  occurred_on: string | null;
+  finding_id: number | null;
+}
+
+export interface StoryGrounding {
+  menu_size: number;
+  cited_count: number;
+  stripped_markers: string[];
+  regenerated: boolean;
+  edited: boolean;
+}
+
+export interface StoryDetail {
+  id: number;
+  title: string | null;
+  subject: string;
+  input_type: StoryInputType;
+  status: StoryStatus;
+  narrative_md: string | null;
+  sources: StorySource[];
+  grounding: StoryGrounding | null;
+  visibility: Visibility;
+  owner_id: number | null;
+  last_seq: number;
+  error: string | null;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface StoryListItem {
+  id: number;
+  title: string | null;
+  subject: string;
+  input_type: StoryInputType;
+  status: StoryStatus;
+  created_at: string;
+}
+
+export interface StoryPage {
+  items: StoryListItem[];
+  total: number;
+}
+
+export interface StoryAccepted {
+  story_id: number;
+  job_id: number;
+}
+
+export interface StoryCreateInput {
+  story_id?: number;
+  investigation_id?: number;
+  workspace_id?: number;
+  topic?: string;
+  since?: string;
+  until?: string;
+  options?: { length?: StoryLength; tone?: StoryTone; style?: string };
+  visibility?: Visibility;
+}
+
+export function createStory(input: StoryCreateInput): Promise<StoryAccepted> {
+  return request<StoryAccepted>("/api/stories", jsonInit("POST", input));
+}
+
+export function listStories(
+  params: { limit?: number; offset?: number } = {},
+): Promise<StoryPage> {
+  return request<StoryPage>(`/api/stories${qs(params)}`);
+}
+
+export function getStory(id: number): Promise<StoryDetail> {
+  return request<StoryDetail>(`/api/stories/${id}`);
+}
+
+export function storyEventsUrl(id: number, afterSeq: number): string {
+  return `${ANALYSIS_EVENTS_BASE}/api/stories/${id}/events${qs({ after: afterSeq })}`;
+}
+
+export function cancelStory(id: number): Promise<{ job_id: number }> {
+  return request<{ job_id: number }>(
+    `/api/stories/${id}/cancel`,
+    jsonInit("POST", {}),
+  );
+}
+
+/** Hand-edit a story's generated narrative. */
+export function editStory(
+  id: number,
+  payload: { title?: string; narrative_md?: string },
+): Promise<StoryDetail> {
+  return request<StoryDetail>(`/api/stories/${id}`, jsonInit("PATCH", payload));
+}
+
+/** Cross-question a story — grounded answer from its facts. */
+export function askStory(id: number, question: string): Promise<DocumentAnswer> {
+  return request<DocumentAnswer>(
+    `/api/stories/${id}/ask`,
+    jsonInit("POST", { question }),
+  );
+}
+
+/** Cross-question a finding — grounded answer from it + its cited source. */
+export function askPost(id: number, question: string): Promise<DocumentAnswer> {
+  return request<DocumentAnswer>(
+    `/api/posts/${id}/ask`,
+    jsonInit("POST", { question }),
+  );
+}
+
 export function getGlobalPostSettings(): Promise<PostSettings> {
   return request<PostSettings>("/api/social/settings");
 }
@@ -2042,6 +2242,25 @@ export function updateWorkspace(
   payload: WorkspaceUpdate,
 ): Promise<Workspace> {
   return request<Workspace>(`/api/workspaces/${id}`, jsonInit("PATCH", payload));
+}
+
+export interface WorkspaceSourceOption {
+  id: number;
+  name: string;
+  doc_count: number;
+}
+
+export interface WorkspaceSourceSuggestions {
+  current: WorkspaceSourceOption[];
+  suggestions: WorkspaceSourceOption[];
+}
+
+export function getWorkspaceSourceSuggestions(
+  id: number,
+): Promise<WorkspaceSourceSuggestions> {
+  return request<WorkspaceSourceSuggestions>(
+    `/api/workspaces/${id}/source-suggestions`,
+  );
 }
 
 export function deleteWorkspace(id: number): Promise<void> {

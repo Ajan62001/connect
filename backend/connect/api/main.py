@@ -30,6 +30,7 @@ from connect.api.routers import (
     analyses,
     auth,
     brief,
+    stories,
     calendar,
     contradictions,
     cursors,
@@ -80,6 +81,7 @@ _AUTHED_ROUTERS = (
     analyses.router,
     contradictions.router,
     investigations.router,
+    stories.router,
     position_shifts.router,
     admin.router,
 )

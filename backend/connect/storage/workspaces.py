@@ -169,3 +169,39 @@ async def focused_feed(conn: psycopg.AsyncConnection, workspace: Workspace, *,
         (*params, page_size, (page - 1) * page_size))
     rows = await cur.fetchall()
     return [doc_dao._to_list_item(r) for r in rows], int(total)
+
+
+async def source_suggestions(conn: psycopg.AsyncConnection,
+                             workspace: Workspace, *, viewer: int,
+                             limit: int = 20) -> dict[str, Any]:
+    """Sources for managing the workspace focus: the ones already in focus
+    (resolved to names) + topic-matched candidates — sources that publish
+    documents tagged with the workspace's topics, ranked by matching doc
+    count, excluding those already added. Empty suggestions when the
+    workspace has no topics (the basis for the match)."""
+    source_ids = [int(s) for s in workspace.source_ids]
+    current: list[dict[str, Any]] = []
+    if source_ids:
+        cur = await conn.execute(
+            "SELECT id, name FROM source WHERE id = ANY(%s) ORDER BY name",
+            (source_ids,))
+        current = [{"id": r["id"], "name": r["name"], "doc_count": 0}
+                   for r in await cur.fetchall()]
+
+    suggestions: list[dict[str, Any]] = []
+    if workspace.topics:
+        cur = await conn.execute(
+            "SELECT s.id, s.name, count(DISTINCT d.id) AS doc_count"
+            " FROM document_topic dt"
+            " JOIN document d ON d.id = dt.document_id"
+            " JOIN source s ON s.id = d.source_id"
+            " WHERE dt.topic = ANY(%s)"
+            " AND (d.visibility = 'shared' OR d.owner_id = %s)"
+            " AND s.id <> ALL(%s)"
+            " GROUP BY s.id, s.name"
+            " ORDER BY doc_count DESC, s.name LIMIT %s",
+            (list(workspace.topics), viewer, source_ids or [0], limit))
+        suggestions = [{"id": r["id"], "name": r["name"],
+                        "doc_count": int(r["doc_count"])}
+                       for r in await cur.fetchall()]
+    return {"current": current, "suggestions": suggestions}

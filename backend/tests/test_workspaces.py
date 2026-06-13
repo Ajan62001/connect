@@ -125,3 +125,28 @@ def test_watch_tagged_and_filtered_by_workspace(client):
 
     scoped = client.get("/api/watches", params={"workspace_id": wid}).json()
     assert [w["id"] for w in scoped] == [w1["id"]]
+
+
+async def test_workspace_source_suggestions(client, db):
+    """Topic-driven source discovery: sources publishing on the workspace's
+    topics are suggested; once added they move to 'current'."""
+    src = await insert_source(db, "RBI", tier=1)
+    doc = await insert_doc(db, title="Repo held", source_id=src,
+                           text="The RBI kept the repo rate at 6.5%.")
+    await db.execute(
+        "INSERT INTO document_topic (document_id, topic, source)"
+        " VALUES (%s, 'monetary-policy', 't1')", (doc,))
+
+    wid = client.post("/api/workspaces", json={
+        "name": "Rates", "topics": ["monetary-policy"]}).json()["id"]
+
+    sug = client.get(f"/api/workspaces/{wid}/source-suggestions").json()
+    assert sug["current"] == []
+    assert any(s["id"] == src and s["doc_count"] >= 1
+               for s in sug["suggestions"])
+
+    # add the suggested source to the focus → it moves to 'current'
+    client.patch(f"/api/workspaces/{wid}", json={"source_ids": [src]})
+    sug2 = client.get(f"/api/workspaces/{wid}/source-suggestions").json()
+    assert any(s["id"] == src for s in sug2["current"])
+    assert all(s["id"] != src for s in sug2["suggestions"])

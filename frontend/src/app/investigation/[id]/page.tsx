@@ -32,6 +32,7 @@ import { WatchNextPanel } from "@/components/investigation/WatchNextPanel";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { QueryError } from "@/components/shared/QueryError";
 import { ShareDossierDialog } from "@/components/shared/ShareDialog";
+import { TellStoryButton } from "@/components/story/TellStoryButton";
 import { OwnerByline, VisibilityBadge } from "@/components/shared/Visibility";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -323,17 +324,24 @@ export default function InvestigationPage({
                   ? ` · ${formatUsd(query.data.cost_usd)}`
                   : ""}
               </span>
-              {canShare ? (
-                <Button
-                  variant="outline"
-                  size="xs"
-                  className="ml-auto"
-                  onClick={() => setShareOpen(true)}
-                >
-                  <Share2Icon data-icon="inline-start" />
-                  Share
-                </Button>
-              ) : null}
+              <span className="ml-auto flex items-center gap-2">
+                {query.data.status === "completed" ? (
+                  <TellStoryButton
+                    source={{ investigation_id: query.data.id }}
+                    size="xs"
+                  />
+                ) : null}
+                {canShare ? (
+                  <Button
+                    variant="outline"
+                    size="xs"
+                    onClick={() => setShareOpen(true)}
+                  >
+                    <Share2Icon data-icon="inline-start" />
+                    Share
+                  </Button>
+                ) : null}
+              </span>
             </div>
           </div>
 

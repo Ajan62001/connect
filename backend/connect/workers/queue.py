@@ -47,6 +47,8 @@ PRIORITY_POLL = 90
 KIND_PRIORITIES: dict[str, int] = {
     "analysis": PRIORITY_INTERACTIVE,
     "investigation": PRIORITY_INTERACTIVE,
+    "workspace_task": PRIORITY_INTERACTIVE,   # user clicked "run a task"
+    "story": PRIORITY_INTERACTIVE,            # user clicked "tell the story"
     "enrich_t2": PRIORITY_INTERACTIVE,    # user clicked "promote"
     "ingest_url": PRIORITY_INTERACTIVE,   # user submitted a URL
     "reverify_claim": PRIORITY_BACKGROUND,
@@ -70,6 +72,8 @@ KIND_MAX_ATTEMPTS: dict[str, int] = {
     "enrich_t1_batch": 3,
     "analysis": 2,
     "investigation": 2,
+    # synthesis-only + idempotent section upserts → safe to reclaim/re-run.
+    "story": 2,
     # idempotent (URL-dedup + content-hash), so a worker crash mid-backfill
     # should reclaim/requeue rather than orphan-fail it.
     "backfill_source": 2,

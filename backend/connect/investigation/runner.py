@@ -22,6 +22,7 @@ from typing import Any
 import psycopg
 from psycopg_pool import AsyncConnectionPool
 
+from connect.agents.metered_loop import run_metered_tool_loop
 from connect.analysis.budget import AnalysisBudget
 from connect.ingestion.pipeline import IngestionPipeline
 from connect.investigation import questions as questions_mod
@@ -42,12 +43,7 @@ from connect.knowledge.enrichment import persist as t1_persist
 from connect.knowledge.enrichment import t1 as t1_mod
 from connect.knowledge.vector import VectorIndex
 from connect.llm import spend
-from connect.llm.provider import (
-    LLMError,
-    LLMProvider,
-    assistant_message,
-    tool_result_message,
-)
+from connect.llm.provider import LLMError, LLMProvider
 from connect.llm.spend import BudgetExceeded, Governor
 from connect.llm.tiers import ModelTier
 from connect.orchestration import events
@@ -289,18 +285,17 @@ class InvestigationService:
             "content": scoping.render_scope_pack(pack)
             + await questions_mod.render_questions(conn, dossier_id)}]
 
-        iterations = 0
-        force_next = False
-        for n in range(1, opts.max_iterations + 1):
-            if state.concluded:
-                break
-            if cancel is not None:  # iteration = cancel checkpoint
-                await cancel.raise_if_cancelled()
+        # The control flow is the shared metered tool-loop; the investigation
+        # POLICY (3-tier degrade ladder, per-iteration SSE + usage save, the
+        # end_turn->force-conclude nudge, raise-on-cancel) lives in these hooks.
+        loop_state = {"force_next": False}
+
+        async def should_force(n: int) -> bool:
             spent = budget.spent_usd
             if (not state.corpus_only
                     and spent >= CORPUS_ONLY_FRACTION * opts.budget_usd):
                 state.corpus_only = True
-            force = (force_next or n == opts.max_iterations
+            force = (loop_state["force_next"] or n == opts.max_iterations
                      or spent >= FORCE_CONCLUDE_FRACTION * opts.budget_usd
                      or spent + turn_proj > loop_cap)
             if not force:
@@ -308,40 +303,43 @@ class InvestigationService:
                     await self.governor.check(turn_proj)
                 except BudgetExceeded:
                     force = True  # one last forced-conclude call
-            turn = await self.provider.complete_with_tools(
-                system=INVESTIGATOR_SYSTEM, messages=messages,
-                tools=TOOL_DEFS, tier=ModelTier.BALANCED,
-                max_tokens=LOOP_MAX_TOKENS,
-                tool_choice="conclude" if force else None)
+            return force
+
+        async def after_turn(n: int, turn: Any, forced: bool) -> None:
             await spend.record_call(conn, purpose=PURPOSE_INVESTIGATION,
                                     model=turn.model, usage=turn.usage)
             budget.add(spend.cost_usd(
                 turn.model, input_tokens=turn.usage.input_tokens,
                 output_tokens=turn.usage.output_tokens,
                 cache_read_tokens=turn.usage.cache_read_tokens))
-            iterations = n
             await emit("iteration", {
                 "n": n, "tools": [c.name for c in turn.tool_calls],
                 "cost_so_far": round(budget.spent_usd, 4),
-                "forced": force, "corpus_only": state.corpus_only})
+                "forced": forced, "corpus_only": state.corpus_only})
             await self._save_usage(conn, dossier_id, budget, state)
 
-            if not turn.tool_calls:
-                # end_turn without tools -> forced conclude next turn
-                messages.append(assistant_message(turn))
-                messages.append({
-                    "role": "user",
-                    "content": "You must finish now: call the conclude"
-                               " tool with honest resolutions for every"
-                               " question."})
-                force_next = True
-                continue
-            messages.append(assistant_message(turn))
-            results = []
-            for call in turn.tool_calls:
-                outcome = await executor(call)
-                results.append((call, outcome))
-            messages.append(tool_result_message(results))
+        async def on_empty_turn(turn: Any) -> bool:
+            # end_turn without tools -> forced conclude next turn
+            messages.append({
+                "role": "user",
+                "content": "You must finish now: call the conclude"
+                           " tool with honest resolutions for every"
+                           " question."})
+            loop_state["force_next"] = True
+            return False
+
+        async def cancelled() -> bool:
+            if cancel is not None:  # iteration = cancel checkpoint
+                await cancel.raise_if_cancelled()
+            return False
+
+        iterations = await run_metered_tool_loop(
+            self.provider, system=INVESTIGATOR_SYSTEM, tools=TOOL_DEFS,
+            executor=executor, messages=messages, tier=ModelTier.BALANCED,
+            max_tokens=LOOP_MAX_TOKENS, max_iters=opts.max_iterations,
+            terminal_tool="conclude", should_force=should_force,
+            after_turn=after_turn, on_empty_turn=on_empty_turn,
+            is_concluded=lambda: state.concluded, should_cancel=cancelled)
 
         summary = (f"{iterations} iterations,"
                    f" {state.findings_recorded} findings,"

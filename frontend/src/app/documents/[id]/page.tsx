@@ -1,6 +1,6 @@
 "use client";
 
-import { use, useState } from "react";
+import { use, useEffect, useState } from "react";
 import {
   ArrowLeftIcon,
   CopyIcon,
@@ -15,6 +15,7 @@ import {
   SparklesIcon,
 } from "lucide-react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 
 import { EntityPill } from "@/components/entities/EntityPill";
@@ -55,6 +56,7 @@ import type {
   DocumentLink,
   DocumentLinkStatus,
   EnrichmentClaim,
+  EnrichmentStatus,
   SocialPost,
   Visibility,
 } from "@/lib/api";
@@ -71,6 +73,7 @@ import {
   useCreatePost,
   useDocument,
   useDraftSocialPost,
+  useEnrichDocument,
   useFetchDocumentLink,
   useInstagramStatus,
   useMe,
@@ -225,6 +228,120 @@ function ClaimRow({ claim }: { claim: EnrichmentClaim }) {
         </span>
       </span>
     </li>
+  );
+}
+
+// how long to poll for the background enrichment job to land (15 × 2s = 30s)
+const ENRICH_POLL_MS = 2000;
+const ENRICH_POLL_MAX = 15;
+
+/** Shown when a document has not been enriched: run T1 on demand. While the
+ *  background job runs, polls the document so the full enrichment swaps in
+ *  automatically (this card unmounts once `enrichment` lands). */
+function EnrichNowCard({
+  documentId,
+  status,
+  visibility,
+  onRefetch,
+}: {
+  documentId: number;
+  status: EnrichmentStatus;
+  visibility?: Visibility;
+  onRefetch: () => void;
+}) {
+  const enrich = useEnrichDocument();
+  const isPrivate = visibility === "private";
+  // null = not started; otherwise the number of polls done so far.
+  const [polls, setPolls] = useState<number | null>(null);
+  const enriching = polls !== null;
+  const timedOut = enriching && polls >= ENRICH_POLL_MAX;
+
+  useEffect(() => {
+    if (!enriching || timedOut) return;
+    const t = setTimeout(() => {
+      onRefetch();
+      setPolls((p) => (p ?? 0) + 1);
+    }, ENRICH_POLL_MS);
+    return () => clearTimeout(t);
+  }, [enriching, polls, timedOut, onRefetch]);
+
+  if (enriching) {
+    return (
+      <Card className="mb-6">
+        <CardContent className="flex flex-col items-center gap-2 py-10 text-center">
+          {timedOut ? (
+            <>
+              <p className="text-sm font-medium">Still enriching…</p>
+              <p className="max-w-sm text-xs text-muted-foreground">
+                This is taking longer than usual. It will appear here once the
+                job finishes.
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                className="mt-1"
+                onClick={() => {
+                  onRefetch();
+                  setPolls(0);
+                }}
+              >
+                Refresh
+              </Button>
+            </>
+          ) : (
+            <>
+              <Loader2Icon className="size-6 animate-spin text-muted-foreground" />
+              <p className="text-sm font-medium">Enriching this document…</p>
+              <p className="max-w-sm text-xs text-muted-foreground">
+                Extracting a summary, the news type, topics, entities and
+                claims. This usually takes a few seconds.
+              </p>
+            </>
+          )}
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card className="mb-6">
+      <CardHeader>
+        <CardTitle className="flex flex-wrap items-center gap-2">
+          Not enriched yet
+          <StatusChip status={status} />
+        </CardTitle>
+        <CardDescription>
+          Run enrichment to extract a summary, the news type, topics, entities
+          and claims for this document.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-wrap items-center gap-3">
+        <Button
+          size="sm"
+          disabled={enrich.isPending || isPrivate}
+          onClick={() =>
+            enrich.mutate(documentId, {
+              onSuccess: () => setPolls(0),
+              onError: (e) =>
+                toast.error("Could not enrich", { description: e.message }),
+            })
+          }
+        >
+          {enrich.isPending ? (
+            <Loader2Icon className="animate-spin" data-icon="inline-start" />
+          ) : (
+            <SparklesIcon data-icon="inline-start" />
+          )}
+          Enrich now
+        </Button>
+        {isPrivate ? (
+          <span className="text-xs text-muted-foreground">
+            Share this document first — enrichment writes to the shared
+            knowledge base.
+          </span>
+        ) : null}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -799,8 +916,19 @@ export default function DocumentPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = use(params);
+  const router = useRouter();
   const documentId = Number(id);
   const document = useDocument(documentId);
+
+  // Return to wherever the user came from (feed / search / library / entity);
+  // fall back to Library only on a cold load with no in-app history.
+  const goBack = () => {
+    if (typeof window !== "undefined" && window.history.length > 1) {
+      router.back();
+    } else {
+      router.push("/library");
+    }
+  };
 
   if (!Number.isFinite(documentId)) {
     return (
@@ -814,9 +942,9 @@ export default function DocumentPage({
 
   return (
     <>
-      <Button variant="ghost" size="sm" render={<Link href="/library" />}>
+      <Button variant="ghost" size="sm" onClick={goBack}>
         <ArrowLeftIcon data-icon="inline-start" />
-        Library
+        Back
       </Button>
 
       {document.isPending ? (
@@ -834,7 +962,14 @@ export default function DocumentPage({
               <AskCard documentId={documentId} />
               {document.data.enrichment ? (
                 <EnrichmentCard enrichment={document.data.enrichment} />
-              ) : null}
+              ) : (
+                <EnrichNowCard
+                  documentId={documentId}
+                  status={document.data.enrichment_status}
+                  visibility={document.data.visibility}
+                  onRefetch={() => void document.refetch()}
+                />
+              )}
               {/* `?? []` tolerates a backend that predates schema v9. */}
               <StatementsCard statements={document.data.statements ?? []} />
               {document.data.content_text ? (

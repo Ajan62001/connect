@@ -24,6 +24,8 @@ from typing import Any
 
 import psycopg
 
+from connect.agents.metered_loop import run_metered_tool_loop
+from connect.analysis import grounding
 from connect.analysis.budget import AnalysisBudget
 from connect.domain.models import Post, PostSettings, SocialPost, Workspace
 from connect.llm import spend
@@ -33,8 +35,6 @@ from connect.llm.provider import (
     ToolCall,
     ToolDef,
     ToolOutcome,
-    assistant_message,
-    tool_result_message,
 )
 from connect.llm.spend import BudgetExceeded
 from connect.llm.tiers import ModelTier
@@ -50,20 +50,38 @@ PURPOSE_WORKSPACE_AGENT = "workspace_agent"
 
 WS_AGENT_MAX_ITERS = 6
 WS_AGENT_REQUEST_CAP_USD = 0.10
+WS_AGENT_DEEP_MAX_ITERS = 20
+WS_AGENT_DEEP_CAP_USD = 1.00
+
+# The two budget presets the workspace agent runs under: a synchronous,
+# in-request "quick" chat turn, and an async "deep" task (a background job)
+# with higher iteration + spend caps. The (max_iters, cap_usd) pair is the
+# ONLY difference between the two modes — same engine, same tools, same gate.
+WS_AGENT_MODES: dict[str, tuple[int, float]] = {
+    "quick": (WS_AGENT_MAX_ITERS, WS_AGENT_REQUEST_CAP_USD),
+    "deep": (WS_AGENT_DEEP_MAX_ITERS, WS_AGENT_DEEP_CAP_USD),
+}
+
 _EST_IN, _EST_OUT = 6000, 700          # conservative per-turn projection
 READ_CHUNK_CHARS = 6000
 SNIPPET_CHARS = 240
 
 WS_AGENT_SYSTEM = (
-    "You are the assistant for a workspace — a focused lens over a news"
-    " corpus. Answer the user using ONLY documents inside this workspace."
-    " Workflow: call search_workspace to find relevant documents, read_document"
-    " to read their text, and ground every claim in what you read (cite"
-    " document ids). If the workspace has nothing relevant, say so plainly —"
-    " never invent facts or figures. When the user asks you to save or capture"
-    " an insight (or it is clearly useful), call post_finding to add a finding"
-    " to this workspace. When you are ready to reply to the user, call"
-    " final_answer with your complete answer. Be concise and specific.")
+    "You are the helpful, conversational assistant for a workspace — a focused"
+    " lens over a news corpus plus the documents added to it. Be proactive: ACT"
+    " on the user's request instead of asking them to clarify or to name a"
+    " document. For a broad or vague ask (a summary, synopsis, overview,"
+    " 'what's new', 'what's in here', 'catch me up'), DON'T ask 'of what?' —"
+    " call list_recent (and search_workspace with relevant terms) to survey the"
+    " workspace, read the most relevant documents, and synthesize the answer"
+    " yourself. Tools: list_recent (survey recent docs, no query), search_workspace"
+    " (find specific things), read_document (read full text), post_finding (save"
+    " an insight to the workspace), draft_social_post (make an Instagram post"
+    " from a document). Ground every factual claim in documents you actually"
+    " read (cite document ids); never invent facts or figures. Only if the"
+    " workspace genuinely has NO documents, say so plainly and describe what the"
+    " workspace is for. When you are ready to reply, call final_answer with your"
+    " complete answer. Be concise, specific, and friendly.")
 
 
 _SEARCH_SCHEMA = {
@@ -78,6 +96,19 @@ _SEARCH_SCHEMA = {
 }
 
 WS_TOOL_DEFS: tuple[ToolDef, ...] = (
+    ToolDef(
+        name="list_recent",
+        description="List the most recent documents in this workspace (NO query"
+                    " needed). Use this to survey the workspace for an overview,"
+                    " summary, synopsis, or 'what's new' — then read the ones"
+                    " worth reading. Returns document ids, titles, sources,"
+                    " dates and snippets, newest first.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 10},
+            },
+        }),
     ToolDef(
         name="search_workspace",
         description="Search this workspace's documents (FTS + vector fusion,"
@@ -100,17 +131,25 @@ WS_TOOL_DEFS: tuple[ToolDef, ...] = (
     ToolDef(
         name="post_finding",
         description="Save a finding/insight to this workspace (a short titled"
-                    " note, optionally citing a document you read). Use when"
-                    " the user asks to capture something.",
+                    " note). MUST cite the workspace document it came from and"
+                    " a quote: an EXACT, verbatim sentence copied from that"
+                    " document's text that backs the finding (copy it"
+                    " character-for-character — it is mechanically verified"
+                    " against the stored document and rejected if it is not a"
+                    " literal substring). Use when the user asks to capture"
+                    " something.",
         input_schema={
             "type": "object",
             "properties": {
                 "title": {"type": "string"},
                 "body": {"type": "string"},
                 "document_id": {"type": "integer",
-                                "description": "Optional cited document"},
+                                "description": "The cited workspace document"},
+                "quote": {"type": "string",
+                          "description": "A verbatim sentence from the cited"
+                                         " document that grounds the finding"},
             },
-            "required": ["title", "body"],
+            "required": ["title", "body", "document_id", "quote"],
         }),
     ToolDef(
         name="draft_social_post",
@@ -220,6 +259,31 @@ class WorkspaceToolExecutor:
         cur = await self.conn.execute(sql, params)
         return await cur.fetchone()
 
+    async def _tool_list_recent(self, args: dict[str, Any]) -> Any:
+        limit = max(1, min(int(args.get("limit", 10) or 10), 25))
+        sql = ("SELECT d.id, d.title, d.published_at, d.content_text,"
+               " s.name AS source_name, s.credibility_tier"
+               " FROM document d LEFT JOIN source s ON s.id = d.source_id"
+               " WHERE (d.visibility = 'shared' OR d.owner_id = %s)")
+        params: list[Any] = [self.viewer]
+        if self.focus_clause:
+            sql += " AND " + self.focus_clause
+            params += self.focus_params
+        sql += " ORDER BY d.fetched_at DESC, d.id DESC LIMIT %s"
+        params.append(limit)
+        cur = await self.conn.execute(sql, params)
+        rows = await cur.fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            self.state.touched_doc_ids.add(row["id"])
+            results.append({
+                "document_id": row["id"], "title": row["title"],
+                "source": row["source_name"], "tier": row["credibility_tier"],
+                "published_at": row["published_at"],
+                "snippet": (row["content_text"] or "")[:SNIPPET_CHARS],
+            })
+        return {"results": results, "total": len(results)}
+
     async def _tool_search_workspace(self, args: dict[str, Any]) -> Any:
         query = str(args.get("query", "")).strip()
         if not query:
@@ -280,19 +344,36 @@ class WorkspaceToolExecutor:
         if not title or not body:
             return ToolOutcome(content="title and body are required",
                                is_error=True)
+        # grounding gate (mirrors investigation/writeback.py): a finding must
+        # cite a workspace document AND a verbatim quote that literally appears
+        # in it — agent claims are mechanically grounded, never prompt-hoped.
         doc_id = args.get("document_id")
-        cited: int | None = None
-        if doc_id is not None:
-            if not isinstance(doc_id, int) or await self._fetch_in_scope(
-                    doc_id) is None:
-                return ToolOutcome(
-                    content="cited document is not in this workspace",
-                    is_error=True)
-            cited = doc_id
+        if not isinstance(doc_id, int):
+            return ToolOutcome(content="document_id must be an integer",
+                               is_error=True)
+        row = await self._fetch_in_scope(doc_id)
+        if row is None:
+            return ToolOutcome(
+                content=f"document {doc_id} is not in this workspace",
+                is_error=True)
+        quote = str(args.get("quote", "")).strip()
+        if not quote:
+            return ToolOutcome(
+                content="quote is required — copy a verbatim sentence from the"
+                        " cited document that backs this finding",
+                is_error=True)
+        content = row["content_text"] or ""
+        if not grounding.span_is_verbatim(quote, content):
+            return ToolOutcome(
+                content=f"quote is not a verbatim substring of document"
+                        f" {doc_id} — copy the sentence exactly as it appears",
+                is_error=True)
+        start, end = grounding.find_span(quote, content)
         post = await post_dao.insert(
             self.conn, owner_id=self.viewer, title=title[:300],
-            body=body[:20_000], document_id=cited,
-            workspace_id=self.workspace.id, visibility="shared")
+            body=body[:20_000], document_id=doc_id,
+            workspace_id=self.workspace.id, quote=quote,
+            quote_start=start, quote_end=end, visibility="shared")
         self.state.finding = post
         return {"ok": True, "post_id": post.id, "title": post.title}
 
@@ -369,11 +450,14 @@ async def run_workspace_agent(
         embedder: Any, vectors: Any, workspace: Workspace, viewer: int,
         messages: list[dict[str, Any]],
         card_store: Any = None, post_settings: PostSettings | None = None,
-        max_iters: int = WS_AGENT_MAX_ITERS,
-        cap_usd: float = WS_AGENT_REQUEST_CAP_USD) -> WorkspaceAgentResult:
-    """Drive the bounded tool-loop for one user turn. Raises BudgetExceeded
+        on_turn: Any = None, should_cancel: Any = None,
+        mode: str = "quick") -> WorkspaceAgentResult:
+    """Drive the bounded tool-loop for one user turn. ``mode`` selects the
+    (max_iters, cap_usd) preset — 'quick' for the in-request chat, 'deep' for
+    the async task; the loop is otherwise identical. Raises BudgetExceeded
     only when the FIRST turn is refused (nothing spent → the endpoint 429s);
     a mid-loop budget hit forces one final answer and returns a partial."""
+    max_iters, cap_usd = WS_AGENT_MODES.get(mode, WS_AGENT_MODES["quick"])
     state = WorkspaceAgentState()
     executor = WorkspaceToolExecutor(
         conn, embedder=embedder, vectors=vectors, workspace=workspace,
@@ -384,23 +468,19 @@ async def run_workspace_agent(
     turn_proj = spend.cost_usd(model, input_tokens=_EST_IN,
                                output_tokens=_EST_OUT)
     msgs = list(messages)
-    turns = 0
 
-    for n in range(1, max_iters + 1):
-        if state.concluded:
-            break
-        force = n == max_iters or not budget.fits(turn_proj)
-        if not force:
-            try:
-                await governor.check(turn_proj, user_id=viewer)
-            except BudgetExceeded:
-                if n == 1:
-                    raise            # nothing spent yet → endpoint returns 429
-                force = True         # one last forced turn, then stop
-        turn = await llm.complete_with_tools(
-            system=WS_AGENT_SYSTEM, messages=msgs, tools=WS_TOOL_DEFS,
-            tier=ModelTier.BALANCED, max_tokens=2048,
-            tool_choice="final_answer" if force else None)
+    async def should_force(n: int) -> bool:
+        if n == max_iters or not budget.fits(turn_proj):
+            return True
+        try:
+            await governor.check(turn_proj, user_id=viewer)
+        except BudgetExceeded:
+            if n == 1:
+                raise              # nothing spent yet → endpoint returns 429
+            return True            # one last forced turn, then stop
+        return False
+
+    async def after_turn(n: int, turn: Any, forced: bool) -> None:
         await spend.record_call(conn, purpose=PURPOSE_WORKSPACE_AGENT,
                                 model=turn.model, usage=turn.usage,
                                 user_id=viewer)
@@ -408,17 +488,28 @@ async def run_workspace_agent(
             turn.model, input_tokens=turn.usage.input_tokens,
             output_tokens=turn.usage.output_tokens,
             cache_read_tokens=turn.usage.cache_read_tokens))
-        turns = n
-        state.tools_used += [c.name for c in turn.tool_calls]
-        msgs.append(assistant_message(turn))
-        if not turn.tool_calls:
-            # a plain text turn IS the answer (conversational, unlike the
-            # investigation engine which demands a structured conclude)
-            if state.final_answer is None:
-                state.final_answer = turn.text
-            break
-        results = [(c, await executor(c)) for c in turn.tool_calls]
-        msgs.append(tool_result_message(results))
+        names = [c.name for c in turn.tool_calls]
+        state.tools_used += names
+        if on_turn is not None:
+            await on_turn(names)
+
+    async def on_empty_turn(turn: Any) -> bool:
+        # a plain text turn IS the answer (conversational, unlike the
+        # investigation engine which demands a structured conclude)
+        if state.final_answer is None:
+            state.final_answer = turn.text
+        return True
+
+    async def cancelled() -> bool:
+        return should_cancel is not None and await should_cancel()
+
+    turns = await run_metered_tool_loop(
+        llm, system=WS_AGENT_SYSTEM, tools=WS_TOOL_DEFS, executor=executor,
+        messages=msgs, tier=ModelTier.BALANCED, max_tokens=2048,
+        max_iters=max_iters, terminal_tool="final_answer",
+        should_force=should_force, after_turn=after_turn,
+        on_empty_turn=on_empty_turn, is_concluded=lambda: state.concluded,
+        should_cancel=cancelled)
 
     return WorkspaceAgentResult(
         final_answer=state.final_answer or "",

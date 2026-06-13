@@ -10,6 +10,7 @@ import {
   LayoutGridIcon,
   Loader2Icon,
   NotebookPenIcon,
+  PlayIcon,
   RssIcon,
   SearchIcon,
   Settings2Icon,
@@ -23,10 +24,13 @@ import { EmptyState } from "@/components/shared/EmptyState";
 import { PageHeader } from "@/components/shared/PageHeader";
 import { QueryError } from "@/components/shared/QueryError";
 import { VisibilityBadge } from "@/components/shared/Visibility";
+import { TellStoryButton } from "@/components/story/TellStoryButton";
 import { PostSettingsDialog } from "@/components/workspace/PostSettingsDialog";
+import { WorkspaceSourcesDialog } from "@/components/workspace/WorkspaceSourcesDialog";
 import { WorkspaceChatPanel } from "@/components/workspace/WorkspaceChatPanel";
 import { WorkspaceDrafts } from "@/components/workspace/WorkspaceDrafts";
 import { WorkspaceKnowledgeBase } from "@/components/workspace/WorkspaceKnowledgeBase";
+import { WorkspaceTasks } from "@/components/workspace/WorkspaceTasks";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -212,6 +216,7 @@ export default function WorkspacePage({
   const del = useDeleteWorkspace();
   const router = useRouter();
   const [postSettingsOpen, setPostSettingsOpen] = useState(false);
+  const [sourcesOpen, setSourcesOpen] = useState(false);
 
   if (!Number.isFinite(workspaceId)) {
     return (
@@ -247,6 +252,15 @@ export default function WorkspacePage({
             description={workspace.data.description || undefined}
             actions={
               <span className="flex gap-2">
+                <TellStoryButton source={{ workspace_id: workspaceId }} />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setSourcesOpen(true)}
+                >
+                  <DatabaseIcon data-icon="inline-start" />
+                  Sources
+                </Button>
                 <Button
                   variant="outline"
                   size="sm"
@@ -281,6 +295,11 @@ export default function WorkspacePage({
             workspaceId={workspaceId}
             open={postSettingsOpen}
             onOpenChange={setPostSettingsOpen}
+          />
+          <WorkspaceSourcesDialog
+            workspaceId={workspaceId}
+            open={sourcesOpen}
+            onOpenChange={setSourcesOpen}
           />
 
           <div className="mb-4 flex flex-wrap items-center gap-1.5">
@@ -323,6 +342,13 @@ export default function WorkspacePage({
                   Assistant
                 </h2>
                 <WorkspaceChatPanel workspaceId={workspaceId} />
+              </div>
+              <div>
+                <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold">
+                  <PlayIcon className="size-4" />
+                  Tasks
+                </h2>
+                <WorkspaceTasks workspaceId={workspaceId} />
               </div>
               <div>
                 <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold">

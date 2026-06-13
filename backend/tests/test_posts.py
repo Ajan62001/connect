@@ -5,7 +5,9 @@ document link + ?document_id filter, validation, and DAO-level tenancy
 from __future__ import annotations
 
 from kb_factories import ensure_user
+from mock_llm import MockProvider
 
+from connect.domain.models import DocumentAnswer
 from connect.storage import posts as post_dao
 
 
@@ -13,6 +15,25 @@ def _ingest(client, text: str, title: str = "Source article") -> int:
     r = client.post("/api/documents", json={"text": text, "title": title})
     assert r.status_code in (200, 201), r.text
     return r.json()["id"]
+
+
+def test_post_ask_grounded(client):
+    """Cross-question a finding: a grounded answer from its cited document."""
+    doc = _ingest(client, "The RBI kept the repo rate at 6.5%.", "RBI holds")
+    pid = client.post("/api/posts", json={
+        "title": "Pause", "body": "A hold.", "document_id": doc}).json()["id"]
+    client.app.state.container.llm = MockProvider(respond_by_schema={
+        DocumentAnswer: lambda _u: DocumentAnswer(
+            answer="The RBI held the repo rate at 6.5%.", grounded=True,
+            quote="The RBI kept the repo rate at 6.5%.")})
+    a = client.post(f"/api/posts/{pid}/ask",
+                    json={"question": "What did the RBI do?"})
+    assert a.status_code == 200, a.text
+    assert a.json()["grounded"] is True
+    assert "RBI" in a.json()["answer"]
+    # missing post -> 404
+    assert client.post("/api/posts/999999/ask",
+                       json={"question": "x"}).status_code == 404
 
 
 def test_post_crud_lifecycle(client):

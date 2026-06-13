@@ -336,6 +336,22 @@ class DocumentListItem(_Frozen):
     owner_id: int | None = None
     visibility: Visibility = "shared"
     origin: DocumentOrigin = "polled"
+    # enrichment tags (NULL/empty until enriched): the document's classified
+    # news type + its topics — surfaced as feed tags.
+    news_type: str | None = None
+    topics: list[str] = Field(default_factory=list)
+
+
+class FacetSource(_Frozen):
+    id: int
+    name: str
+
+
+class FeedFacets(_Frozen):
+    """Distinct filter values present in the viewer-visible corpus."""
+    news_types: list[str] = Field(default_factory=list)
+    topics: list[str] = Field(default_factory=list)
+    sources: list[FacetSource] = Field(default_factory=list)
 
 
 class DocumentLink(_Frozen):
@@ -804,6 +820,11 @@ class Post(_Frozen):
     document_id: int | None = None
     document_title: str | None = None   # joined from the linked document
     workspace_id: int | None = None     # the workspace this finding belongs to
+    # v13: a verbatim-verified quote from the cited document (agent findings
+    # only — the grounding gate); NULL for human-authored posts.
+    quote: str | None = None
+    quote_start: int | None = None
+    quote_end: int | None = None
     visibility: Visibility = "shared"
     owner_id: int | None = None
     owner_name: str | None = None
@@ -876,6 +897,19 @@ class ChatTurn(_Frozen):
     finding_title: str | None = None
 
 
+class WorkspaceSourceOption(_Frozen):
+    id: int
+    name: str
+    doc_count: int = 0
+
+
+class WorkspaceSourceSuggestions(_Frozen):
+    """Sources for managing a workspace's focus: those already in focus, plus
+    topic-matched candidates (sources publishing on the workspace's topics)."""
+    current: list[WorkspaceSourceOption] = Field(default_factory=list)
+    suggestions: list[WorkspaceSourceOption] = Field(default_factory=list)
+
+
 class WorkspaceChatRequest(_Frozen):
     """Send a message to a workspace's agent. Omit ``chat_id`` to start a new
     conversation; pass it to continue a saved one."""
@@ -907,6 +941,18 @@ class WorkspaceChatDetail(_Frozen):
     transcript: list[ChatTurn]
     created_at: str
     updated_at: str | None = None
+
+
+# --- async ("deep") workspace-agent runs ---------------------------------------
+# A deep run is just a chat turn executed as a background job: the SAME agent as
+# the in-request chat, with higher iteration/spend caps. Progress streams over
+# job_event (the shared SSE contract) and the answer lands in the chat
+# transcript on completion — there is no separate task row, so the job's own
+# terminal state is the single source of truth.
+
+class WorkspaceChatAsyncAccepted(_Frozen):
+    chat_id: int
+    job_id: int
 
 
 # --- jobs --------------------------------------------------------------------

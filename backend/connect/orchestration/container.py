@@ -37,6 +37,7 @@ from connect.analysis.pipeline import AnalysisService
 from connect.auth.oauth import GoogleOAuth
 from connect.ingestion.blobs import BlobStore
 from connect.investigation.runner import InvestigationService
+from connect.story.service import StoryService
 from connect.ingestion.fetcher import Fetcher
 from connect.ingestion.pipeline import IngestionPipeline
 from connect.ingestion.poller import SourcePoller
@@ -124,6 +125,8 @@ class Container:
         # v8: investigation mode — its OWN daily governor + service.
         self.investigation_governor: Governor | None = None
         self.investigations: InvestigationService | None = None
+        # v15: story mode — grounded narrative synthesis over a fact-set.
+        self.stories: StoryService | None = None
         # Phase B auth: Google OAuth client — None without credentials
         # (the signin page then offers only the dev hatch, if enabled).
         # Construction is offline (discovery is fetched lazily at first
@@ -239,6 +242,14 @@ class Container:
             synthesis_reserve_usd=self.settings
             .investigation_synthesis_reserve_usd,
             synthesis_tier=self.settings.investigation_synthesis_tier,
+        )
+        self.stories = StoryService(
+            pool,
+            jobs=self.jobs,
+            provider=self.llm,
+            governor=self.governor,
+            embedder=self.embedder,
+            vectors=self.vectors,
         )
         log.info("container up: db=%s schema=v%s vectors=%s",
                  pg_mod.redact_dsn(self.settings.database_url),

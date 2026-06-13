@@ -76,7 +76,10 @@ STORY_STATUSES = ("active", "archived")
 DOSSIER_STATUSES = ("pending", "running", "completed", "failed", "cancelled")
 # v8 appends topic/entity/story (investigation seeds).
 DOSSIER_INPUT_TYPES = ("claim", "policy", "event", "document",
-                       "topic", "entity", "story")
+                       "topic", "entity", "story",
+                       # v15: story-mode sources (narrate an existing
+                       # investigation / a workspace lens).
+                       "investigation", "workspace")
 # v8 appends the investigation stages + its section-row names.
 DOSSIER_STAGES = (
     "normalize", "provenance", "verify", "extract_link",
@@ -85,8 +88,11 @@ DOSSIER_STAGES = (
     "actors", "alternatives", "open_questions", "watch_next")
 SECTION_STATUSES = ("pending", "running", "completed", "failed", "skipped")
 
-# v8: a dossier is either an analysis (Phase 3) or an investigation.
-DOSSIER_KINDS = ("analysis", "investigation")
+# v8: a dossier is an analysis (Phase 3) or an investigation.
+# v15: + 'story' — a grounded narrative synthesised over an existing fact-set
+# (a story thread, an investigation, a workspace, or a topic). Reuses the
+# 'scope' (gather) and 'synthesize' (narrative) section stages.
+DOSSIER_KINDS = ("analysis", "investigation", "story")
 
 # --- investigations (v8) -----------------------------------------------------
 
@@ -103,7 +109,7 @@ FINDING_KINDS = (
 JOB_KINDS = (
     "poll_source", "backfill_source", "ingest_url", "analysis",
     "enrich_t1_sync", "enrich_t1_batch", "enrich_t2", "reverify_claim",
-    "brief_generate", "investigation")
+    "brief_generate", "investigation", "workspace_task", "story")
 JOB_STATUSES = ("queued", "running", "done", "failed", "cancelled")
 
 # --- watches / consumption -------------------------------------------------

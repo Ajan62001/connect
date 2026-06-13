@@ -255,3 +255,26 @@ async def promote_document(doc_id: int,
     job_id = await jobs.enqueue("enrich_t2", {"document_id": doc_id},
                                 owner_id=user.id)
     return JobAccepted(job_id=job_id)
+
+
+@router.post("/{doc_id}/enrich", response_model=JobAccepted, status_code=202)
+async def enrich_document(doc_id: int,
+                          container: Container = Depends(get_container),
+                          db: psycopg.AsyncConnection = Depends(get_db),
+                          user: CurrentUser = Depends(get_current_user)):
+    """Queue a synchronous T1 enrichment of ONE document (summary + news type
+    + topics) — the per-document counterpart of the feed sweep. Bounded (one
+    FAST call) and governor-checked; charges the requesting user."""
+    jobs = container.jobs
+    assert container.enrichment is not None and jobs is not None
+    document = await doc_dao.get(db, doc_id, viewer=user.id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    if document.visibility != "shared":
+        # I1 gate 1: T1 persistence writes shared-KB rows (topics/enrichment)
+        raise HTTPException(status_code=409, detail=(
+            "a private document cannot be enriched into the shared knowledge"
+            " base — share it first"))
+    job_id = await jobs.enqueue("enrich_t1_sync", {"document_id": doc_id},
+                                owner_id=user.id)
+    return JobAccepted(job_id=job_id)

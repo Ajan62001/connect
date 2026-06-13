@@ -3,13 +3,17 @@
 import { useState } from "react";
 import Link from "next/link";
 import {
+  CheckIcon,
   FileTextIcon,
   Loader2Icon,
   NotebookPenIcon,
+  PencilIcon,
+  SparklesIcon,
   Trash2Icon,
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { AskBox } from "@/components/shared/AskBox";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { PageHeader } from "@/components/shared/PageHeader";
 import { QueryError } from "@/components/shared/QueryError";
@@ -28,6 +32,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
+import { askPost } from "@/lib/api";
 import type { Post, Visibility } from "@/lib/api";
 import { relativeTime } from "@/lib/format";
 import {
@@ -35,6 +40,7 @@ import {
   useDeletePost,
   useMe,
   usePosts,
+  useUpdatePost,
 } from "@/lib/queries";
 
 function Composer() {
@@ -108,32 +114,120 @@ function Composer() {
 function PostCard({ post }: { post: Post }) {
   const me = useMe();
   const del = useDeletePost();
+  const patch = useUpdatePost();
   const isOwner = me.data != null && post.owner_id === me.data.id;
+
+  const [editing, setEditing] = useState(false);
+  const [asking, setAsking] = useState(false);
+  const [draftTitle, setDraftTitle] = useState(post.title);
+  const [draftBody, setDraftBody] = useState(post.body);
+
+  const startEdit = () => {
+    setDraftTitle(post.title);
+    setDraftBody(post.body);
+    setEditing(true);
+  };
+  const save = () => {
+    if (!draftTitle.trim() || !draftBody.trim()) return;
+    patch.mutate(
+      {
+        id: post.id,
+        payload: { title: draftTitle.trim(), body: draftBody.trim() },
+      },
+      {
+        onSuccess: () => {
+          toast.success("Finding updated");
+          setEditing(false);
+        },
+        onError: (e) =>
+          toast.error("Could not save", { description: e.message }),
+      },
+    );
+  };
 
   return (
     <Card>
       <CardContent className="space-y-2 py-4">
         <div className="flex items-start justify-between gap-2">
-          <h3 className="font-medium">{post.title}</h3>
-          {isOwner ? (
+          {editing ? (
+            <Input
+              value={draftTitle}
+              onChange={(e) => setDraftTitle(e.target.value)}
+              className="font-medium"
+            />
+          ) : (
+            <h3 className="font-medium">{post.title}</h3>
+          )}
+          <div className="flex shrink-0 items-center gap-0.5">
             <Button
               variant="ghost"
               size="xs"
-              aria-label="Delete finding"
-              disabled={del.isPending}
-              onClick={() =>
-                del.mutate(post.id, {
-                  onSuccess: () => toast.success("Finding deleted"),
-                  onError: (e) =>
-                    toast.error("Could not delete", { description: e.message }),
-                })
-              }
+              aria-label="Cross-question this finding"
+              onClick={() => setAsking((a) => !a)}
             >
-              <Trash2Icon className="size-4" />
+              <SparklesIcon className="size-4" />
             </Button>
-          ) : null}
+            {isOwner && !editing ? (
+              <Button
+                variant="ghost"
+                size="xs"
+                aria-label="Edit finding"
+                onClick={startEdit}
+              >
+                <PencilIcon className="size-4" />
+              </Button>
+            ) : null}
+            {isOwner ? (
+              <Button
+                variant="ghost"
+                size="xs"
+                aria-label="Delete finding"
+                disabled={del.isPending}
+                onClick={() =>
+                  del.mutate(post.id, {
+                    onSuccess: () => toast.success("Finding deleted"),
+                    onError: (e) =>
+                      toast.error("Could not delete", {
+                        description: e.message,
+                      }),
+                  })
+                }
+              >
+                <Trash2Icon className="size-4" />
+              </Button>
+            ) : null}
+          </div>
         </div>
-        <p className="text-sm whitespace-pre-wrap">{post.body}</p>
+
+        {editing ? (
+          <div className="space-y-2">
+            <Textarea
+              value={draftBody}
+              onChange={(e) => setDraftBody(e.target.value)}
+              className="min-h-24"
+            />
+            <div className="flex items-center gap-2">
+              <Button size="sm" disabled={patch.isPending} onClick={save}>
+                {patch.isPending ? (
+                  <Loader2Icon className="animate-spin" data-icon="inline-start" />
+                ) : (
+                  <CheckIcon data-icon="inline-start" />
+                )}
+                Save
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setEditing(false)}
+              >
+                Cancel
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <p className="text-sm whitespace-pre-wrap">{post.body}</p>
+        )}
+
         {post.document_id ? (
           <Link
             href={`/documents/${post.document_id}`}
@@ -148,6 +242,13 @@ function PostCard({ post }: { post: Post }) {
           <OwnerByline ownerId={post.owner_id} ownerName={post.owner_name} />
           <VisibilityBadge visibility={post.visibility} />
         </div>
+
+        {asking ? (
+          <AskBox
+            onAsk={(q) => askPost(post.id, q)}
+            placeholder="Ask a follow-up about this finding…"
+          />
+        ) : null}
       </CardContent>
     </Card>
   );

@@ -20,6 +20,7 @@ VISIBLE_SQL = "(p.visibility = 'shared' OR p.owner_id = %s)"
 
 _SELECT = """
 SELECT p.id, p.title, p.body, p.document_id, p.workspace_id, p.visibility,
+       p.quote, p.quote_start, p.quote_end,
        p.owner_id, p.created_at, p.updated_at,
        d.title AS document_title, u.name AS owner_name
 FROM post p
@@ -36,6 +37,9 @@ def _to_model(row: Mapping[str, Any]) -> Post:
         document_id=row["document_id"],
         document_title=row.get("document_title"),
         workspace_id=row.get("workspace_id"),
+        quote=row.get("quote"),
+        quote_start=row.get("quote_start"),
+        quote_end=row.get("quote_end"),
         visibility=row["visibility"],
         owner_id=row["owner_id"],
         owner_name=row.get("owner_name"),
@@ -47,14 +51,18 @@ def _to_model(row: Mapping[str, Any]) -> Post:
 async def insert(conn: psycopg.AsyncConnection, *, owner_id: int, title: str,
                  body: str, document_id: int | None = None,
                  workspace_id: int | None = None,
+                 quote: str | None = None,
+                 quote_start: int | None = None,
+                 quote_end: int | None = None,
                  visibility: str = "shared") -> Post:
     async with conn.transaction():
         cur = await conn.execute(
             "INSERT INTO post (owner_id, title, body, document_id,"
-            " workspace_id, visibility, created_at)"
-            " VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-            (owner_id, title, body, document_id, workspace_id, visibility,
-             utc_now()))
+            " workspace_id, quote, quote_start, quote_end, visibility,"
+            " created_at)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (owner_id, title, body, document_id, workspace_id, quote,
+             quote_start, quote_end, visibility, utc_now()))
         post_id = (await cur.fetchone())["id"]
     got = await get(conn, post_id)
     assert got is not None

@@ -61,6 +61,25 @@ async def test_chat_grounded_qa(client, db):
                     me["id"]) == 2
 
 
+async def test_chat_synopsis_uses_list_recent(client, db):
+    """A vague 'make a synopsis' ask: the agent surveys the workspace with
+    list_recent (no query) and synthesizes, rather than demanding a document."""
+    src = await insert_source(db, "RBI", tier=1)
+    await insert_doc(db, title="RBI holds repo rate", source_id=src,
+                     text="The RBI kept the repo rate unchanged at 6.5%.")
+    wid = client.post("/api/workspaces", json={"name": "Rates"}).json()["id"]
+
+    _set_llm(client, MockProvider(tool_turns=[
+        tool_turn(("list_recent", {"limit": 10})),
+        tool_turn(("final_answer", {"answer": "This week: the RBI held rates."})),
+    ]))
+    r = _chat(client, wid, "make a synopsis out of it")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["reply"] == "This week: the RBI held rates."
+    assert body["tools_used"] == ["list_recent", "final_answer"]
+
+
 async def test_chat_posts_finding_to_workspace(client, db):
     src = await insert_source(db, "RBI", tier=1)
     doc_id = await insert_doc(db, title="RBI holds repo rate", source_id=src,
@@ -70,9 +89,10 @@ async def test_chat_posts_finding_to_workspace(client, db):
 
     _set_llm(client, MockProvider(tool_turns=[
         tool_turn(("search_workspace", {"query": "repo rate"})),
-        tool_turn(("post_finding", {"title": "Pause likely",
-                                    "body": "Signals a hold.",
-                                    "document_id": doc_id})),
+        tool_turn(("post_finding", {
+            "title": "Pause likely", "body": "Signals a hold.",
+            "document_id": doc_id,
+            "quote": "The RBI kept the repo rate at 6.5%."})),
         tool_turn(("final_answer", {"answer": "Posted a finding."})),
     ]))
     r = _chat(client, wid, "capture a finding")
@@ -81,9 +101,39 @@ async def test_chat_posts_finding_to_workspace(client, db):
     assert body["finding"] is not None
     assert body["finding"]["workspace_id"] == wid
     assert body["finding"]["document_id"] == doc_id
+    # the grounding gate stored the verbatim quote + its char span
+    assert body["finding"]["quote"] == "The RBI kept the repo rate at 6.5%."
+    assert body["finding"]["quote_start"] is not None
     # surfaced by the workspace findings filter
     scoped = client.get("/api/posts", params={"workspace_id": wid}).json()
     assert [p["id"] for p in scoped] == [body["finding"]["id"]]
+
+
+async def test_post_finding_rejects_non_verbatim_quote(client, db):
+    """The grounding gate: a quote that is not a literal substring of the
+    cited document is rejected (is_error), so the agent must retry — agent
+    findings are mechanically grounded, not prompt-hoped."""
+    src = await insert_source(db, "RBI", tier=1)
+    doc_id = await insert_doc(db, title="RBI holds repo rate", source_id=src,
+                              text="The RBI kept the repo rate at 6.5%.")
+    wid = client.post("/api/workspaces", json={
+        "name": "Rates", "query_fts": "repo rate"}).json()["id"]
+
+    _set_llm(client, MockProvider(tool_turns=[
+        # an invented quote that does not appear in the document
+        tool_turn(("post_finding", {
+            "title": "Cut coming", "body": "Rates will fall.",
+            "document_id": doc_id,
+            "quote": "The RBI will slash rates next quarter."})),
+        tool_turn(("final_answer", {"answer": "Could not ground that."})),
+    ]))
+    r = _chat(client, wid, "capture a finding")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # the rejected finding was never persisted
+    assert body["finding"] is None
+    scoped = client.get("/api/posts", params={"workspace_id": wid}).json()
+    assert scoped == []
 
 
 async def test_chat_drafts_a_social_post(client, db):
@@ -172,6 +222,27 @@ async def test_workspace_kb_doc_in_scope_even_outside_focus(container, db):
         workspace=ws, viewer=me, state=state)
     out = await ex._tool_search_workspace({"query": "RBI note"})
     assert kb_doc in {r["document_id"] for r in out["results"]}
+
+
+async def test_list_recent_scoped_newest_first(container, db):
+    """list_recent surveys the workspace lens (no query), newest-first, and
+    excludes docs outside the focus."""
+    me = await ensure_user(db, email="wslr@test.local")
+    src_a = await insert_source(db, "RBI", tier=1)
+    src_b = await insert_source(db, "Other", tier=3)
+    older = await insert_doc(db, title="older in-focus", source_id=src_a,
+                             text="an older RBI note")
+    newer = await insert_doc(db, title="newer in-focus", source_id=src_a,
+                             text="a newer RBI note")
+    off = await insert_doc(db, title="off focus", source_id=src_b,
+                           text="unrelated chatter")
+
+    ex = await _executor(container, db, viewer=me, source_ids=[src_a])
+    out = await ex._tool_list_recent({"limit": 10})
+    ids = [r["document_id"] for r in out["results"]]
+    assert newer in ids and older in ids
+    assert off not in ids               # outside the lens
+    assert ids.index(newer) < ids.index(older)   # newest (higher id) first
 
 
 async def test_search_respects_tenancy(container, db):

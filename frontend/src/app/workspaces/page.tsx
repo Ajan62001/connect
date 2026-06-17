@@ -2,11 +2,18 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { LayoutGridIcon, Loader2Icon, SearchIcon, TagIcon } from "lucide-react";
+import {
+  LayoutGridIcon,
+  Loader2Icon,
+  PlusIcon,
+  SearchIcon,
+  TagIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { EmptyState } from "@/components/shared/EmptyState";
 import { PageHeader } from "@/components/shared/PageHeader";
+import { TopicChooser } from "@/components/workspace/TopicChooser";
 import { QueryError } from "@/components/shared/QueryError";
 import {
   OwnerByline,
@@ -15,12 +22,14 @@ import {
 } from "@/components/shared/Visibility";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
@@ -28,17 +37,16 @@ import type { Visibility } from "@/lib/api";
 import { relativeTime } from "@/lib/format";
 import { useCreateWorkspace, useWorkspaces } from "@/lib/queries";
 
-function splitCsv(value: string): string[] {
-  return value
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
-function Composer() {
+function NewWorkspaceDialog({
+  open,
+  onOpenChange,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
-  const [topics, setTopics] = useState("");
+  const [topics, setTopics] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [visibility, setVisibility] = useState<Visibility>("shared");
   const create = useCreateWorkspace();
@@ -49,7 +57,7 @@ function Composer() {
       {
         name: name.trim(),
         description: description.trim(),
-        topics: splitCsv(topics),
+        topics,
         query_fts: query.trim() || null,
         visibility,
       },
@@ -58,9 +66,10 @@ function Composer() {
           toast.success("Workspace created");
           setName("");
           setDescription("");
-          setTopics("");
+          setTopics([]);
           setQuery("");
           setVisibility("shared");
+          onOpenChange(false);
         },
         onError: (e) =>
           toast.error("Could not create workspace", { description: e.message }),
@@ -69,67 +78,77 @@ function Composer() {
   };
 
   return (
-    <Card className="mb-6">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <LayoutGridIcon className="size-4" />
-          New workspace
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        <Input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="Workspace name (e.g. RBI & Monetary Policy)"
-          maxLength={120}
-        />
-        <Textarea
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          placeholder="What is this workspace about? (optional)"
-          className="min-h-16"
-        />
-        <Input
-          value={topics}
-          onChange={(e) => setTopics(e.target.value)}
-          placeholder="Focus topics, comma-separated (e.g. monetary-policy, banking)"
-        />
-        <Input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Focus search query (optional, e.g. repo rate)"
-        />
-        <VisibilityToggle
-          value={visibility}
-          onChange={setVisibility}
-          kind="workspace"
-        />
-        <Button onClick={submit} disabled={!name.trim() || create.isPending}>
-          {create.isPending ? (
-            <Loader2Icon className="animate-spin" data-icon="inline-start" />
-          ) : null}
-          Create workspace
-        </Button>
-      </CardContent>
-    </Card>
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>New workspace</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-3">
+          <Input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Workspace name (e.g. RBI & Monetary Policy)"
+            maxLength={120}
+            autoFocus
+          />
+          <Textarea
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="What is this workspace about? (optional)"
+            className="min-h-16"
+          />
+          <div className="space-y-1.5">
+            <p className="text-xs font-medium text-muted-foreground">
+              Focus topics — pick any that this workspace should track
+            </p>
+            <TopicChooser value={topics} onChange={setTopics} />
+          </div>
+          <Input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Focus search query (optional, e.g. repo rate)"
+          />
+          <VisibilityToggle
+            value={visibility}
+            onChange={setVisibility}
+            kind="workspace"
+          />
+        </div>
+        <DialogFooter>
+          <Button onClick={submit} disabled={!name.trim() || create.isPending}>
+            {create.isPending ? (
+              <Loader2Icon className="animate-spin" data-icon="inline-start" />
+            ) : null}
+            Create workspace
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
 export default function WorkspacesPage() {
   const workspaces = useWorkspaces();
+  const [createOpen, setCreateOpen] = useState(false);
 
   return (
     <>
       <PageHeader
         title="Workspaces"
-        description="Focused lenses over the news — each with its own feed, findings and posts."
+        description="Focused lenses over the news — each its own assistant, feed, findings and posts."
+        actions={
+          <Button onClick={() => setCreateOpen(true)}>
+            <PlusIcon data-icon="inline-start" />
+            New workspace
+          </Button>
+        }
       />
-      <Composer />
+      <NewWorkspaceDialog open={createOpen} onOpenChange={setCreateOpen} />
 
       {workspaces.isPending ? (
-        <div className="space-y-3">
-          <Skeleton className="h-24 w-full" />
-          <Skeleton className="h-24 w-full" />
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Skeleton className="h-28 w-full" />
+          <Skeleton className="h-28 w-full" />
         </div>
       ) : workspaces.isError ? (
         <QueryError
@@ -140,7 +159,13 @@ export default function WorkspacesPage() {
         <EmptyState
           icon={LayoutGridIcon}
           title="No workspaces yet"
-          description="Create a workspace above to focus the news around a topic."
+          description="Create a workspace to focus the news around a topic — it gets its own assistant, feed and findings."
+          action={
+            <Button onClick={() => setCreateOpen(true)}>
+              <PlusIcon data-icon="inline-start" />
+              New workspace
+            </Button>
+          }
         />
       ) : (
         <div className="grid gap-3 sm:grid-cols-2">

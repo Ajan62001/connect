@@ -14,6 +14,9 @@ over within ``retry_s``). Beat only ENQUEUES, never works:
 | brief pre-gen | 'brief_generate' per user active in the last 7 days     |
 |               | (last_login_at, stamped on login), run_at staggered     |
 |               | over an hour; inactive users stay on-demand.            |
+| due content   | 'content_publish' per scheduled content_item whose      |
+|               | scheduled_at has passed (the partial unique index       |
+|               | dedups a re-enqueue while the publish job runs).        |
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from typing import Any
 import psycopg
 
 from connect.ingestion.poller import is_due
+from connect.storage import content_items as content_item_dao
 from connect.storage import jobs as job_dao
 from connect.storage import sources as source_dao
 from connect.storage.pg import utc_now
@@ -96,7 +100,7 @@ async def tick(services: Any) -> dict[str, int]:
     """One beat pass; returns counters (for tests/logs)."""
     settings = services.settings
     counts = {"requeued": 0, "orphan_failed": 0, "polls": 0,
-              "nightly": 0, "briefs": 0}
+              "nightly": 0, "briefs": 0, "publishes": 0}
     async with services.pool.connection() as conn:
         # 1. orphan sweep — replaces v0.1's startup reconcile_orphans
         requeued, failed = await job_dao.reclaim_stale(
@@ -138,6 +142,12 @@ async def tick(services: Any) -> dict[str, int]:
                     "brief_generate", {"user_id": user_id},
                     delay_s=i * BRIEF_STAGGER_WINDOW_S / len(user_ids))
                 counts["briefs"] += 1
+
+        # 5. due scheduled content -> one 'content_publish' job per item
+        # (the partial unique index dedups a re-enqueue while the job runs)
+        for item_id in await content_item_dao.list_due(conn):
+            await services.jobs.enqueue("content_publish", {"item_id": item_id})
+            counts["publishes"] += 1
     return counts
 
 

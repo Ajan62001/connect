@@ -265,6 +265,7 @@ async def workspace_chat(workspace_id: int, body: WorkspaceChatRequest,
             embedder=container.embedder, vectors=container.vectors,
             workspace=ws, viewer=user.id, messages=wire,
             card_store=container.card_store,
+            logo_store=container.logo_store,
             post_settings=await post_settings.effective(db, ws),
             mode="quick")
     except BudgetExceeded as e:

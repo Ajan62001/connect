@@ -6,12 +6,10 @@ import { useRouter } from "next/navigation";
 import {
   ArrowLeftIcon,
   DatabaseIcon,
-  ImageIcon,
+  FilmIcon,
   LayoutGridIcon,
   Loader2Icon,
-  NotebookPenIcon,
-  PlayIcon,
-  RssIcon,
+  PencilIcon,
   SearchIcon,
   Settings2Icon,
   SparklesIcon,
@@ -26,184 +24,25 @@ import { QueryError } from "@/components/shared/QueryError";
 import { VisibilityBadge } from "@/components/shared/Visibility";
 import { TellStoryButton } from "@/components/story/TellStoryButton";
 import { PostSettingsDialog } from "@/components/workspace/PostSettingsDialog";
-import { WorkspaceSourcesDialog } from "@/components/workspace/WorkspaceSourcesDialog";
+import { WorkspaceContentSheet } from "@/components/workspace/WorkspaceContentSheet";
+import { TopicChooser } from "@/components/workspace/TopicChooser";
 import { WorkspaceChatPanel } from "@/components/workspace/WorkspaceChatPanel";
-import { WorkspaceDrafts } from "@/components/workspace/WorkspaceDrafts";
-import { WorkspaceKnowledgeBase } from "@/components/workspace/WorkspaceKnowledgeBase";
-import { WorkspaceTasks } from "@/components/workspace/WorkspaceTasks";
+import { WorkspaceContextRail } from "@/components/workspace/WorkspaceContextRail";
+import { WorkspaceSourcesDialog } from "@/components/workspace/WorkspaceSourcesDialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
+import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Textarea } from "@/components/ui/textarea";
-import type { Post } from "@/lib/api";
-import { relativeTime } from "@/lib/format";
 import {
-  useCreatePost,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
   useDeleteWorkspace,
-  usePosts,
+  useUpdateWorkspace,
   useWorkspace,
-  useWorkspaceFeed,
 } from "@/lib/queries";
-
-function FocusedFeed({ workspaceId }: { workspaceId: number }) {
-  const [page, setPage] = useState(1);
-  const feed = useWorkspaceFeed(workspaceId, page);
-
-  if (feed.isPending) {
-    return (
-      <div className="space-y-2">
-        <Skeleton className="h-16 w-full" />
-        <Skeleton className="h-16 w-full" />
-      </div>
-    );
-  }
-  if (feed.isError) {
-    return <QueryError error={feed.error} onRetry={() => void feed.refetch()} />;
-  }
-  if (feed.data.total === 0) {
-    return (
-      <EmptyState
-        icon={RssIcon}
-        title="Nothing in focus yet"
-        description="No documents match this workspace's focus. Widen the topics or query, or wait for the feed to fill."
-      />
-    );
-  }
-
-  const { items, total, page: cur, page_size } = feed.data;
-  const hasNext = cur * page_size < total;
-
-  return (
-    <div className="space-y-2">
-      {items.map((doc) => (
-        <Card key={doc.id}>
-          <CardContent className="py-3">
-            <Link
-              href={`/documents/${doc.id}`}
-              className="font-medium hover:underline"
-            >
-              {doc.title ?? "(untitled document)"}
-            </Link>
-            <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-              <span>{doc.source_name ?? "Manual ingest"}</span>
-              <span title={doc.fetched_at}>{relativeTime(doc.fetched_at)}</span>
-            </div>
-          </CardContent>
-        </Card>
-      ))}
-      <div className="flex items-center justify-between pt-1 text-sm text-muted-foreground">
-        <span>{total} in focus</span>
-        <span className="flex gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={cur <= 1}
-            onClick={() => setPage((p) => Math.max(1, p - 1))}
-          >
-            Previous
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={!hasNext}
-            onClick={() => setPage((p) => p + 1)}
-          >
-            Next
-          </Button>
-        </span>
-      </div>
-    </div>
-  );
-}
-
-function FindingComposer({ workspaceId }: { workspaceId: number }) {
-  const [title, setTitle] = useState("");
-  const [body, setBody] = useState("");
-  const create = useCreatePost();
-
-  const submit = () => {
-    if (!title.trim() || !body.trim()) return;
-    create.mutate(
-      { title: title.trim(), body: body.trim(), workspace_id: workspaceId },
-      {
-        onSuccess: () => {
-          toast.success("Finding posted to workspace");
-          setTitle("");
-          setBody("");
-        },
-        onError: (e) =>
-          toast.error("Could not post finding", { description: e.message }),
-      },
-    );
-  };
-
-  return (
-    <div className="space-y-2 rounded-lg border bg-muted/30 p-3">
-      <Input
-        value={title}
-        onChange={(e) => setTitle(e.target.value)}
-        placeholder="Finding headline"
-        maxLength={300}
-      />
-      <Textarea
-        value={body}
-        onChange={(e) => setBody(e.target.value)}
-        placeholder="Your read for this workspace…"
-        className="min-h-20"
-      />
-      <Button
-        size="sm"
-        onClick={submit}
-        disabled={!title.trim() || !body.trim() || create.isPending}
-      >
-        {create.isPending ? (
-          <Loader2Icon className="animate-spin" data-icon="inline-start" />
-        ) : null}
-        Post finding
-      </Button>
-    </div>
-  );
-}
-
-function WorkspaceFindings({ workspaceId }: { workspaceId: number }) {
-  const posts = usePosts({ workspace_id: workspaceId });
-
-  return (
-    <div className="space-y-3">
-      <FindingComposer workspaceId={workspaceId} />
-      {posts.isPending ? (
-        <Skeleton className="h-16 w-full" />
-      ) : posts.isError ? (
-        <QueryError error={posts.error} onRetry={() => void posts.refetch()} />
-      ) : posts.data.length === 0 ? (
-        <p className="text-sm text-muted-foreground">
-          No findings in this workspace yet.
-        </p>
-      ) : (
-        posts.data.map((post: Post) => (
-          <Card key={post.id}>
-            <CardContent className="space-y-1 py-3">
-              <h4 className="text-sm font-medium">{post.title}</h4>
-              <p className="text-sm whitespace-pre-wrap text-muted-foreground">
-                {post.body}
-              </p>
-              {post.document_id ? (
-                <Link
-                  href={`/documents/${post.document_id}`}
-                  className="text-xs text-muted-foreground hover:underline"
-                >
-                  {post.document_title ?? `document #${post.document_id}`}
-                </Link>
-              ) : null}
-            </CardContent>
-          </Card>
-        ))
-      )}
-    </div>
-  );
-}
 
 export default function WorkspacePage({
   params,
@@ -214,9 +53,13 @@ export default function WorkspacePage({
   const workspaceId = Number(id);
   const workspace = useWorkspace(workspaceId);
   const del = useDeleteWorkspace();
+  const updateWs = useUpdateWorkspace(workspaceId);
   const router = useRouter();
   const [postSettingsOpen, setPostSettingsOpen] = useState(false);
+  const [contentOpen, setContentOpen] = useState(false);
   const [sourcesOpen, setSourcesOpen] = useState(false);
+  const [editTopics, setEditTopics] = useState(false);
+  const [draftTopics, setDraftTopics] = useState<string[]>([]);
 
   if (!Number.isFinite(workspaceId)) {
     return (
@@ -228,6 +71,16 @@ export default function WorkspacePage({
     );
   }
 
+  const remove = () =>
+    del.mutate(workspaceId, {
+      onSuccess: () => {
+        toast.success("Workspace deleted");
+        router.push("/workspaces");
+      },
+      onError: (e) =>
+        toast.error("Could not delete", { description: e.message }),
+    });
+
   return (
     <>
       <Button variant="ghost" size="sm" render={<Link href="/workspaces" />}>
@@ -238,7 +91,7 @@ export default function WorkspacePage({
       {workspace.isPending ? (
         <div className="mt-4 space-y-3">
           <Skeleton className="h-10 w-64" />
-          <Skeleton className="h-40 w-full" />
+          <Skeleton className="h-[60vh] w-full" />
         </div>
       ) : workspace.isError ? (
         <QueryError
@@ -251,8 +104,16 @@ export default function WorkspacePage({
             title={workspace.data.name}
             description={workspace.data.description || undefined}
             actions={
-              <span className="flex gap-2">
+              <div className="flex items-center gap-1.5">
                 <TellStoryButton source={{ workspace_id: workspaceId }} />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setContentOpen(true)}
+                >
+                  <FilmIcon data-icon="inline-start" />
+                  Content
+                </Button>
                 <Button
                   variant="outline"
                   size="sm"
@@ -267,34 +128,39 @@ export default function WorkspacePage({
                   onClick={() => setPostSettingsOpen(true)}
                 >
                   <Settings2Icon data-icon="inline-start" />
-                  Post settings
+                  Post style
                 </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() =>
-                    del.mutate(workspaceId, {
-                      onSuccess: () => {
-                        toast.success("Workspace deleted");
-                        router.push("/workspaces");
-                      },
-                      onError: (e) =>
-                        toast.error("Could not delete", {
-                          description: e.message,
-                        }),
-                    })
-                  }
-                >
-                  <Trash2Icon data-icon="inline-start" />
-                  Delete
-                </Button>
-              </span>
+                <Separator orientation="vertical" className="mx-0.5 h-5" />
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label="Delete workspace"
+                        disabled={del.isPending}
+                        onClick={remove}
+                      />
+                    }
+                  >
+                    <Trash2Icon />
+                  </TooltipTrigger>
+                  <TooltipContent>Delete workspace</TooltipContent>
+                </Tooltip>
+              </div>
             }
           />
+
           <PostSettingsDialog
             workspaceId={workspaceId}
             open={postSettingsOpen}
             onOpenChange={setPostSettingsOpen}
+          />
+          <WorkspaceContentSheet
+            workspaceId={workspaceId}
+            name={workspace.data.name}
+            open={contentOpen}
+            onOpenChange={setContentOpen}
           />
           <WorkspaceSourcesDialog
             workspaceId={workspaceId}
@@ -302,69 +168,94 @@ export default function WorkspacePage({
             onOpenChange={setSourcesOpen}
           />
 
-          <div className="mb-4 flex flex-wrap items-center gap-1.5">
-            {workspace.data.topics.map((t) => (
-              <Badge key={t} variant="secondary">
-                <TagIcon className="size-3" />
-                {t}
-              </Badge>
-            ))}
-            {workspace.data.query_fts ? (
-              <Badge variant="outline">
-                <SearchIcon className="size-3" />
-                {workspace.data.query_fts}
-              </Badge>
-            ) : null}
-            <VisibilityBadge visibility={workspace.data.visibility} />
-          </div>
+          {editTopics ? (
+            <div className="mb-3 space-y-2 rounded-lg border bg-muted/30 p-3">
+              <p className="text-xs font-medium text-muted-foreground">
+                Focus topics — pick any this workspace should track
+              </p>
+              <TopicChooser value={draftTopics} onChange={setDraftTopics} />
+              <div className="flex gap-2 pt-1">
+                <Button
+                  size="sm"
+                  disabled={updateWs.isPending}
+                  onClick={() =>
+                    updateWs.mutate(
+                      { topics: draftTopics },
+                      {
+                        onSuccess: () => {
+                          toast.success("Focus topics updated");
+                          setEditTopics(false);
+                        },
+                        onError: (e) =>
+                          toast.error("Could not update", {
+                            description: e.message,
+                          }),
+                      },
+                    )
+                  }
+                >
+                  {updateWs.isPending ? (
+                    <Loader2Icon className="animate-spin" data-icon="inline-start" />
+                  ) : null}
+                  Save topics
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setEditTopics(false)}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div className="mb-3 flex flex-wrap items-center gap-1.5">
+              {workspace.data.topics.length > 0 ? (
+                workspace.data.topics.map((t) => (
+                  <Badge key={t} variant="secondary">
+                    <TagIcon className="size-3" />
+                    {t}
+                  </Badge>
+                ))
+              ) : (
+                <span className="text-xs text-muted-foreground">
+                  No focus topics
+                </span>
+              )}
+              {workspace.data.query_fts ? (
+                <Badge variant="outline">
+                  <SearchIcon className="size-3" />
+                  {workspace.data.query_fts}
+                </Badge>
+              ) : null}
+              <VisibilityBadge visibility={workspace.data.visibility} />
+              <Button
+                size="xs"
+                variant="ghost"
+                onClick={() => {
+                  setDraftTopics(workspace.data.topics);
+                  setEditTopics(true);
+                }}
+              >
+                <PencilIcon data-icon="inline-start" />
+                Edit topics
+              </Button>
+            </div>
+          )}
+
+          <p className="mb-5 flex items-center gap-1.5 text-sm text-muted-foreground">
+            <SparklesIcon className="size-3.5 shrink-0" />
+            A focused lens over the news — the assistant searches and acts only
+            over the documents in focus. Everything else lives in the rail.
+          </p>
 
           <div className="flex flex-col gap-6 lg:flex-row">
-            <section className="min-w-0 flex-1 space-y-6">
-              <div>
-                <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold">
-                  <RssIcon className="size-4" />
-                  Focused feed
-                </h2>
-                <FocusedFeed workspaceId={workspaceId} />
-              </div>
-              <div>
-                <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold">
-                  <DatabaseIcon className="size-4" />
-                  Knowledge base
-                </h2>
-                <WorkspaceKnowledgeBase workspaceId={workspaceId} />
-              </div>
+            <section className="min-w-0 flex-1">
+              <WorkspaceChatPanel workspaceId={workspaceId} hero />
             </section>
-            <section className="w-full shrink-0 space-y-6 lg:w-96">
-              <div>
-                <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold">
-                  <SparklesIcon className="size-4" />
-                  Assistant
-                </h2>
-                <WorkspaceChatPanel workspaceId={workspaceId} />
-              </div>
-              <div>
-                <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold">
-                  <PlayIcon className="size-4" />
-                  Tasks
-                </h2>
-                <WorkspaceTasks workspaceId={workspaceId} />
-              </div>
-              <div>
-                <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold">
-                  <ImageIcon className="size-4" />
-                  Post drafts
-                </h2>
-                <WorkspaceDrafts workspaceId={workspaceId} />
-              </div>
-              <div>
-                <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold">
-                  <NotebookPenIcon className="size-4" />
-                  Findings
-                </h2>
-                <WorkspaceFindings workspaceId={workspaceId} />
-              </div>
-            </section>
+            <aside className="w-full shrink-0 lg:w-[380px]">
+              <WorkspaceContextRail workspaceId={workspaceId} />
+            </aside>
           </div>
         </>
       )}

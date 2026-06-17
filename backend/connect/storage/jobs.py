@@ -54,6 +54,12 @@ def _to_model(row: Mapping[str, Any]) -> Job:
     )
 
 
+# job kinds that dedup against a partial unique index, keyed by a payload
+# field (beat enqueues them blindly on every tick; the index DO-NOTHINGs the
+# duplicate). Each MUST have a matching uq_job_* index in storage/schema.py.
+_DEDUP_KEYS = {"poll_source": "source_id", "content_publish": "item_id"}
+
+
 async def create(conn: psycopg.AsyncConnection, kind: str,
                  payload: dict[str, Any] | None = None,
                  dossier_id: int | None = None, *,
@@ -65,15 +71,16 @@ async def create(conn: psycopg.AsyncConnection, kind: str,
     per-user interactive caps and the ambient spend attribution when a
     worker executes the job.
 
-    ``poll_source`` dedups against the partial unique index (at most one
-    live poll job per source); a deduped enqueue returns the EXISTING live
-    job's id and notifies nobody (the job is already known).
+    ``poll_source`` (keyed by source_id) and ``content_publish`` (keyed by
+    item_id) dedup against their partial unique indexes (at most one live job
+    per key); a deduped enqueue returns the EXISTING live job's id and
+    notifies nobody (the job is already known).
     """
+    dedup_key = _DEDUP_KEYS.get(kind)
     conflict = ""
-    if kind == "poll_source":
-        conflict = (" ON CONFLICT ((payload->>'source_id'))"
-                    " WHERE kind = 'poll_source'"
-                    " AND status IN ('queued','running') DO NOTHING")
+    if dedup_key is not None:
+        conflict = (f" ON CONFLICT ((payload->>'{dedup_key}')) WHERE kind ="
+                    f" '{kind}' AND status IN ('queued','running') DO NOTHING")
     while True:
         async with conn.transaction():
             cur = await conn.execute(
@@ -89,13 +96,13 @@ async def create(conn: psycopg.AsyncConnection, kind: str,
                 await conn.execute("SELECT pg_notify(%s, %s)",
                                    (CHANNEL_JOB_NEW, kind))
                 return int(row["id"])
-        # deduped poll: hand back the live job for this source; if it went
-        # terminal in the window since the conflict, insert again
+        # deduped: hand back the live job for this key; if it went terminal
+        # in the window since the conflict, loop and insert again
         cur = await conn.execute(
-            "SELECT id FROM job WHERE kind = 'poll_source'"
+            f"SELECT id FROM job WHERE kind = '{kind}'"
             " AND status IN ('queued','running')"
-            " AND payload->>'source_id' = %s",
-            (str((payload or {})["source_id"]),))
+            f" AND payload->>'{dedup_key}' = %s",
+            (str((payload or {})[dedup_key]),))
         existing = await cur.fetchone()
         if existing is not None:
             return int(existing["id"])

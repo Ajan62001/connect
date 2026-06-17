@@ -47,14 +47,22 @@ log = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL_MINUTES = 30
 
+# Global floor on automatic polling cadence: no source is auto-polled more
+# often than this regardless of its per-source poll_interval_minutes. Keeps
+# total request volume low (politeness + lower block risk — most CDN blocks
+# are rate-triggered) while individual sources may still elect to poll LESS
+# often (e.g. 360 = 6h). The manual instant-fetch endpoint bypasses is_due
+# entirely, so on-demand polls are never throttled by this floor.
+MIN_POLL_INTERVAL_MINUTES = 180  # 3 hours
+
 
 def is_due(source: Source) -> bool:
     """Is this source due for a poll? (beat's per-tick check; ported intact
     from the v0.1 loop's _is_due)."""
     if source.last_polled_at is None:
         return True
-    interval = int(source.config.get(
-        "poll_interval_minutes", DEFAULT_POLL_INTERVAL_MINUTES))
+    interval = max(MIN_POLL_INTERVAL_MINUTES, int(source.config.get(
+        "poll_interval_minutes", DEFAULT_POLL_INTERVAL_MINUTES)))
     try:
         last = datetime.fromisoformat(
             source.last_polled_at.replace("Z", "+00:00"))

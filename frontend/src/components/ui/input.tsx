@@ -4,6 +4,15 @@ import { Input as InputPrimitive } from "@base-ui/react/input"
 import { cn } from "@/lib/utils"
 
 function Input({ className, type, ...props }: React.ComponentProps<"input">) {
+  // Base UI's Input is a FieldControl: a *controlled* input warns (and Base UI
+  // resets the field) if its `value` flips to null/undefined mid-lifetime —
+  // which happens when a bound value comes from still-loading or sparse data.
+  // If a `value` prop is present (controlled intent), coerce a nullish value
+  // to "" so the input stays controlled. Inputs that omit `value` and rely on
+  // `defaultValue` (uncontrolled) are left untouched.
+  if ("value" in props && props.value == null) {
+    props = { ...props, value: "" }
+  }
   return (
     <InputPrimitive
       type={type}

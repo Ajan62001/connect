@@ -4,7 +4,7 @@ rows, and every seed config validates against its type's model."""
 from __future__ import annotations
 
 from connect.sources.base import parse_source_config
-from connect.sources.seeds import SEED_SOURCES, seed_sources
+from connect.sources.seeds import SEED_SOURCES, repair_sources, seed_sources
 from connect.storage import sources as source_dao
 
 NEW_SEED_NAMES = {
@@ -35,6 +35,69 @@ async def test_seeding_is_idempotent(container, db):
     await source_dao.update(db, gov.id, {"credibility_tier": 2})
     assert await seed_sources(db) == 0
     assert (await source_dao.get(db, gov.id)).credibility_tier == 2
+
+
+async def test_repair_fixes_broken_builtin_sources(container, db):
+    """repair_sources corrects built-in rows still carrying a dead/blocked URL,
+    renames BQ Prime -> NDTV Profit, clears the poll error, is idempotent, and
+    never overwrites a user's own edit."""
+    # simulate an older deploy: drop the corrected seeds, plant the broken ones
+    for name in ("Business Standard — Economy", "NDTV Profit — Markets",
+                 "The Print", "Financial Express", "BQ Prime — Economy"):
+        s = await source_dao.get_by_name(db, name)
+        if s is not None:
+            await source_dao.delete(db, s.id)
+    await source_dao.insert(
+        db, name="Business Standard — Economy", type_="web_news",
+        config={"index_url": "https://www.business-standard.com/economy-policy",
+                "link_pattern": r"x", "poll_interval_minutes": 60},
+        credibility_tier=2)
+    await source_dao.insert(
+        db, name="BQ Prime — Economy", type_="web_news",
+        config={"index_url": "https://www.bqprime.com/economy",
+                "link_pattern": r"x"}, credibility_tier=2)
+    await source_dao.insert(
+        db, name="The Print", type_="rss",
+        config={"feed_url": "https://theprint.in/feed/"}, credibility_tier=2)
+    await source_dao.insert(
+        db, name="Financial Express", type_="rss",
+        config={"feed_url": "https://www.financialexpress.com/feed/"},
+        credibility_tier=2)
+    # a stale poll error that the repair should clear
+    await db.execute(
+        "UPDATE source SET last_poll_status = 'error: HTTP 403'"
+        " WHERE name = 'The Print'")
+
+    assert await repair_sources(db) == 4
+
+    bs = await source_dao.get_by_name(db, "Business Standard — Economy")
+    assert bs.type == "rss" and "economy-102.rss" in bs.config["feed_url"]
+
+    # BQ Prime is renamed to NDTV Profit and repointed at the working feed
+    assert await source_dao.get_by_name(db, "BQ Prime — Economy") is None
+    ndtv = await source_dao.get_by_name(db, "NDTV Profit — Markets")
+    assert ndtv is not None and ndtv.type == "rss"
+    assert "ndtvprofit.com/rss" in ndtv.config["feed_url"]
+
+    tp = await source_dao.get_by_name(db, "The Print")
+    assert "category/economy/feed" in tp.config["feed_url"]
+    assert tp.last_poll_status is None  # error cleared so the UI recovers
+
+    fe = await source_dao.get_by_name(db, "Financial Express")
+    assert fe.type == "web_news"
+    assert "economy" in fe.config["index_url"]
+
+    # idempotent: nothing left to repair
+    assert await repair_sources(db) == 0
+
+    # a user edit is never clobbered: a row whose feed_url is not the known
+    # broken value is left untouched
+    await source_dao.update(
+        db, tp.id, {"config": {"feed_url": "https://theprint.in/category/"
+                                           "india/feed/"}})
+    assert await repair_sources(db) == 0
+    again = await source_dao.get_by_name(db, "The Print")
+    assert again.config["feed_url"] == "https://theprint.in/category/india/feed/"
 
 
 async def test_twitter_seed_rows(container, db):

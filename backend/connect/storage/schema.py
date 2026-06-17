@@ -65,7 +65,7 @@ class StorageVersionError(StorageError):
 # PostgreSQL baseline schema (v0.2, the canonical DDL) — fresh lineage, v1.
 # ==============================================================================
 
-PG_SCHEMA_VERSION = 15
+PG_SCHEMA_VERSION = 18
 
 # Extensions first: the compose image is pgvector/pgvector:pg17, so both are
 # present; IF NOT EXISTS keeps re-entry harmless.
@@ -767,6 +767,11 @@ _PG_DDL_JOB_INDEXES = (
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_poll_source"
     " ON job ((payload->>'source_id'))"
     " WHERE kind = 'poll_source' AND status IN ('queued','running')",
+    # dedup: at most one LIVE publish job per content item (beat enqueues
+    # blindly on every due-scan tick; the ON CONFLICT targets this index)
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_publish_item"
+    " ON job ((payload->>'item_id'))"
+    " WHERE kind = 'content_publish' AND status IN ('queued','running')",
 )
 
 # seq: identity values are allocated at INSERT, not commit — globally, a
@@ -961,6 +966,91 @@ CREATE TABLE IF NOT EXISTS social_draft (
 _PG_DDL_SOCIAL_DRAFT_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_social_draft_workspace"
     " ON social_draft(workspace_id, created_at DESC)",
+)
+
+# Social content pipeline (v16). A `campaign` is one generation run for a
+# corpus subject (a story-mode dossier, a story thread, an investigation, a
+# workspace, or a free topic — `seed` round-trips a ContentSeed). It produces
+# `content_item` rows: the review-queue units. Owned + shared/private like
+# dossiers; the generation job streams job_event (same SSE contract).
+_PG_DDL_CAMPAIGN = f"""
+CREATE TABLE IF NOT EXISTS campaign (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    owner_id    bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    subject     text NOT NULL,
+    input_type  text NOT NULL,
+    seed        jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    formats     jsonb NOT NULL DEFAULT '[]'::jsonb,
+    options     jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    status      text NOT NULL DEFAULT 'pending'
+                CONSTRAINT ck_campaign_status
+                CHECK (status IN {E.sql_in(E.CAMPAIGN_STATUSES)}),
+    visibility  text NOT NULL DEFAULT 'shared'
+                CONSTRAINT ck_campaign_visibility
+                CHECK (visibility IN {E.sql_in(E.VISIBILITIES)}),
+    error       text,
+    created_at  timestamptz NOT NULL,
+    started_at  timestamptz,
+    finished_at timestamptz
+)"""
+
+_PG_DDL_CAMPAIGN_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_campaign_owner"
+    " ON campaign(owner_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_campaign_visibility"
+    " ON campaign(visibility, created_at DESC)",
+)
+
+# One review-queue unit. `content` is the format-specific payload (an
+# IGCardContent / CarouselContent / ThreadContent / LinkedInContent); `sources`
+# is the resolved closed-menu citation list (trust preserved in-app even where
+# the platform text cannot render markers); `card_shas` are rendered image
+# cards in the social card store ([] for text formats).
+_PG_DDL_CONTENT_ITEM = f"""
+CREATE TABLE IF NOT EXISTS content_item (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    campaign_id  bigint NOT NULL REFERENCES campaign(id) ON DELETE CASCADE,
+    owner_id     bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    platform     text NOT NULL CONSTRAINT ck_content_item_platform
+                 CHECK (platform IN {E.sql_in(E.CONTENT_PLATFORMS)}),
+    format       text NOT NULL CONSTRAINT ck_content_item_format
+                 CHECK (format IN {E.sql_in(E.CONTENT_FORMATS)}),
+    status       text NOT NULL DEFAULT 'draft'
+                 CONSTRAINT ck_content_item_status
+                 CHECK (status IN {E.sql_in(E.CONTENT_ITEM_STATUSES)}),
+    content      jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    sources      jsonb NOT NULL DEFAULT '[]'::jsonb,
+    grounding    jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    card_shas    jsonb NOT NULL DEFAULT '[]'::jsonb,
+    visibility   text NOT NULL DEFAULT 'shared'
+                 CONSTRAINT ck_content_item_visibility
+                 CHECK (visibility IN {E.sql_in(E.VISIBILITIES)}),
+    edited       boolean NOT NULL DEFAULT false,
+    scheduled_at timestamptz,
+    published_at timestamptz,
+    publish_ref  jsonb,
+    error        text,
+    created_at   timestamptz NOT NULL,
+    updated_at   timestamptz
+)"""
+
+_PG_DDL_CONTENT_ITEM_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_content_item_campaign"
+    " ON content_item(campaign_id, id)",
+    "CREATE INDEX IF NOT EXISTS idx_content_item_queue"
+    " ON content_item(owner_id, status, created_at DESC)",
+    # the beat due-scan: scheduled items whose time has come
+    "CREATE INDEX IF NOT EXISTS idx_content_item_due"
+    " ON content_item(scheduled_at) WHERE status = 'scheduled'",
+)
+
+# the v15->v16 migration replays exactly this (tables before their indexes,
+# campaign before content_item which FKs it).
+_PG_DDL_CAMPAIGN_DDL: tuple[str, ...] = (
+    _PG_DDL_CAMPAIGN,
+    *_PG_DDL_CAMPAIGN_INDEXES,
+    _PG_DDL_CONTENT_ITEM,
+    *_PG_DDL_CONTENT_ITEM_INDEXES,
 )
 
 # Long-running workspace-agent tasks (v12): the async "run a task" mode. The
@@ -1180,6 +1270,7 @@ PG_DDL: tuple[str, ...] = (
     *_PG_DDL_WORKSPACE_CHAT_INDEXES,
     _PG_DDL_SOCIAL_DRAFT,
     *_PG_DDL_SOCIAL_DRAFT_INDEXES,
+    *_PG_DDL_CAMPAIGN_DDL,
     # NOTE: workspace_task (v12) was dropped at v14 — deep runs are now async
     # chat jobs streaming job_event; _PG_DDL_WORKSPACE_TASK is retained only
     # for the historical v11->v12 migration and is NOT in the fresh baseline.

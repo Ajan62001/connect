@@ -3,6 +3,12 @@ import * as React from "react"
 import { cn } from "@/lib/utils"
 
 function Textarea({ className, ...props }: React.ComponentProps<"textarea">) {
+  // Same controlled→uncontrolled guard as Input: if a `value` prop is present
+  // (controlled), never let it be null/undefined, or React warns and the field
+  // silently goes uncontrolled. Uncontrolled (defaultValue) usage is untouched.
+  if ("value" in props && props.value == null) {
+    props = { ...props, value: "" }
+  }
   return (
     <textarea
       data-slot="textarea"

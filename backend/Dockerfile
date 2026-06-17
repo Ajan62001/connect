@@ -23,6 +23,10 @@ COPY pyproject.toml ./
 # legacy builder as well as BuildKit)
 RUN python -c "import tomllib; deps = tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']; open('/tmp/requirements.txt', 'w').write('\n'.join(deps) + '\n')" \
     && pip install -r /tmp/requirements.txt
+# Optional reel-narration TTS (connect/social/tts.py). `|| true`: a flaky
+# piper wheel must never fail the build — the runtime import is guarded and
+# falls back to silent reels.
+RUN pip install piper-tts || true
 
 # --- runtime ------------------------------------------------------------------
 FROM python:3.12-slim
@@ -36,7 +40,15 @@ ENV PATH="/opt/venv/bin:$PATH" \
     FASTEMBED_CACHE_PATH=/opt/fastembed \
     # default blob root inside containers; compose mounts the shared
     # `blobs` volume here for api (uploads) and workers (ingest)
-    CONNECT_BLOB_DIR=/data/blobs
+    CONNECT_BLOB_DIR=/data/blobs \
+    # baked Piper voice for reel narration (connect/social/tts.py); absent
+    # voice => silent reels, so this is a quality bake, not a hard dep
+    CONNECT_PIPER_VOICE_DIR=/opt/piper
+
+# ffmpeg is required to assemble reel videos (slim image lacks it).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
 
@@ -44,10 +56,15 @@ COPY --from=builder /opt/venv /opt/venv
 # until the venv layer changes.
 RUN python -c "from fastembed import TextEmbedding; TextEmbedding('BAAI/bge-small-en-v1.5')"
 
+# Bake the Piper voice model (~60MB). `|| true`: a flaky voice host must not
+# fail the build — a cold container then just renders silent reels.
+RUN python -m piper.download_voices en_US-lessac-medium --download-dir /opt/piper || true
+
 # Non-root runtime user; owns the model cache (fastembed touches lock
 # files next to the model) and the blob root (overlaid by the volume).
 RUN useradd --create-home --uid 1000 connect \
     && chown -R connect:connect /opt/fastembed \
+    && mkdir -p /opt/piper && chown -R connect:connect /opt/piper \
     && mkdir -p /data/blobs \
     && chown -R connect:connect /data
 

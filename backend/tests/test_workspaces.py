@@ -9,6 +9,16 @@ from connect.storage import workspaces as workspace_dao
 from connect.storage.pg import utc_now
 
 
+def test_topics_vocabulary(client, anon_client):
+    """The controlled topic vocabulary the workspace focus is chosen from."""
+    topics = client.get("/api/topics").json()
+    assert isinstance(topics, list)
+    assert {"monetary-policy", "elections", "banking"} <= set(topics)
+    assert len(topics) >= 20
+    # authed only
+    assert anon_client.get("/api/topics").status_code in (401, 403)
+
+
 def test_workspace_crud_lifecycle(client):
     r = client.post("/api/workspaces", json={
         "name": "RBI & Monetary Policy",
@@ -76,6 +86,28 @@ async def test_focused_feed_filters_by_source_topic_and_query(client, db):
     feed = client.get(f"/api/workspaces/{ws.id}/feed").json()
     ids = {item["id"] for item in feed["items"]}
     assert {on_source, on_topic, on_query} <= ids
+    assert off not in ids
+
+
+async def test_focused_feed_custom_topic_matches_full_text(client, db):
+    """A custom (non-vocabulary) topic has no document_topic tag, so it must
+    filter the feed via full-text search instead — otherwise user-defined
+    topics would be inert labels."""
+    src = await insert_source(db, "PIB", tier=1)
+    on_custom = await insert_doc(
+        db, title="PM foreign trip itinerary",
+        source_id=src, text="the prime minister foreign trip to Japan")
+    off = await insert_doc(db, title="Cricket scores", source_id=src,
+                           text="unrelated sports content")
+
+    me = client.get("/api/me").json()
+    # "foreign trip" is not in T1_TOPICS -> treated as a free-text focus term
+    ws = await workspace_dao.insert(
+        db, owner_id=me["id"], name="Travels", topics=["foreign trip"])
+
+    feed = client.get(f"/api/workspaces/{ws.id}/feed").json()
+    ids = {item["id"] for item in feed["items"]}
+    assert on_custom in ids
     assert off not in ids
 
 

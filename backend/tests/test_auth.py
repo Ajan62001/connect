@@ -288,10 +288,12 @@ def test_garbage_cookie_is_401(anon_client):
 
 # --- whole-surface 401 sweep --------------------------------------------------------
 
-# /api/social/card/{sha}.jpg is intentionally public — Instagram's servers
-# fetch the rendered card image unauthenticated (served only from the
-# dedicated card store, keyed by an unguessable content sha).
-_OPEN_PATHS = {"/api/health", "/api/social/card/{sha}.jpg"}
+# /api/social/card/{sha}.jpg, /logo/{sha}.png and /reel/{sha}.mp4 are
+# intentionally public — Instagram's servers fetch the rendered card / brand
+# logo / reel video unauthenticated (served only from the dedicated stores,
+# keyed by an unguessable content sha).
+_OPEN_PATHS = {"/api/health", "/api/social/card/{sha}.jpg",
+               "/api/social/logo/{sha}.png", "/api/social/reel/{sha}.mp4"}
 _PARAM_VALUES = {"email": "x@example.com", "brief_date": "2026-01-01",
                  "topic": "markets"}
 

@@ -25,7 +25,7 @@ import socket
 import time
 import urllib.robotparser
 from dataclasses import dataclass
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 from psycopg_pool import AsyncConnectionPool
@@ -38,6 +38,13 @@ log = logging.getLogger(__name__)
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+# curl_cffi impersonation profile used for the 403 fallback (see
+# _impersonated_fetch). Some CDNs (Akamai bot-defense on Moneycontrol,
+# Business Standard) block on the TLS/JA3 fingerprint of a plain httpx
+# client regardless of the User-Agent; replaying a real Chrome handshake
+# clears them. Verified June 2026.
+_IMPERSONATE_PROFILE = "chrome"
 
 _ROBOTS_TTL = 3600.0        # shared robots_cache row TTL (seconds)
 _ROBOTS_LOCAL_TTL = 300.0   # in-process parser cache on top of the row
@@ -124,14 +131,17 @@ class Fetcher:
                  timeout_seconds: float = 30.0,
                  max_bytes: int = 10 * 1024 * 1024,
                  retries: int = 2,
-                 respect_robots: bool = True):
+                 respect_robots: bool = True,
+                 impersonate_on_403: bool = True):
         self.user_agent = user_agent
         self.per_domain_interval = per_domain_interval
         self.timeout_seconds = timeout_seconds
         self.max_bytes = max_bytes
         self.retries = retries
         self.respect_robots = respect_robots
+        self.impersonate_on_403 = impersonate_on_403
         self._client: httpx.AsyncClient | None = None
+        self._imp_session = None  # lazy curl_cffi AsyncSession for 403 fallback
         self._pool: AsyncConnectionPool | None = None
         self._domain_locks: dict[str, asyncio.Lock] = {}
         self._domain_next: dict[str, float] = {}
@@ -166,6 +176,9 @@ class Fetcher:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+        if self._imp_session is not None:
+            await self._imp_session.close()
+            self._imp_session = None
 
     # -- politeness ------------------------------------------------------------
 
@@ -293,6 +306,14 @@ class Fetcher:
         async with client.stream("GET", url) as resp:
             if resp.status_code >= 500:
                 raise FetchError(f"server error {resp.status_code}")
+            if resp.status_code == 403 and self.impersonate_on_403:
+                # Likely a CDN bot-defence block on our TLS fingerprint, not a
+                # real authz denial — replay a genuine Chrome handshake before
+                # giving up (Akamai on Moneycontrol / Business Standard).
+                imp = await self._impersonated_fetch(url)
+                if imp is not None:
+                    return imp
+                raise FetchTerminal(url, 403)
             if resp.status_code >= 400:
                 # 4xx is terminal — retrying won't help
                 raise FetchTerminal(url, resp.status_code)
@@ -311,6 +332,67 @@ class Fetcher:
                 content=b"".join(chunks),
                 content_type=resp.headers.get("content-type", ""),
             )
+
+    async def _impersonated_fetch(self, url: str) -> FetchResult | None:
+        """403 fallback: re-fetch ``url`` replaying a real Chrome TLS/JA3
+        fingerprint via curl_cffi, which clears CDN bot-defence blocks that
+        key on the handshake rather than the User-Agent.
+
+        Returns a FetchResult on a clean <400 response, or None if the block
+        persists / the fallback is unavailable — the caller then surfaces the
+        original 403. SSRF discipline is preserved: redirects are followed
+        manually with a private/reserved host check on every hop (curl_cffi
+        bypasses the httpx SsrfGuardTransport), and the byte cap is enforced
+        on the materialised body.
+        """
+        try:
+            from curl_cffi.requests import AsyncSession
+        except ImportError:
+            log.warning("curl_cffi not installed; cannot retry 403 for %s", url)
+            return None
+
+        if self._imp_session is None:
+            self._imp_session = AsyncSession()
+
+        current = url
+        for _ in range(4):  # cap redirect hops, like a browser would
+            if await _host_is_blocked(urlsplit(current).hostname):
+                raise FetchBlocked(
+                    f"refusing to fetch internal/reserved host: "
+                    f"{urlsplit(current).hostname!r}")
+            try:
+                resp = await self._imp_session.get(
+                    current,
+                    impersonate=_IMPERSONATE_PROFILE,
+                    timeout=self.timeout_seconds,
+                    allow_redirects=False,
+                )
+            except FetchBlocked:
+                raise
+            except Exception as e:  # curl_cffi transport/timeout errors
+                log.info("impersonated fetch failed for %s: %s", current, e)
+                return None
+
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("location")
+                if not location:
+                    return None
+                current = urljoin(current, location)
+                continue
+            if resp.status_code >= 400:
+                return None  # block persists — surface the original 403
+            if len(resp.content) > self.max_bytes:
+                raise FetchTooLarge(
+                    f"{current} exceeded {self.max_bytes} bytes")
+            log.info("impersonated fetch cleared block for %s", url)
+            return FetchResult(
+                url=url,
+                final_url=current,
+                status_code=resp.status_code,
+                content=resp.content,
+                content_type=resp.headers.get("content-type", ""),
+            )
+        return None  # too many redirects
 
 
 class FetchTerminal(FetchError):

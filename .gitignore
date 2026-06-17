@@ -15,6 +15,7 @@ backend/data/
 # Node / Next.js
 node_modules/
 .next/
+.next-papers/
 out/
 *.tsbuildinfo
 npm-debug.log*
@@ -26,3 +27,6 @@ npm-debug.log*
 
 # OS / editor
 .DS_Store
+
+# Claude Code local machine settings (may contain secrets)
+.claude/settings.local.json

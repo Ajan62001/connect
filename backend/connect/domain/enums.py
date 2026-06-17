@@ -109,8 +109,56 @@ FINDING_KINDS = (
 JOB_KINDS = (
     "poll_source", "backfill_source", "ingest_url", "analysis",
     "enrich_t1_sync", "enrich_t1_batch", "enrich_t2", "reverify_claim",
-    "brief_generate", "investigation", "workspace_task", "story")
+    "brief_generate", "investigation", "workspace_task", "story",
+    "content_generate", "content_publish", "content_render")
 JOB_STATUSES = ("queued", "running", "done", "failed", "cancelled")
+
+# --- social post card theme ------------------------------------------------
+# How the rendered Instagram card looks. Templates are layout variants; the
+# colors/size/align are honoured by every template (connect/social/card.py).
+
+CARD_TEMPLATES = ("classic", "bold", "minimal")
+CardTemplate = Literal["classic", "bold", "minimal"]
+
+HEADLINE_SIZES = ("s", "m", "l")
+HeadlineSize = Literal["s", "m", "l"]
+
+HEADLINE_ALIGNS = ("left", "center")
+HeadlineAlign = Literal["left", "center"]
+
+
+# --- social content pipeline (v16) -----------------------------------------
+# A campaign turns one corpus subject into a batch of grounded social-content
+# items that flow through a review queue (draft -> approved -> scheduled ->
+# published) to platform publishing. Formats double as LLM output schemas.
+
+CONTENT_PLATFORMS = ("instagram", "x", "linkedin")
+ContentPlatform = Literal["instagram", "x", "linkedin"]
+
+CONTENT_FORMATS = ("ig_card", "ig_carousel", "x_thread", "linkedin_post",
+                   "ig_reel")
+ContentFormat = Literal["ig_card", "ig_carousel", "x_thread", "linkedin_post",
+                        "ig_reel"]
+
+# which platform each format publishes to (single source of truth)
+CONTENT_FORMAT_PLATFORM = {
+    "ig_card": "instagram",
+    "ig_carousel": "instagram",
+    "x_thread": "x",
+    "linkedin_post": "linkedin",
+    "ig_reel": "instagram",
+}
+
+CAMPAIGN_STATUSES = ("pending", "running", "completed", "failed", "cancelled")
+CampaignStatus = Literal[
+    "pending", "running", "completed", "failed", "cancelled"]
+
+# content_item lifecycle: drafts the pipeline produced -> human review ->
+# scheduled -> published by beat (or rejected / failed).
+CONTENT_ITEM_STATUSES = (
+    "draft", "approved", "scheduled", "published", "rejected", "failed")
+ContentItemStatus = Literal[
+    "draft", "approved", "scheduled", "published", "rejected", "failed"]
 
 # --- watches / consumption -------------------------------------------------
 

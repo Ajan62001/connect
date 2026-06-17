@@ -11,6 +11,7 @@ dependencies = [
     "fastapi",
     "uvicorn[standard]",
     "httpx",
+    "curl_cffi",
     "trafilatura",
     "pymupdf",
     "feedparser",
@@ -38,6 +39,12 @@ dependencies = [
 dev = [
     "pytest",
     "pytest-asyncio",
+]
+# Optional local TTS for reel narration. Absent => reels render silently
+# (see connect/social/tts.py). Kept out of base deps so the default install
+# stays lean; the Docker image installs it and bakes a voice model.
+tts = [
+    "piper-tts",
 ]
 
 [tool.setuptools.packages.find]

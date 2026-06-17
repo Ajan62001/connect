@@ -13,12 +13,37 @@ from typing import Any, Iterable, Mapping
 
 import psycopg
 
+from connect.domain.enums import T1_TOPICS
 from connect.domain.models import DocumentListItem, Workspace
 from connect.storage import documents as doc_dao
 from connect.storage.pg import Jsonb, utc_now
 
 # viewer-scoped visibility: shared workspaces, or the viewer's own private ones.
 VISIBLE_SQL = "(w.visibility = 'shared' OR w.owner_id = %s)"
+
+
+def topic_focus_clauses(topics: Iterable[str]) -> tuple[list[str], list[Any]]:
+    """Focus SQL for a workspace's topics, as (clause_fragments, params) to be
+    OR-ed into a document focus clause (the ``d`` alias must be in scope).
+
+    Controlled-vocabulary topics (``T1_TOPICS``) match ``document_topic`` tags
+    exactly — that's what enrichment writes. Custom free-text topics have no
+    tag, so they match the full-text index instead (like ``query_fts``), so a
+    user-defined topic actually filters the feed rather than being an inert
+    label. Shared by ``focused_feed`` and the workspace agent's retrieval so
+    the two lenses can't drift apart."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    vocab = [t for t in topics if t in T1_TOPICS]
+    custom = [t for t in topics if t not in T1_TOPICS]
+    if vocab:
+        clauses.append("EXISTS (SELECT 1 FROM document_topic dt"
+                       " WHERE dt.document_id = d.id AND dt.topic = ANY(%s))")
+        params.append(vocab)
+    for t in custom:
+        clauses.append("d.search_tsv @@ websearch_to_tsquery('english', %s)")
+        params.append(t)
+    return clauses, params
 
 _SELECT = """
 SELECT w.id, w.name, w.description, w.topics, w.source_ids, w.query_fts,
@@ -147,9 +172,9 @@ async def focused_feed(conn: psycopg.AsyncConnection, workspace: Workspace, *,
         focus.append("d.source_id = ANY(%s)")
         params.append([int(s) for s in workspace.source_ids])
     if workspace.topics:
-        focus.append("EXISTS (SELECT 1 FROM document_topic dt"
-                     " WHERE dt.document_id = d.id AND dt.topic = ANY(%s))")
-        params.append(list(workspace.topics))
+        tclauses, tparams = topic_focus_clauses(workspace.topics)
+        focus.extend(tclauses)
+        params.extend(tparams)
     if workspace.query_fts:
         focus.append("d.search_tsv @@ websearch_to_tsquery('english', %s)")
         params.append(workspace.query_fts)

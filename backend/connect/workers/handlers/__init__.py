@@ -8,6 +8,7 @@ from connect.workers.handlers import (  # noqa: F401 — registration imports
     analysis,
     backfill,
     brief,
+    content,
     enrichment,
     investigation,
     poll,

@@ -1,4 +1,4 @@
-"""The contradiction ledger surface — filterable list + dismiss."""
+"""The contradiction ledger surface — filterable list + detail + dismiss."""
 
 from __future__ import annotations
 
@@ -8,8 +8,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 import psycopg
 
-from connect.api.deps import get_db
-from connect.domain.models import ContradictionItem, ContradictionPage
+from connect.api.deps import get_current_user, get_db
+from connect.domain.models import (
+    ContradictionDetail,
+    ContradictionItem,
+    ContradictionPage,
+    CurrentUser,
+)
 from connect.knowledge import contradictions
 
 router = APIRouter(prefix="/contradictions", tags=["contradictions"])
@@ -28,6 +33,20 @@ async def list_contradictions(
         db, status=status, page=page, page_size=page_size)
     return ContradictionPage(items=items, total=total, page=page,
                              page_size=page_size)
+
+
+@router.get("/{contradiction_id}", response_model=ContradictionDetail)
+async def get_contradiction(contradiction_id: int,
+                            db: psycopg.AsyncConnection = Depends(get_db),
+                            user: CurrentUser = Depends(get_current_user)):
+    """One contradiction row plus the per-stance evidence quotes the caller
+    may see (the two-column expand view)."""
+    detail = await contradictions.get_detail(db, contradiction_id,
+                                             viewer=user.id)
+    if detail is None:
+        raise HTTPException(status_code=404,
+                            detail="contradiction not found")
+    return detail
 
 
 @router.post("/{contradiction_id}/dismiss",

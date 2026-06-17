@@ -110,6 +110,7 @@ export function matchesDossierScope(
 
 export type SourceType =
   | "rss"
+  | "web_news"
   | "twitter"
   | "telegram"
   | "scrape"
@@ -1953,19 +1954,78 @@ export interface WorkspaceUpdate {
   post_settings?: Record<string, unknown>;
 }
 
+/** The controlled topic vocabulary a workspace's focus is chosen from. */
+export function getTopics(): Promise<string[]> {
+  return request<string[]>("/api/topics");
+}
+
 /** How posts are generated (global default, overridable per workspace). */
+export type CardTemplate = "classic" | "bold" | "minimal";
+export type HeadlineSize = "s" | "m" | "l";
+export type HeadlineAlign = "left" | "center";
+
 export interface PostSettings {
   tone: string;
   hashtag_count: number;
   brand_handle: string;
   caption_max_chars: number;
   default_visibility: Visibility;
+  card_bg: string;
+  card_text: string;
+  card_muted: string;
   card_accent: string;
+  card_template: CardTemplate;
+  headline_size: HeadlineSize;
+  headline_align: HeadlineAlign;
   sign_off: string;
+  logo_sha: string | null;
+  auto_theme: boolean;
+  topic_palettes: Record<string, string>;
+}
+
+export interface Palette {
+  card_bg: string;
+  card_text: string;
+  card_muted: string;
+  card_accent: string;
+  card_template: CardTemplate;
+}
+
+export interface PaletteCatalog {
+  palettes: Record<string, Palette>;
+  topic_defaults: Record<string, string>;
+  topics: string[];
+}
+
+export function getPostPalettes(): Promise<PaletteCatalog> {
+  return request<PaletteCatalog>("/api/social/palettes");
 }
 
 export function getWorkspacePostSettings(id: number): Promise<PostSettings> {
   return request<PostSettings>(`/api/workspaces/${id}/post-settings`);
+}
+
+/** Render a sample card with these settings (no LLM); returns an object URL
+ * the caller must revoke. Drives the live style preview. */
+export async function previewPostCard(settings: PostSettings): Promise<string> {
+  let res: Response;
+  try {
+    res = await fetch("/api/social/preview", jsonInit("POST", settings));
+  } catch {
+    throw new ApiError(0, "Backend unreachable");
+  }
+  if (!res.ok) await raise(res);
+  return URL.createObjectURL(await res.blob());
+}
+
+/** Upload a brand logo; returns its sha for PostSettings.logo_sha. */
+export function uploadPostLogo(file: File): Promise<{ logo_sha: string }> {
+  const form = new FormData();
+  form.append("file", file);
+  return request<{ logo_sha: string }>("/api/social/logo", {
+    method: "POST",
+    body: form,
+  });
 }
 
 /** A social-post draft the workspace agent generated. */
@@ -2716,4 +2776,218 @@ export async function getAdminSpend(days = 7): Promise<AdminSpend> {
       .map(decodeAdminSpendUser)
       .filter((user): user is AdminSpendUser => user !== null),
   };
+}
+
+// --- content pipeline (campaigns -> review queue -> publish) ----------------
+
+export type ContentFormat =
+  | "ig_card"
+  | "ig_carousel"
+  | "x_thread"
+  | "linkedin_post"
+  | "ig_reel";
+
+export type ContentItemStatus =
+  | "draft"
+  | "approved"
+  | "scheduled"
+  | "published"
+  | "rejected"
+  | "failed";
+
+/** Grounding telemetry for a generated item (how many cited menu items, etc.). */
+export interface ContentGrounding {
+  menu_size?: number;
+  cited_count?: number;
+  stripped_markers?: string[];
+  regenerated?: boolean;
+  edited?: boolean;
+}
+
+export interface ContentItem {
+  id: number;
+  campaign_id: number;
+  platform: string;
+  format: ContentFormat;
+  status: ContentItemStatus;
+  content: Record<string, unknown>;
+  sources: StorySource[];
+  grounding: ContentGrounding;
+  card_shas: string[];
+  scheduled_at: string | null;
+  published_at: string | null;
+  publish_ref: Record<string, unknown> | null;
+  error: string | null;
+  edited: boolean;
+  created_at: string;
+}
+
+export interface CampaignListItem {
+  id: number;
+  subject: string;
+  input_type: string;
+  status: string;
+  formats: string[];
+  item_count: number;
+  created_at: string;
+}
+
+export interface CampaignDetail {
+  id: number;
+  subject: string;
+  input_type: string;
+  status: string;
+  formats: string[];
+  error: string | null;
+  items: ContentItem[];
+  created_at: string;
+}
+
+export interface CampaignAccepted {
+  campaign_id: number;
+  job_id: number;
+}
+
+export interface CampaignCreate {
+  topic?: string;
+  story_dossier_id?: number;
+  investigation_id?: number;
+  workspace_id?: number;
+  story_id?: number;
+  formats: ContentFormat[];
+  options?: ReelOptions;
+}
+
+/** All content formats, in display order (mirrors backend CONTENT_FORMATS). */
+export const CONTENT_FORMATS: { value: ContentFormat; label: string }[] = [
+  { value: "ig_reel", label: "Instagram Reel" },
+  { value: "ig_card", label: "Instagram Card" },
+  { value: "ig_carousel", label: "Instagram Carousel" },
+  { value: "x_thread", label: "X Thread" },
+  { value: "linkedin_post", label: "LinkedIn Post" },
+];
+
+export const reelUrl = (sha: string) => `/api/social/reel/${sha}.mp4`;
+export const cardUrl = (sha: string) => `/api/social/card/${sha}.jpg`;
+
+export function createCampaign(body: CampaignCreate): Promise<CampaignAccepted> {
+  return request<CampaignAccepted>("/api/campaigns", jsonInit("POST", body));
+}
+
+export function listCampaigns(
+  workspaceId?: number,
+): Promise<{ items: CampaignListItem[]; total: number }> {
+  const query = workspaceId ? qs({ workspace_id: workspaceId }) : "";
+  return request<{ items: CampaignListItem[]; total: number }>(`/api/campaigns${query}`);
+}
+
+export function getCampaign(id: number): Promise<CampaignDetail> {
+  return request<CampaignDetail>(`/api/campaigns/${id}`);
+}
+
+export function approveContent(id: number): Promise<ContentItem> {
+  return request<ContentItem>(`/api/content/${id}/approve`, jsonInit("POST", {}));
+}
+
+export function rejectContent(id: number): Promise<ContentItem> {
+  return request<ContentItem>(`/api/content/${id}/reject`, jsonInit("POST", {}));
+}
+
+export function scheduleContent(id: number, scheduled_at: string): Promise<ContentItem> {
+  return request<ContentItem>(
+    `/api/content/${id}/schedule`,
+    jsonInit("POST", { scheduled_at }),
+  );
+}
+
+export function publishContent(
+  id: number,
+  target: "direct" | "zapier" = "direct",
+): Promise<JobAccepted> {
+  const query = target === "zapier" ? qs({ target }) : "";
+  return request<JobAccepted>(`/api/content/${id}/publish${query}`, jsonInit("POST", {}));
+}
+
+/** Hand-edit a draft's payload (any format). Replaces the whole content object;
+ * the server flags it edited. For image/video formats, follow with a re-render
+ * so the rendered media reflects the edit. */
+export function editContent(
+  id: number,
+  content: Record<string, unknown>,
+): Promise<ContentItem> {
+  return request<ContentItem>(`/api/content/${id}`, jsonInit("PATCH", { content }));
+}
+
+export function cancelCampaign(id: number): Promise<JobAccepted> {
+  return request<JobAccepted>(`/api/campaigns/${id}/cancel`, jsonInit("POST", {}));
+}
+
+export function deleteCampaign(id: number): Promise<void> {
+  return request<void>(`/api/campaigns/${id}`, { method: "DELETE" });
+}
+
+// --- reel controls: voices, render options, re-render -----------------------
+
+export interface VoiceOption {
+  id: string;
+  name: string;
+  description: string;
+}
+
+/** On-screen caption styles for reels (mirrors backend reel_caption_style). */
+export type CaptionStyle = "karaoke" | "lower_third" | "centered" | "boxed";
+export const CAPTION_STYLES: { value: CaptionStyle; label: string }[] = [
+  { value: "karaoke", label: "Karaoke (word-by-word)" },
+  { value: "lower_third", label: "Lower third" },
+  { value: "centered", label: "Centered" },
+  { value: "boxed", label: "Boxed / TikTok" },
+];
+
+/** Generation + render controls for a campaign (mirrors backend ContentOptions).
+ * Also reused for reel re-render. */
+export interface ContentOptions {
+  // shared voice/shape knobs
+  tone?: string;
+  style?: string | null;
+  hashtag_count?: number;
+  slide_count?: number; // carousel target
+  thread_length?: number; // x-thread target
+  scene_count?: number; // reel target
+  // reel render controls
+  voice_id?: string | null;
+  tts_engine?: string | null;
+  music?: boolean;
+  music_volume?: number | null;
+  presenter?: boolean;
+  caption_style?: CaptionStyle | null;
+  video?: boolean | null;
+}
+
+/** @deprecated alias kept for older imports — use ContentOptions. */
+export type ReelOptions = ContentOptions;
+
+export function getVoices(): Promise<VoiceOption[]> {
+  return request<VoiceOption[]>("/api/content/voices");
+}
+
+/** Optional reel features configured on the server (e.g. the HeyGen presenter). */
+export interface ReelCapabilities {
+  presenter: boolean;
+  video: boolean;
+  /** Whether a Zapier webhook is configured ("Send to Zapier" publish route). */
+  zapier: boolean;
+}
+
+export function getReelCapabilities(): Promise<ReelCapabilities> {
+  return request<ReelCapabilities>("/api/content/capabilities");
+}
+
+export function rerenderContent(
+  id: number,
+  body: { content?: Record<string, unknown>; options?: ReelOptions },
+): Promise<JobAccepted> {
+  return request<JobAccepted>(
+    `/api/content/${id}/rerender`,
+    jsonInit("POST", { content: body.content ?? null, options: body.options ?? {} }),
+  );
 }

@@ -15,8 +15,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from connect.domain.enums import (
     BriefObjectType,
     BriefSection,
+    CardTemplate,
     DocumentOrigin,
     EnrichmentStatus,
+    HeadlineAlign,
+    HeadlineSize,
     LinkStatus,
     MediaType,
     PositionShiftStatus,
@@ -492,6 +495,11 @@ class SocialPost(_Frozen):
     alt_text: str = Field(
         default="",
         description="One-sentence accessibility description of the card.")
+    suggested_palette: str | None = Field(
+        default=None,
+        description="Optional: a palette name that fits the news mood, chosen"
+                    " ONLY from the list given in the instructions; null if"
+                    " none was offered or none fits.")
 
 
 class SocialPostDraft(_Frozen):
@@ -516,16 +524,38 @@ class SocialPublishResult(_Frozen):
     permalink: str | None = None
 
 
+_HEX = r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$"
+
+
 class PostSettings(_Frozen):
-    """How posts are generated. A global default lives in app_setting; a
-    workspace can override any subset (merged at use time)."""
+    """How posts are generated AND how the card looks. A global default lives
+    in app_setting; a workspace can override any subset (merged at use time).
+    The card_* / headline_* / logo_sha fields drive connect/social/card.py."""
+    # generation
     tone: str = "neutral, factual, engaging"
     hashtag_count: int = Field(default=8, ge=0, le=30)
     brand_handle: str = ""
     caption_max_chars: int = Field(default=400, ge=50, le=2200)
     default_visibility: Visibility = "shared"
-    card_accent: str = "#38bdf8"
+    # card look — colors (any valid #rgb/#rrggbb)
+    card_bg: str = Field(default="#0f172a", pattern=_HEX)
+    card_text: str = Field(default="#f1f5f9", pattern=_HEX)
+    card_muted: str = Field(default="#94a3b8", pattern=_HEX)
+    card_accent: str = Field(default="#38bdf8", pattern=_HEX)
+    # card look — layout
+    card_template: CardTemplate = "classic"
+    headline_size: HeadlineSize = "m"
+    headline_align: HeadlineAlign = "left"
     sign_off: str = "via connect"
+    # an uploaded brand logo (sha in the social-logo store); rendered on the
+    # card when set. Served at /api/social/logo/{sha}.png.
+    logo_sha: str | None = None
+    # auto-theming: when on, the card palette (colors + template) is chosen per
+    # post from its topic (topic_palettes override, else a default map) and the
+    # model's suggested palette — see connect/social/palettes.py. The card_*
+    # fields above become the fallback look.
+    auto_theme: bool = False
+    topic_palettes: dict[str, str] = Field(default_factory=dict)
 
 
 class PostSettingsUpdate(_Frozen):
@@ -534,8 +564,17 @@ class PostSettingsUpdate(_Frozen):
     brand_handle: str | None = None
     caption_max_chars: int | None = Field(default=None, ge=50, le=2200)
     default_visibility: Visibility | None = None
-    card_accent: str | None = None
+    card_bg: str | None = Field(default=None, pattern=_HEX)
+    card_text: str | None = Field(default=None, pattern=_HEX)
+    card_muted: str | None = Field(default=None, pattern=_HEX)
+    card_accent: str | None = Field(default=None, pattern=_HEX)
+    card_template: CardTemplate | None = None
+    headline_size: HeadlineSize | None = None
+    headline_align: HeadlineAlign | None = None
     sign_off: str | None = None
+    logo_sha: str | None = None
+    auto_theme: bool | None = None
+    topic_palettes: dict[str, str] | None = None
 
 
 class SocialDraft(_Frozen):
@@ -1171,6 +1210,15 @@ class ContradictionPage(_Frozen):
     total: int
     page: int
     page_size: int
+
+
+class ContradictionDetail(ContradictionItem):
+    """A contradiction row plus its per-stance evidence quotes (the two-column
+    expand view). ``n_support``/``n_refute`` are the materialized counts over
+    ALL evidence; ``evidence`` is only what the caller may see (documents
+    private to others are omitted), so the visible quote count can be < the
+    counts — by design."""
+    evidence: list[AnalysisEvidenceItem] = Field(default_factory=list)
 
 
 # --- view cursors / calendar (Phase 2) ------------------------------------------

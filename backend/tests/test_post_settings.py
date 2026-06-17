@@ -90,14 +90,96 @@ def test_system_prompt_reflects_settings():
     assert "@x" in prompt
 
 
-def test_card_honours_accent_and_signoff():
-    content = PostSettings()  # not used; just need a SocialPost
+def _sample_post():
     from connect.domain.models import SocialPost
-    card = render_card(
-        SocialPost(headline="H", caption="c", hashtags=[],
-                   key_points=["a"], source_label="S", alt_text="a"),
-        accent="#ff0000", sign_off="@mybrand")
+    return SocialPost(headline="A clear and grounded headline about rates",
+                      caption="c", hashtags=[],
+                      key_points=["point one", "point two"],
+                      source_label="Source: RBI", alt_text="a")
+
+
+def test_card_honours_colors():
+    card = render_card(_sample_post(),
+                       settings=PostSettings(card_accent="#ff0000",
+                                             card_bg="#ffffff"))
     img = Image.open(io.BytesIO(card))
     assert img.format == "JPEG" and img.size == (1080, 1080)
-    # the accent bar (top-left strip) is red
-    assert img.getpixel((20, 5))[0] > 180   # strong red channel
+    assert img.getpixel((20, 5))[0] > 180          # accent bar is red
+    assert img.getpixel((540, 540))[0] > 240       # white background
+
+
+def test_all_templates_render():
+    post = _sample_post()
+    for tmpl in ("classic", "bold", "minimal"):
+        for align in ("left", "center"):
+            for size in ("s", "m", "l"):
+                card = render_card(post, settings=PostSettings(
+                    card_template=tmpl, headline_align=align,
+                    headline_size=size))
+                img = Image.open(io.BytesIO(card))
+                assert img.format == "JPEG" and img.size == (1080, 1080)
+
+
+def test_logo_changes_the_card():
+    post = _sample_post()
+    base = PostSettings()
+    plain = render_card(post, settings=base)
+    buf = io.BytesIO()
+    Image.new("RGBA", (200, 80), (255, 80, 80, 255)).save(buf, "PNG")
+    with_logo = render_card(post, settings=base, logo=buf.getvalue())
+    assert plain != with_logo            # the logo is composited in
+
+
+# --- auto-theme (palette resolution) ----------------------------------------
+
+def test_palette_resolution_precedence():
+    from connect.social.palettes import PALETTES, resolve_post_theme
+
+    base = PostSettings()
+    # auto-theme off -> identity
+    assert resolve_post_theme(base, topic="elections", suggested="gold") == (
+        base, None)
+    on = PostSettings(auto_theme=True)
+    # a topic's default palette wins over the AI suggestion
+    _, n = resolve_post_theme(on, topic="elections", suggested="gold")
+    assert n == "crimson"
+    # a user topic override beats the default
+    _, n = resolve_post_theme(
+        PostSettings(auto_theme=True, topic_palettes={"elections": "ink"}),
+        topic="elections")
+    assert n == "ink"
+    # unmapped topic -> the AI suggestion is used
+    _, n = resolve_post_theme(on, topic="nope", suggested="royal")
+    assert n == "royal"
+    # a palette swaps colors+template but keeps logo + headline prefs
+    themed, n = resolve_post_theme(
+        PostSettings(auto_theme=True, logo_sha="a" * 64,
+                     headline_align="center"), topic="banking")
+    assert themed.logo_sha == "a" * 64 and themed.headline_align == "center"
+    assert themed.card_bg == PALETTES[n]["card_bg"]
+
+
+def test_all_palettes_are_valid_overlays():
+    from connect.social.palettes import PALETTES
+
+    for name, pal in PALETTES.items():
+        s = PostSettings(**{**PostSettings().model_dump(), **pal})
+        render_card(_sample_post(), settings=s)   # renders without error
+
+
+def test_palettes_endpoint(client):
+    body = client.get("/api/social/palettes").json()
+    assert "midnight" in body["palettes"] and "crimson" in body["palettes"]
+    assert "monetary-policy" in body["topics"]
+    assert body["topic_defaults"]["elections"] == "crimson"
+
+
+def test_auto_theme_settings_roundtrip(client):
+    r = client.put("/api/social/settings",
+                   json={"auto_theme": True,
+                         "topic_palettes": {"elections": "ink"}})
+    assert r.status_code == 200, r.text
+    assert r.json()["auto_theme"] is True
+    assert r.json()["topic_palettes"] == {"elections": "ink"}
+    # persisted + falls through to workspaces
+    assert client.get("/api/social/settings").json()["auto_theme"] is True

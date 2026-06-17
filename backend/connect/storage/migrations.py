@@ -245,6 +245,46 @@ async def pg_migrate_14_to_15(conn: "psycopg.AsyncConnection") -> None:
         f" CHECK (kind IN {schema.E.sql_in(schema.E.JOB_KINDS)})")
 
 
+async def pg_migrate_15_to_16(conn: "psycopg.AsyncConnection") -> None:
+    """v16 — social content pipeline: the `campaign` + `content_item` tables
+    (the review queue) and the `content_generate` / `content_publish` job
+    kinds. Fresh DDL only (no data migration); the job-kind CHECK is widened
+    and the publish-dedup partial index is created."""
+    for ddl in schema._PG_DDL_CAMPAIGN_DDL:
+        await conn.execute(ddl)
+    await conn.execute(
+        "ALTER TABLE job DROP CONSTRAINT IF EXISTS ck_job_kind")
+    await conn.execute(
+        "ALTER TABLE job ADD CONSTRAINT ck_job_kind"
+        f" CHECK (kind IN {schema.E.sql_in(schema.E.JOB_KINDS)})")
+    await conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_publish_item"
+        " ON job ((payload->>'item_id'))"
+        " WHERE kind = 'content_publish' AND status IN ('queued','running')")
+
+
+async def pg_migrate_16_to_17(conn: "psycopg.AsyncConnection") -> None:
+    """v17 — Instagram Reels: the new `ig_reel` content format. Widen the
+    content_item format CHECK to the current CONTENT_FORMATS (platform
+    `instagram` is already allowed; reel videos ride in card_shas, so no new
+    column). Pure constraint widening, no data migration."""
+    await conn.execute(
+        "ALTER TABLE content_item DROP CONSTRAINT IF EXISTS"
+        " ck_content_item_format")
+    await conn.execute(
+        "ALTER TABLE content_item ADD CONSTRAINT ck_content_item_format"
+        f" CHECK (format IN {schema.E.sql_in(schema.E.CONTENT_FORMATS)})")
+
+
+async def pg_migrate_17_to_18(conn: "psycopg.AsyncConnection") -> None:
+    """v18 — the `content_render` job kind (re-render an edited reel). Widen the
+    job-kind CHECK to the current JOB_KINDS. Constraint-only, no data migration."""
+    await conn.execute("ALTER TABLE job DROP CONSTRAINT IF EXISTS ck_job_kind")
+    await conn.execute(
+        "ALTER TABLE job ADD CONSTRAINT ck_job_kind"
+        f" CHECK (kind IN {schema.E.sql_in(schema.E.JOB_KINDS)})")
+
+
 # Registry: version N -> async function taking N's schema to N+1's.
 # Forward-only.
 PG_MIGRATIONS: dict[
@@ -263,6 +303,9 @@ PG_MIGRATIONS: dict[
     12: pg_migrate_12_to_13,
     13: pg_migrate_13_to_14,
     14: pg_migrate_14_to_15,
+    15: pg_migrate_15_to_16,
+    16: pg_migrate_16_to_17,
+    17: pg_migrate_17_to_18,
 }
 
 

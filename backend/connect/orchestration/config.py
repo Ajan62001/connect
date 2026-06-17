@@ -84,6 +84,115 @@ class Settings(BaseSettings):
     # publicly reachable URL (localhost is unreachable by Instagram).
     public_base_url: str | None = None
 
+    # Instagram Reels (video) rendering. ffmpeg is required (a system binary);
+    # narration is OPTIONAL — when CONNECT_PIPER_VOICE_DIR points at a baked
+    # Piper voice (<dir>/<piper_voice>.onnx + .onnx.json) reels get a voiceover,
+    # otherwise a silent slideshow is produced. Nothing here is required for the
+    # rest of the pipeline.
+    ffmpeg_path: str = "/usr/bin/ffmpeg"
+    instagram_reel_timeout_s: float = 300.0
+    # Reel background imagery: per-scene web photos (Pexels if a key is set,
+    # else keyless Openverse). Set reel_use_images False for plain themed reels.
+    reel_use_images: bool = True
+    pexels_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("PEXELS_API_KEY", "CONNECT_PEXELS_API_KEY"),
+    )
+    piper_voice_dir: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CONNECT_PIPER_VOICE_DIR", "PIPER_VOICE_DIR"),
+    )
+    piper_voice: str = "en_US-ryan-high"   # natural, less robotic than -medium
+    # Reel narration engine: 'auto' (ElevenLabs if a key is set, else Piper,
+    # else silent), or force 'elevenlabs' / 'piper' / 'none'.
+    reel_tts_engine: str = "auto"
+    # ElevenLabs cloud TTS (most natural). Optional; ElevenLabs falls back to
+    # Piper then silent. Voice 'George' (warm storyteller) by default.
+    elevenlabs_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ELEVENLABS_API_KEY", "CONNECT_ELEVENLABS_API_KEY"),
+    )
+    elevenlabs_voice_id: str = "JBFqnCBsd6RMkjVDRZzb"
+    elevenlabs_model: str = "eleven_multilingual_v2"
+    # Background-music bed for reels: a dir of audio files (CC0/your own). One
+    # is mixed (ducked) under the narration. Empty/missing => no music.
+    reel_music_dir: Path | None = Field(
+        default=BACKEND_DIR / "data" / "music",
+        validation_alias=AliasChoices("CONNECT_REEL_MUSIC_DIR"),
+    )
+    reel_music_volume: float = 0.07        # music gain under the voice (subtle)
+    # Stock VIDEO b-roll: when on AND a Pexels key is set, each scene uses a
+    # relevant short clip (real footage) instead of a panning still; falls back
+    # to a photo then a themed colour. Reuses pexels_api_key.
+    reel_use_video: bool = True
+    # On-screen caption style: 'karaoke' (word-by-word, burned when the TTS gives
+    # word timing, else lower-third), 'lower_third', 'centered', or 'boxed'.
+    reel_caption_style: str = "karaoke"
+
+    # HeyGen avatar "presenter" for reels (optional, paid). When configured AND
+    # a reel is rendered in presenter mode, a photoreal talking-head clip of the
+    # narration is generated and composited over the b-roll slideshow. Unset =>
+    # presenter mode silently falls back to the local TTS slideshow. The avatar
+    # speaks with HeyGen's own TTS (heygen_voice_id), NOT ElevenLabs.
+    heygen_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "HEYGEN_API_KEY", "CONNECT_HEYGEN_API_KEY"),
+    )
+    heygen_avatar_id: str | None = Field(
+        default=None, validation_alias=AliasChoices("CONNECT_HEYGEN_AVATAR_ID"),
+    )
+    heygen_voice_id: str | None = Field(
+        default=None, validation_alias=AliasChoices("CONNECT_HEYGEN_VOICE_ID"),
+    )
+    heygen_avatar_style: str = "normal"    # normal | circle | closeUp
+    heygen_background: str = "#0B1220"     # solid bg behind the avatar (hex)
+    heygen_speed: float = 1.0              # HeyGen TTS speaking rate
+    # Avatar voice source: 'elevenlabs' (default) lip-syncs the avatar to OUR
+    # ElevenLabs brand voice (synth -> upload -> audio asset) so presenter reels
+    # match the slideshow reels; 'heygen' uses HeyGen's own TTS (heygen_voice_id).
+    # 'elevenlabs' silently falls back to HeyGen TTS when ElevenLabs isn't set.
+    heygen_voice_source: str = "elevenlabs"
+    heygen_timeout_s: float = 300.0        # give up if the render never finishes
+    heygen_poll_interval_s: float = 5.0    # seconds between status polls
+    # Reel presenter mode: 'off' (local slideshow), 'pip' (avatar in a corner
+    # over the b-roll), or 'full' (avatar fills the frame). Per-campaign
+    # ContentOptions.presenter overlays this at render time.
+    reel_presenter: str = "off"
+
+    # X (Twitter) + LinkedIn direct publishing for the content pipeline
+    # (optional; SCAFFOLDED). Unset => the platform reports "not connected"
+    # and a scheduled item for it lands in 'failed' with an actionable error;
+    # generation/queue/scheduling work regardless.
+    x_api_bearer_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "X_API_BEARER_TOKEN", "CONNECT_X_API_BEARER_TOKEN"),
+    )
+    linkedin_access_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "LINKEDIN_ACCESS_TOKEN", "CONNECT_LINKEDIN_ACCESS_TOKEN"),
+    )
+    linkedin_author_urn: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "LINKEDIN_AUTHOR_URN", "CONNECT_LINKEDIN_AUTHOR_URN"),
+    )
+    # Zapier (optional): a "Catch Hook" webhook URL. When set, the content
+    # review queue offers "Send to Zapier" per draft — publishing POSTs a JSON
+    # payload (format, platform, caption, hashtags, public media URLs) to the
+    # webhook so a Zap can route the post to any network Zapier supports,
+    # without per-platform API credentials. Media formats still need
+    # public_base_url so the destination can fetch the rendered card/reel.
+    zapier_webhook_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ZAPIER_WEBHOOK_URL", "CONNECT_ZAPIER_WEBHOOK_URL"),
+    )
+
     # --- auth (tenancy design §3, Phase B) -----------------------------------
     # Google OAuth client credentials (Google Cloud Console — see README
     # "Google sign-in"). Unset => Google login is unavailable and
@@ -162,6 +271,13 @@ class Settings(BaseSettings):
     pool_max_size: int = 10
 
     # background machinery
+    # Seed the built-in NEWS domain content (the 30 Indian news sources +
+    # their repairs, the calendar events, and event-type taxonomy) into a
+    # fresh DB on startup. Set false for a clean-slate instance — e.g. the
+    # research-papers experiment, which brings its own sources/taxonomy and
+    # must NOT inherit the news seeds. App-setting/budget seeding is
+    # unaffected (that's infra, not domain content).
+    seed_builtin_sources: bool = True
     # poller_enabled gates the BEAT's due-source scheduling (the v0.1
     # lifespan poll loop is gone — beat enqueues poll_source jobs)
     poller_enabled: bool = True

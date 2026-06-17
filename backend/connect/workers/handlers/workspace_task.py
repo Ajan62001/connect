@@ -60,7 +60,8 @@ async def run_workspace_task(ctx: WorkerContext,
         ctx.conn, llm=services.llm, governor=services.governor,
         embedder=services.embedder, vectors=services.vectors,
         workspace=ws, viewer=owner_id, messages=wire,
-        card_store=services.card_store, post_settings=settings,
+        card_store=services.card_store, logo_store=services.logo_store,
+        post_settings=settings,
         on_turn=on_turn, should_cancel=ctx.cancel.cancelled, mode="deep")
 
     transcript.append(chat_dao.turn_dict(

@@ -41,8 +41,11 @@ from connect.llm.tiers import ModelTier
 from connect.retrieval.search import hybrid_document_ids
 from connect.social import generate
 from connect.social.card import render_card
+from connect.social.palettes import resolve_post_theme
+from connect.social.settings import load_logo
 from connect.storage import posts as post_dao
 from connect.storage import social_drafts as social_draft_dao
+from connect.storage.workspaces import topic_focus_clauses
 
 log = logging.getLogger(__name__)
 
@@ -183,9 +186,9 @@ def _build_focus(workspace: Workspace) -> tuple[str | None, list[Any]]:
         clauses.append("d.source_id = ANY(%s)")
         params.append([int(s) for s in workspace.source_ids])
     if workspace.topics:
-        clauses.append("EXISTS (SELECT 1 FROM document_topic dt"
-                       " WHERE dt.document_id = d.id AND dt.topic = ANY(%s))")
-        params.append(list(workspace.topics))
+        tclauses, tparams = topic_focus_clauses(workspace.topics)
+        clauses.extend(tclauses)
+        params.extend(tparams)
     if workspace.query_fts:
         clauses.append("d.search_tsv @@ websearch_to_tsquery('english', %s)")
         params.append(workspace.query_fts)
@@ -217,6 +220,7 @@ class WorkspaceToolExecutor:
                  vectors: Any, workspace: Workspace, viewer: int,
                  state: WorkspaceAgentState, llm: LLMProvider | None = None,
                  governor: Any = None, card_store: Any = None,
+                 logo_store: Any = None,
                  post_settings: PostSettings | None = None):
         self.conn = conn
         self.embedder = embedder
@@ -228,6 +232,7 @@ class WorkspaceToolExecutor:
         self.llm = llm
         self.governor = governor
         self.card_store = card_store
+        self.logo_store = logo_store
         self.post_settings = post_settings
         self.focus_clause, self.focus_params = _build_focus(workspace)
 
@@ -416,8 +421,12 @@ class WorkspaceToolExecutor:
                                 model=completion.model,
                                 usage=completion.usage, user_id=self.viewer)
         content = completion.output
-        image = render_card(content, accent=s.card_accent,
-                            sign_off=s.sign_off)
+        themed, palette = resolve_post_theme(
+            s, suggested=content.suggested_palette)
+        if palette:
+            content = content.model_copy(update={"suggested_palette": palette})
+        logo = load_logo(self.logo_store, themed)
+        image = render_card(content, settings=themed, logo=logo)
         rel = self.card_store.put(image)
         sha = rel.rsplit("/", 1)[-1]
         draft_id = await social_draft_dao.insert(
@@ -449,7 +458,8 @@ async def run_workspace_agent(
         conn: psycopg.AsyncConnection, *, llm: LLMProvider, governor: Any,
         embedder: Any, vectors: Any, workspace: Workspace, viewer: int,
         messages: list[dict[str, Any]],
-        card_store: Any = None, post_settings: PostSettings | None = None,
+        card_store: Any = None, logo_store: Any = None,
+        post_settings: PostSettings | None = None,
         on_turn: Any = None, should_cancel: Any = None,
         mode: str = "quick") -> WorkspaceAgentResult:
     """Drive the bounded tool-loop for one user turn. ``mode`` selects the
@@ -462,7 +472,8 @@ async def run_workspace_agent(
     executor = WorkspaceToolExecutor(
         conn, embedder=embedder, vectors=vectors, workspace=workspace,
         viewer=viewer, state=state, llm=llm, governor=governor,
-        card_store=card_store, post_settings=post_settings)
+        card_store=card_store, logo_store=logo_store,
+        post_settings=post_settings)
     budget = AnalysisBudget(cap_usd=cap_usd)
     model = llm.model_for(ModelTier.BALANCED)
     turn_proj = spend.cost_usd(model, input_tokens=_EST_IN,

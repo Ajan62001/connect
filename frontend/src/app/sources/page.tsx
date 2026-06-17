@@ -62,7 +62,7 @@ function SourcesSkeleton() {
 }
 
 /** Source types the backend can poll on demand (registry POLLABLE_TYPES). */
-const POLLABLE_TYPES: Source["type"][] = ["rss", "twitter", "telegram"];
+const POLLABLE_TYPES: Source["type"][] = ["rss", "web_news", "twitter", "telegram"];
 
 const TYPE_BADGE_LABELS: Partial<Record<Source["type"], string>> = {
   twitter: "X / Twitter",

@@ -114,6 +114,39 @@ async def get(conn: psycopg.AsyncConnection,
     return _to_dict(row) if row else None
 
 
+# the per-stance evidence quotes behind a contradiction's counts. Viewer-scoped
+# (documents private to others are omitted) and verbatim — the quote is stored
+# inline on the evidence row, so a contradiction never re-reads a blob.
+_EVIDENCE_SQL = """
+SELECT e.id, e.document_id, e.stance, e.confidence, e.quote,
+       d.url, d.title, s.name AS source_name, s.credibility_tier
+FROM evidence e
+JOIN document d ON d.id = e.document_id
+LEFT JOIN source s ON s.id = d.source_id
+WHERE e.claim_id = %s AND e.stance IN ('supports', 'refutes')
+  AND (d.visibility = 'shared' OR d.owner_id = %s)
+ORDER BY e.stance, s.credibility_tier NULLS LAST, e.id
+"""
+
+
+async def get_detail(conn: psycopg.AsyncConnection, contradiction_id: int, *,
+                     viewer: int) -> dict[str, Any] | None:
+    """The contradiction row + the evidence quotes the viewer may see. None
+    when the contradiction id is unknown."""
+    base = await get(conn, contradiction_id)
+    if base is None:
+        return None
+    cur = await conn.execute(_EVIDENCE_SQL, (base["claim"]["id"], viewer))
+    base["evidence"] = [
+        {"id": r["id"], "document_id": r["document_id"],
+         "source_name": r["source_name"], "credibility_tier":
+         r["credibility_tier"], "stance": r["stance"],
+         "confidence": r["confidence"], "quote": r["quote"],
+         "url": r["url"], "title": r["title"]}
+        for r in await cur.fetchall()]
+    return base
+
+
 async def dismiss(conn: psycopg.AsyncConnection,
                   contradiction_id: int) -> dict[str, Any] | None:
     async with conn.transaction():

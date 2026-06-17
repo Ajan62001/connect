@@ -13,6 +13,7 @@ from __future__ import annotations
 import psycopg
 
 from connect.storage import sources as source_dao
+from connect.storage.pg import Jsonb
 
 SEED_SOURCES: tuple[dict, ...] = (
     {
@@ -103,10 +104,11 @@ SEED_SOURCES: tuple[dict, ...] = (
     {
         "name": "The Print",
         "type": "rss",
-        "config": {"feed_url": "https://theprint.in/feed/",
+        "config": {"feed_url": "https://theprint.in/category/economy/feed/",
                    "poll_interval_minutes": 60},
         "credibility_tier": 2,
-        "notes": "Independent national news. URL needs live-verification on first deploy.",
+        "notes": "ThePrint economy category feed (live-verified June 2026; the "
+                 "site-wide /feed/ 403s scrapers, the category feed does not).",
     },
     {
         "name": "The Hindu — Business",
@@ -136,11 +138,15 @@ SEED_SOURCES: tuple[dict, ...] = (
     },
     {
         "name": "Financial Express",
-        "type": "rss",
-        "config": {"feed_url": "https://www.financialexpress.com/feed/",
-                   "poll_interval_minutes": 60},
+        "type": "web_news",
+        "config": {
+            "index_url": "https://www.financialexpress.com/economy/",
+            "link_pattern": r"financialexpress\.com/[a-z-]+/[a-z0-9-]+-\d{6,}/",
+            "poll_interval_minutes": 60,
+        },
         "credibility_tier": 2,
-        "notes": "Financial Express. URL needs live-verification on first deploy.",
+        "notes": "Financial Express economy section — HTML scraping (live-verified "
+                 "June 2026; FE discontinued RSS, /feed/ returns HTTP 410).",
     },
     {
         "name": "Factly",
@@ -174,27 +180,22 @@ SEED_SOURCES: tuple[dict, ...] = (
     # --- web_news (tier 2, no RSS) --------------------------------------------
     {
         "name": "Business Standard — Economy",
-        "type": "web_news",
-        "config": {
-            "index_url": "https://www.business-standard.com/economy-policy",
-            "link_pattern": r"business-standard\.com/[a-z-]+/[a-z0-9-]+-\d+_\d+\.html",
-            "poll_interval_minutes": 60,
-        },
+        "type": "rss",
+        "config": {"feed_url": "https://www.business-standard.com/rss/economy-102.rss",
+                   "poll_interval_minutes": 360},
         "credibility_tier": 2,
-        "notes": "Business Standard economy/policy section — HTML scraping. "
-                 "URL needs live-verification on first deploy.",
+        "notes": "Business Standard economy section RSS (live-verified June 2026). "
+                 "The feed is reachable, but BS may 403 article pages from some "
+                 "server IPs (no full text then); polled every 6h to stay gentle.",
     },
     {
-        "name": "BQ Prime — Economy",
-        "type": "web_news",
-        "config": {
-            "index_url": "https://www.bqprime.com/economy",
-            "link_pattern": r"bqprime\.com/[a-z-]+/[a-z0-9-]{25,}",
-            "poll_interval_minutes": 60,
-        },
+        "name": "NDTV Profit — Markets",
+        "type": "rss",
+        "config": {"feed_url": "https://www.ndtvprofit.com/rss",
+                   "poll_interval_minutes": 60},
         "credibility_tier": 2,
-        "notes": "BQ Prime (Bloomberg Quint) economy section — HTML scraping. "
-                 "URL needs live-verification on first deploy.",
+        "notes": "NDTV Profit (formerly BQ Prime / BloombergQuint) main feed "
+                 "(live-verified June 2026; bqprime.com retired in the rebrand).",
     },
     {
         "name": "CNBCTV18 — Economy",
@@ -333,3 +334,90 @@ async def seed_sources(conn: psycopg.AsyncConnection) -> int:
         )
         added += 1
     return added
+
+
+# Built-in sources whose originally-seeded URL went dead or got bot-blocked
+# after the first research pass (the "live-verification" the notes flagged).
+# Each repair is applied ONLY when the live row STILL carries the exact broken
+# value under ``match`` — so a user's own edit is never clobbered, and the
+# repair is idempotent (once applied, the match no longer holds). ``from_name``
+# lets a repair also rename a row (BQ Prime -> NDTV Profit after the rebrand);
+# it must run BEFORE seed_sources so the renamed row is found and the corrected
+# SEED_SOURCES entry is not inserted as a duplicate.
+SEED_REPAIRS: tuple[dict, ...] = (
+    {
+        "from_name": "Business Standard — Economy",
+        "match": ("index_url", "https://www.business-standard.com/economy-policy"),
+        "set": {
+            "type": "rss",
+            "config": {"feed_url": "https://www.business-standard.com/rss/economy-102.rss",
+                       "poll_interval_minutes": 360},
+            "notes": "Business Standard economy section RSS (live-verified June 2026). "
+                     "The feed is reachable, but BS may 403 article pages from some "
+                     "server IPs (no full text then); polled every 6h to stay gentle.",
+        },
+    },
+    {
+        "from_name": "BQ Prime — Economy",
+        "match": ("index_url", "https://www.bqprime.com/economy"),
+        "set": {
+            "name": "NDTV Profit — Markets",
+            "type": "rss",
+            "config": {"feed_url": "https://www.ndtvprofit.com/rss",
+                       "poll_interval_minutes": 60},
+            "notes": "NDTV Profit (formerly BQ Prime / BloombergQuint) main feed "
+                     "(live-verified June 2026; bqprime.com retired in the rebrand).",
+        },
+    },
+    {
+        "from_name": "The Print",
+        "match": ("feed_url", "https://theprint.in/feed/"),
+        "set": {
+            "config": {"feed_url": "https://theprint.in/category/economy/feed/",
+                       "poll_interval_minutes": 60},
+            "notes": "ThePrint economy category feed (live-verified June 2026; the "
+                     "site-wide /feed/ 403s scrapers, the category feed does not).",
+        },
+    },
+    {
+        "from_name": "Financial Express",
+        "match": ("feed_url", "https://www.financialexpress.com/feed/"),
+        "set": {
+            "type": "web_news",
+            "config": {"index_url": "https://www.financialexpress.com/economy/",
+                       "link_pattern": r"financialexpress\.com/[a-z-]+/[a-z0-9-]+-\d{6,}/",
+                       "poll_interval_minutes": 60},
+            "notes": "Financial Express economy section — HTML scraping (live-verified "
+                     "June 2026; FE discontinued RSS, /feed/ returns HTTP 410).",
+        },
+    },
+)
+
+
+async def repair_sources(conn: psycopg.AsyncConnection) -> int:
+    """Correct built-in sources still carrying a known-broken seeded URL.
+
+    Matches by ``from_name`` AND the exact broken config value, so a row a user
+    has edited (or that was already repaired) is left untouched. Updates type /
+    config / name / notes in one statement (``type`` is not patchable via the
+    admin DAO, so this is a dedicated write) and clears the last poll result so
+    the corrected source re-polls promptly. Returns how many rows were fixed.
+    Must run BEFORE ``seed_sources``."""
+    repaired = 0
+    for spec in SEED_REPAIRS:
+        row = await source_dao.get_by_name(conn, spec["from_name"])
+        if row is None:
+            continue
+        key, broken = spec["match"]
+        if (row.config or {}).get(key) != broken:
+            continue  # user-edited or already repaired — never overwrite
+        s = spec["set"]
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE source SET name = %s, type = %s, config = %s,"
+                " notes = %s, last_polled_at = NULL, last_poll_status = NULL"
+                " WHERE id = %s",
+                (s.get("name", row.name), s.get("type", row.type),
+                 Jsonb(s["config"]), s.get("notes", row.notes), row.id))
+        repaired += 1
+    return repaired

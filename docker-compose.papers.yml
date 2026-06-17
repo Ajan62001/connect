@@ -1,0 +1,19 @@
+# Override for the isolated "research papers" experiment instance.
+#
+# The base docker-compose.yml hardcodes `env_file: .env` in every service, so
+# `--env-file .env.papers` alone only reaches compose *interpolation* (ports,
+# DATABASE_URL, password). This override repoints the containers' own env_file
+# at .env.papers so EVERY CONNECT_* knob (poller, dev-login, budgets) comes
+# from the papers config too.
+#
+#   docker compose -p connect-papers \
+#     -f docker-compose.yml -f docker-compose.papers.yml \
+#     --env-file .env.papers up -d
+#
+services:
+  migrate:
+    env_file: .env.papers
+  api:
+    env_file: .env.papers
+  worker:
+    env_file: .env.papers

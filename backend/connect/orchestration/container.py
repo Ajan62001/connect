@@ -37,6 +37,7 @@ from connect.analysis.pipeline import AnalysisService
 from connect.auth.oauth import GoogleOAuth
 from connect.ingestion.blobs import BlobStore
 from connect.investigation.runner import InvestigationService
+from connect.content.service import ContentService
 from connect.story.service import StoryService
 from connect.ingestion.fetcher import Fetcher
 from connect.ingestion.pipeline import IngestionPipeline
@@ -64,7 +65,7 @@ from connect.orchestration.config import Settings
 from connect.retrieval.search_client import SearchClient, create_search_client
 from connect.sources.adapters.twitter import TwitterAdapter
 from connect.sources.registry import POLLABLE_TYPES, SOURCE_ADAPTERS
-from connect.sources.seeds import seed_sources
+from connect.sources.seeds import repair_sources, seed_sources
 from connect.storage import app_settings as app_settings_dao
 from connect.storage import pg as pg_mod
 from connect.workers import handlers as _handlers  # noqa: F401 — registers job handlers
@@ -85,6 +86,12 @@ class Container:
         # social cards live in a SEPARATE namespace from document blobs so the
         # public card endpoint can never serve a (possibly private) doc blob.
         self.card_store = BlobStore(settings.blob_dir / "social_cards")
+        # uploaded brand logos for post cards — a separate sha-keyed namespace,
+        # served (public, sha-unguessable) at /api/social/logo/<sha>.png.
+        self.logo_store = BlobStore(settings.blob_dir / "social_logos")
+        # rendered reel videos — separate namespace again, served (public) at
+        # /api/social/reel/<sha>.mp4 so the endpoint never exposes a doc blob.
+        self.reel_store = BlobStore(settings.blob_dir / "social_reels")
         self.fetcher = Fetcher(
             per_domain_interval=settings.fetch_per_domain_interval,
             timeout_seconds=settings.fetch_timeout_seconds,
@@ -127,6 +134,8 @@ class Container:
         self.investigations: InvestigationService | None = None
         # v15: story mode — grounded narrative synthesis over a fact-set.
         self.stories: StoryService | None = None
+        # v16: social content pipeline — campaigns -> review queue -> publish.
+        self.content: ContentService | None = None
         # Phase B auth: Google OAuth client — None without credentials
         # (the signin page then offers only the dev hatch, if enabled).
         # Construction is offline (discovery is fetched lazily at first
@@ -154,9 +163,18 @@ class Container:
         # Fetcher seam, PG backing — runtime design §4)
         self.fetcher.bind_pool(pool)
         async with pool.connection() as conn:
-            await seed_sources(conn)
-            await seed_event_types(conn)
-            await seed_calendar_events(conn)
+            # Built-in NEWS-domain seeds — skipped on a clean-slate instance
+            # (CONNECT_SEED_BUILTIN_SOURCES=false), e.g. the research-papers
+            # experiment that must not inherit Indian-news sources/taxonomy.
+            if self.settings.seed_builtin_sources:
+                # repair must precede seed: it may rename a built-in row (e.g.
+                # BQ Prime -> NDTV Profit), and seed_sources would otherwise
+                # insert the corrected entry as a duplicate before the rename
+                # lands.
+                await repair_sources(conn)
+                await seed_sources(conn)
+                await seed_event_types(conn)
+                await seed_calendar_events(conn)
             # budget app_settings (member defaults + global backstop):
             # ON CONFLICT DO NOTHING — admin edits survive restarts
             await app_settings_dao.seed_defaults(conn, self.settings)
@@ -248,6 +266,18 @@ class Container:
             jobs=self.jobs,
             provider=self.llm,
             governor=self.governor,
+            embedder=self.embedder,
+            vectors=self.vectors,
+        )
+        self.content = ContentService(
+            pool,
+            jobs=self.jobs,
+            provider=self.llm,
+            governor=self.governor,
+            settings=self.settings,
+            card_store=self.card_store,
+            logo_store=self.logo_store,
+            reel_store=self.reel_store,
             embedder=self.embedder,
             vectors=self.vectors,
         )

@@ -8,14 +8,17 @@ from __future__ import annotations
 from typing import Sequence
 
 from connect.domain.models import PostSettings
+from connect.social.palettes import palette_guidance
 
 DOC_CAP = 8_000
 
 
 def system_for(s: PostSettings) -> str:
     """The caption/card system prompt, parameterized by the effective
-    post-generation settings (tone, hashtag count, length, brand)."""
+    post-generation settings (tone, hashtag count, length, brand). When
+    auto-theming is on, the model is also asked to suggest a card palette."""
     brand = f" Credit the brand {s.brand_handle}." if s.brand_handle else ""
+    theme = f" {palette_guidance()}" if s.auto_theme else ""
     return (
         "You turn ONE news document into an Instagram post. Use ONLY the"
         " supplied document and its enrichment — never invent figures, dates,"
@@ -23,7 +26,7 @@ def system_for(s: PostSettings) -> str:
         + f" Tone: {s.tone}. Produce a punchy headline, 2-4 short factual key"
         f" points for the image card, a caption of at most"
         f" {s.caption_max_chars} characters that ends by crediting the"
-        f" source, and exactly {s.hashtag_count} relevant hashtags.")
+        f" source, and exactly {s.hashtag_count} relevant hashtags." + theme)
 
 
 def build_prompt(*, title: str | None, source_name: str | None = None,

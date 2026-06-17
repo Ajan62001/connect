@@ -16,6 +16,12 @@ const nextConfig: NextConfig = {
   // it plus public/ and .next/static and runs `node server.js`; no
   // node_modules in the runtime image.
   output: "standalone",
+  // Next 16 allows only one `next dev` per build dir (the lock lives inside
+  // distDir). Setting NEXT_DIST_DIR lets a SECOND dev server — the isolated
+  // papers instance on :3001 — run from this same source tree with its own
+  // lock/output. Unset => `.next`, so the primary news dev server is
+  // unaffected. (Must stay inside the project dir per Next's distDir rule.)
+  distDir: process.env.NEXT_DIST_DIR ?? ".next",
   async rewrites() {
     return [
       {

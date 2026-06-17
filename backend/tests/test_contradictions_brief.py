@@ -38,11 +38,11 @@ async def add_sighting(conn, claim_id, doc_id, stance="asserts"):
         (claim_id, doc_id, stance, utc_now()))
 
 
-async def add_evidence(conn, claim_id, doc_id, stance):
+async def add_evidence(conn, claim_id, doc_id, stance, quote=None):
     await conn.execute(
-        "INSERT INTO evidence (claim_id, document_id, stance, grade,"
-        " created_at) VALUES (%s,%s,%s,2,%s)",
-        (claim_id, doc_id, stance, utc_now()))
+        "INSERT INTO evidence (claim_id, document_id, stance, quote, grade,"
+        " created_at) VALUES (%s,%s,%s,%s,2,%s)",
+        (claim_id, doc_id, stance, quote, utc_now()))
 
 
 # --- /api/contradictions ----------------------------------------------------------
@@ -88,6 +88,52 @@ async def test_contradictions_endpoints(env, db):
                       ).json()["total"] == 1
     assert client.post("/api/contradictions/999/dismiss"
                        ).status_code == 404
+
+
+async def test_contradiction_detail_returns_scoped_evidence(env, db):
+    """GET /api/contradictions/{id} carries the per-stance quotes (the expand
+    view). Counts include ALL evidence; the returned quotes are viewer-scoped,
+    so a supporting quote on a document private to ANOTHER user is counted but
+    never leaked."""
+    from kb_factories import ensure_user
+
+    client, _ = env
+    conn = db
+    pib = await insert_source(conn, "PIB", tier=1)
+    et = await insert_source(conn, "ET", tier=2)
+    claim_id = await make_claim(conn, "GST revenue doubled", verdict="mixed")
+    d_sup = await insert_doc(conn, source_id=pib, title="PIB note")
+    d_ref = await insert_doc(conn, source_id=et, title="ET note")
+    await add_evidence(conn, claim_id, d_sup, "supports",
+                       "GST revenue doubled YoY.")
+    await add_evidence(conn, claim_id, d_ref, "refutes",
+                       "Revenue rose only 8%.")
+    # a second supporting doc, PRIVATE to another user: counted, never shown
+    other = await ensure_user(conn, "stranger@test.local")
+    d_priv = await insert_doc(conn, source_id=pib, title="secret")
+    await conn.execute(
+        "UPDATE document SET visibility = 'private', owner_id = %s"
+        " WHERE id = %s", (other, d_priv))
+    await add_evidence(conn, claim_id, d_priv, "supports", "secret quote")
+    assert await contradictions.scan(conn) == 1
+
+    cid = client.get("/api/contradictions").json()["items"][0]["id"]
+    res = client.get(f"/api/contradictions/{cid}")
+    assert res.status_code == 200, res.text
+    detail = res.json()
+
+    # materialized counts include the private supporting doc
+    assert (detail["n_support"], detail["n_refute"]) == (2, 1)
+    by_quote = {e["quote"]: e for e in detail["evidence"]}
+    # exactly the two visible quotes — the private one is omitted, not leaked
+    assert set(by_quote) == {"GST revenue doubled YoY.", "Revenue rose only 8%."}
+    assert by_quote["GST revenue doubled YoY."]["stance"] == "supports"
+    assert by_quote["GST revenue doubled YoY."]["source_name"] == "PIB"
+    assert by_quote["GST revenue doubled YoY."]["credibility_tier"] == 1
+    assert by_quote["Revenue rose only 8%."]["stance"] == "refutes"
+
+    # unknown id -> 404 (the bug this endpoint fixes was a blanket 404)
+    assert client.get("/api/contradictions/999999").status_code == 404
 
 
 # --- brief: contradiction section ----------------------------------------------------

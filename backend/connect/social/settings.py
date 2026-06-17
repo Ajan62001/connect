@@ -55,3 +55,17 @@ async def effective(conn: psycopg.AsyncConnection,
     base = await get_global(conn)
     overrides = getattr(workspace, "post_settings", None) if workspace else None
     return _merge(base, overrides)
+
+
+def load_logo(store: Any, settings: PostSettings) -> bytes | None:
+    """Read the brand-logo bytes for ``settings.logo_sha`` from the social-logo
+    BlobStore; None when unset, absent, or unreadable (the card just renders
+    without a logo). Used by every render path so the look stays consistent."""
+    sha = settings.logo_sha
+    if not sha or store is None:
+        return None
+    rel = f"{sha[:2]}/{sha}"
+    try:
+        return store.get(rel) if store.exists(rel) else None
+    except OSError:
+        return None

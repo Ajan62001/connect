@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
 
 import psycopg
 
@@ -24,6 +25,7 @@ from connect.api.deps import (
     get_db,
     require_admin,
 )
+from connect.domain.enums import T1_TOPICS
 from connect.domain.models import (
     CurrentUser,
     InstagramStatus,
@@ -39,7 +41,7 @@ from connect.llm.provider import LLMError
 from connect.llm.spend import BudgetExceeded
 from connect.llm.tiers import ModelTier
 from connect.orchestration.container import Container
-from connect.social import generate, instagram
+from connect.social import generate, instagram, palettes
 from connect.social import settings as post_settings
 from connect.social.card import render_card
 from connect.storage import documents as doc_dao
@@ -118,11 +120,19 @@ async def draft_social_post(document_id: int,
                             model=completion.model, usage=completion.usage,
                             user_id=user.id)
 
+    # auto-theme: pick a palette from the doc's topic + the model's suggestion,
+    # bake the chosen name into the content so publish re-renders identically.
+    topic = (enrichment.topics[0]
+             if enrichment is not None and enrichment.topics else None)
+    themed, palette = palettes.resolve_post_theme(
+        settings, topic=topic, suggested=completion.output.suggested_palette)
+    content = (completion.output.model_copy(update={"suggested_palette": palette})
+               if palette else completion.output)
+    logo = post_settings.load_logo(container.logo_store, themed)
     image = await asyncio.to_thread(
-        render_card, completion.output,
-        accent=settings.card_accent, sign_off=settings.sign_off)
+        render_card, content, settings=themed, logo=logo)
     return SocialPostDraft(
-        content=completion.output,
+        content=content,
         image_b64=base64.b64encode(image).decode("ascii"))
 
 
@@ -142,6 +152,70 @@ async def put_post_settings(body: PostSettingsUpdate,
     merged = post_settings._merge(current, body.model_dump(exclude_unset=True))
     await post_settings.set_global(db, merged)
     return merged
+
+
+# a representative post for the live style preview (no LLM, never persisted)
+_PREVIEW_SAMPLE = SocialPost(
+    headline="RBI holds the repo rate at 6.5% as inflation cools",
+    caption="The central bank kept its key rate steady, citing easing price"
+            " pressures and a steady growth outlook. Source: RBI.",
+    hashtags=["RBI", "MonetaryPolicy", "India"],
+    key_points=["Repo rate unchanged at 6.5%",
+                "Retail inflation eased to 4.8%",
+                "FY27 growth seen at 6.6%"],
+    source_label="Source: RBI",
+    alt_text="A summary card preview.")
+LOGO_MAX_BYTES = 2_000_000
+
+
+@router.post("/preview")
+async def preview_card(settings: PostSettings,
+                       container: Container = Depends(get_container),
+                       user: CurrentUser = Depends(get_current_user)):
+    """Render a sample card with the given settings — no LLM call — so the
+    style editor can show a live preview as colors/template/align change. The
+    sample is a monetary-policy story, so with auto-theme on the preview shows
+    the palette that topic would get."""
+    themed, _ = palettes.resolve_post_theme(
+        settings, topic="monetary-policy", suggested="gold")
+    logo = post_settings.load_logo(container.logo_store, themed)
+    image = await asyncio.to_thread(
+        render_card, _PREVIEW_SAMPLE, settings=themed, logo=logo)
+    return Response(content=image, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
+@router.post("/logo")
+async def upload_logo(file: UploadFile = File(...),
+                      container: Container = Depends(get_container),
+                      user: CurrentUser = Depends(get_current_user)):
+    """Upload a brand logo (normalized to a ≤512px PNG, stored by content sha).
+    Returns ``logo_sha`` to put on PostSettings.logo_sha; the card renderer
+    composites it and it is served at /api/social/logo/<sha>.png."""
+    raw = await file.read()
+    if len(raw) > LOGO_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="logo too large (max 2MB)")
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(raw)).convert("RGBA")
+        img.thumbnail((512, 512))
+        out = io.BytesIO()
+        img.save(out, format="PNG")
+        data = out.getvalue()
+    except Exception as e:  # noqa: BLE001 — any decode failure is a bad upload
+        raise HTTPException(status_code=422,
+                            detail="not a valid image file") from e
+    rel = container.logo_store.put(data)
+    return {"logo_sha": rel.rsplit("/", 1)[-1]}
+
+
+@router.get("/palettes")
+async def list_palettes(user: CurrentUser = Depends(get_current_user)):
+    """The built-in card palettes (name -> colors+template), the default
+    topic->palette map, and the topic vocabulary — for the auto-theme editor."""
+    return {"palettes": palettes.PALETTES,
+            "topic_defaults": palettes.DEFAULT_TOPIC_PALETTE,
+            "topics": list(T1_TOPICS)}
 
 
 @router.get("/instagram/status", response_model=InstagramStatus)
@@ -173,9 +247,13 @@ async def publish_social_post(document_id: int, body: SocialPublishRequest,
                    "INSTAGRAM_BUSINESS_ACCOUNT_ID and CONNECT_PUBLIC_BASE_URL)")
 
     settings = await post_settings.effective(db)
+    # re-apply the palette the draft chose (carried on the content) so the
+    # published card matches the preview.
+    themed, _ = palettes.resolve_post_theme(
+        settings, suggested=body.content.suggested_palette)
+    logo = post_settings.load_logo(container.logo_store, themed)
     image = await asyncio.to_thread(
-        render_card, body.content,
-        accent=settings.card_accent, sign_off=settings.sign_off)
+        render_card, body.content, settings=themed, logo=logo)
     rel = container.card_store.put(image)
     sha = rel.rsplit("/", 1)[-1]
     image_url = f"{s.public_base_url.rstrip('/')}/api/social/card/{sha}.jpg"
@@ -200,4 +278,37 @@ async def get_card(sha: str,
         raise HTTPException(status_code=404, detail="not found")
     return Response(
         content=container.card_store.get(rel), media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"})
+
+
+# PUBLIC (no auth): the rendered reel video. Instagram's servers fetch it from
+# here to publish a Reel; served ONLY from the dedicated reel store, keyed by
+# content sha, so it can never expose a (possibly private) document blob.
+@public_router.get("/reel/{sha}.mp4")
+async def get_reel(sha: str,
+                   container: Container = Depends(get_container)):
+    if not _SHA_RE.match(sha):
+        raise HTTPException(status_code=404, detail="not found")
+    rel = f"{sha[:2]}/{sha}"
+    if not container.reel_store.exists(rel):
+        raise HTTPException(status_code=404, detail="not found")
+    return Response(
+        content=container.reel_store.get(rel), media_type="video/mp4",
+        headers={"Cache-Control": "public, max-age=86400",
+                 "Accept-Ranges": "bytes"})
+
+
+# PUBLIC (no auth): the rendered card composites the logo server-side, but the
+# style editor also shows the uploaded logo directly. Served ONLY from the
+# dedicated logo store, keyed by content sha — it can never expose a doc blob.
+@public_router.get("/logo/{sha}.png")
+async def get_logo(sha: str,
+                   container: Container = Depends(get_container)):
+    if not _SHA_RE.match(sha):
+        raise HTTPException(status_code=404, detail="not found")
+    rel = f"{sha[:2]}/{sha}"
+    if not container.logo_store.exists(rel):
+        raise HTTPException(status_code=404, detail="not found")
+    return Response(
+        content=container.logo_store.get(rel), media_type="image/png",
         headers={"Cache-Control": "public, max-age=86400"})

@@ -19,6 +19,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
+import { cn } from "@/lib/utils";
 import { ApiError, getWorkspaceChat } from "@/lib/api";
 import type { ChatTurn } from "@/lib/api";
 import {
@@ -27,7 +28,13 @@ import {
   useWorkspaceChats,
 } from "@/lib/queries";
 
-export function WorkspaceChatPanel({ workspaceId }: { workspaceId: number }) {
+export function WorkspaceChatPanel({
+  workspaceId,
+  hero = false,
+}: {
+  workspaceId: number;
+  hero?: boolean;
+}) {
   const [chatId, setChatId] = useState<number | undefined>(undefined);
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [input, setInput] = useState("");
@@ -133,7 +140,14 @@ export function WorkspaceChatPanel({ workspaceId }: { workspaceId: number }) {
           </div>
         ) : null}
 
-        <div className="max-h-96 space-y-3 overflow-y-auto">
+        <div
+          className={cn(
+            "space-y-3 overflow-y-auto",
+            hero
+              ? "h-[clamp(360px,calc(100vh-360px),720px)]"
+              : "max-h-96",
+          )}
+        >
           {turns.length === 0 ? (
             <p className="text-sm text-muted-foreground">
               Ask about this workspace’s news, or tell the assistant to capture

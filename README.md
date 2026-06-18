@@ -11,6 +11,18 @@ accumulates structured knowledge — entities, events, story threads, claims, co
 on. Trust is the product: every assertion cites a stored immutable document snapshot, and
 the citation discipline is enforced mechanically, not by prompt-hoping.
 
+## Screenshots
+
+| Feed — live corpus, pipeline-transparency view | Content Studio — grounded posts & reels |
+|---|---|
+| ![Feed](docs/screenshots/feed.png) | ![Content Studio](docs/screenshots/content-studio.png) |
+| **Sources** — extensible registry, poll health | **Stories** — clustered story threads |
+| ![Sources](docs/screenshots/sources.png) | ![Stories](docs/screenshots/stories.png) |
+| **Investigations** — on-demand analyses | **Contradictions** — cross-source claim conflicts |
+| ![Investigations](docs/screenshots/investigations.png) | ![Contradictions](docs/screenshots/contradictions.png) |
+| **Workspaces** — conversational agent over the KB | **Library** — immutable document snapshots |
+| ![Workspaces](docs/screenshots/workspaces.png) | ![Library](docs/screenshots/library.png) |
+
 ## Deployment (Docker Compose — v0.2)
 
 The v0.2 runtime is six containers on one box, VPS-ready (design:

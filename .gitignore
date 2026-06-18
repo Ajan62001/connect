@@ -30,3 +30,6 @@ npm-debug.log*
 
 # Claude Code local machine settings (may contain secrets)
 .claude/settings.local.json
+
+# Screenshot scratch dir (puppeteer-core, node_modules)
+.shots/

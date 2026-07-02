@@ -91,6 +91,7 @@ class WeighedDoc:
     credibility_tier: int | None
     stance: str                 # supports | refutes | mixed
     relevance: float
+    reliability: float | None = None   # S4 dynamic credibility (None => tier)
 
 
 def tier_weight(credibility_tier: int | None) -> float:
@@ -99,14 +100,24 @@ def tier_weight(credibility_tier: int | None) -> float:
     return TIER_WEIGHTS.get(credibility_tier, UNKNOWN_TIER_WEIGHT)
 
 
+def source_weight(credibility_tier: int | None,
+                  reliability: float | None) -> float:
+    """The per-source base weight: the data-driven reliability (S4) when one has
+    been computed, else the static tier prior. Identical to tier_weight() until
+    a source has a track record, so existing verdicts are unchanged at launch."""
+    if reliability is not None:
+        return reliability
+    return tier_weight(credibility_tier)
+
+
 def weigh(docs: list[WeighedDoc]) -> list[float]:
-    """Effective weight per doc = tier-weight x relevance, with the
+    """Effective weight per doc = source-weight x relevance, with the
     per-domain independence discount applied in input order (callers sort
     deterministically: best tier first, then document id)."""
     seen_domains: set[str] = set()
     weights: list[float] = []
     for doc in docs:
-        w = tier_weight(doc.credibility_tier) * doc.relevance
+        w = source_weight(doc.credibility_tier, doc.reliability) * doc.relevance
         if doc.domain in seen_domains:
             w *= INDEPENDENCE_DISCOUNT
         else:
@@ -163,7 +174,7 @@ async def _doc_row(conn: psycopg.AsyncConnection,
     cur = await conn.execute(
         "SELECT d.id, d.title, d.url, d.content_text, d.visibility,"
         " d.owner_id, s.name AS source_name,"
-        " s.credibility_tier FROM document d"
+        " s.credibility_tier, s.reliability_score FROM document d"
         " LEFT JOIN source s ON s.id = d.source_id WHERE d.id = %s",
         (doc_id,))
     return await cur.fetchone()
@@ -504,6 +515,7 @@ async def _verify_claim(ctx: AnalysisContext, claim: DecomposedClaim,
         domain=doc_domain(doc["url"], doc["source_name"], doc["id"]),
         credibility_tier=doc["credibility_tier"],
         stance=j.stance, relevance=j.relevance,
+        reliability=doc.get("reliability_score"),
     ) for doc, j in accepted]
     weights = weigh(weighed_docs)
     stances = [(wd.stance, w) for wd, w in zip(weighed_docs, weights)]

@@ -18,11 +18,16 @@ import psycopg
 from psycopg_pool import AsyncConnectionPool
 
 from connect.analysis.budget import AnalysisBudget
+from connect.content import gate as gate_mod
 from connect.content import publish as publish_mod
+from connect.integrity import observe as integrity_observe
 from connect.content.factset import resolve_content_factset
 from connect.content.generate import FormatResult, generate_format
-from connect.content.render import render_carousel
+from connect.content.render import render_carousel, render_meme
+from connect.content import imagery
+from connect.content import plan as plan_mod
 from connect.content import reel as reel_render
+from connect.content import video as video_mod
 from connect.content.schema import ContentOptions, ContentSeed, FORMAT_SCHEMA
 from connect.social import palettes
 from connect.llm.provider import LLMError, LLMProvider
@@ -32,6 +37,7 @@ from connect.social import settings as post_settings
 from connect.social.card import render_card
 from connect.storage import campaigns as campaign_dao
 from connect.storage import content_items as item_dao
+from connect.storage import content_sources
 from connect.storage.pg import utc_now
 from connect.workers.queue import JobQueue
 from connect.workers.registry import CancelToken
@@ -182,23 +188,56 @@ class ContentService:
                        {"section": "gather",
                         "summary": f"{len(factset.facts)} facts gathered"})
 
+            # empty formats => 'auto': the editorial planner decides what to
+            # make of this story (significance, format mix, media treatment).
+            plan = None
+            if not formats:
+                plan = await plan_mod.plan_content(
+                    conn, self.provider, factset=factset, budget=budget,
+                    governor=self.governor, viewer=owner_id,
+                    video_available=video_mod.available(self.settings))
+                formats = [p.format for p in plan.picks]
+                await campaign_dao.set_plan(
+                    conn, campaign_id, plan=plan.model_dump(),
+                    formats=formats)
+                await emit("section_completed", {
+                    "section": "plan",
+                    "summary": f"{plan.significance_label}"
+                               f" ({plan.significance}/5) → "
+                               + ", ".join(formats),
+                    "plan": plan.model_dump()})
+            picks = {p.format: p for p in (plan.picks if plan else [])}
+
             for fmt in formats:
                 if cancel is not None:
                     await cancel.raise_if_cancelled()
+                pick = picks.get(fmt)
+                fmt_opts = opts
+                if pick is not None and fmt == "ig_reel" and opts.video is None:
+                    fmt_opts = opts.model_copy(
+                        update={"video": pick.media == "stock_video"})
                 result = await generate_format(
                     conn, self.provider, fmt=fmt, factset=factset,
-                    options=opts, settings=eff, budget=budget,
-                    governor=self.governor, viewer=owner_id)
+                    options=fmt_opts, settings=eff, budget=budget,
+                    governor=self.governor, viewer=owner_id,
+                    media_hint=(pick.media_query or None)
+                    if pick and pick.media != "none" else None,
+                    angle=(plan.angle or None) if plan else None,
+                    pick_reason=(pick.reason or None) if pick else None)
+                if pick is not None and pick.media == "none":
+                    result.content = _strip_image_queries(result.content)
                 card_shas = await self._render(result, eff, topic=seed.topic,
-                                               options=opts)
+                                               options=fmt_opts)
                 item_id = await item_dao.insert(
                     conn, campaign_id=campaign_id, owner_id=owner_id,
                     platform=result.platform, format=fmt,
                     content=result.content.model_dump(),
                     sources=[s.model_dump() for s in result.sources],
                     grounding=result.grounding, card_shas=card_shas,
-                    visibility=visibility)
+                    visibility=visibility, gate=result.gate)
                 made.append(item_id)
+                await integrity_observe.record_gate(
+                    conn, result.gate, surface="content", subject_id=item_id)
                 await emit("item_generated", {"item_id": item_id,
                                               "format": fmt})
         except Exception as e:
@@ -240,23 +279,52 @@ class ContentService:
         except Exception:  # noqa: BLE001 — fall back to global on any copy issue
             return self.settings
 
+    def _photo(self, query: str, *, variant: int = 0) -> bytes | None:
+        """Blocking stock-photo fetch for a card/meme background ('' -> None).
+        Never raises — a miss just falls back to the themed background."""
+        q = (query or "").strip()
+        if not q:
+            return None
+        try:
+            return imagery.fetch_scene_image(q, settings=self.settings,
+                                             variant=variant)
+        except Exception:  # noqa: BLE001 — imagery must never fail a render
+            return None
+
     async def _render(self, result: FormatResult, eff: Any, *,
                       topic: str | None = None, options: Any = None) -> list[str]:
-        """Render image cards (ig_card / ig_carousel) and store them; text
-        formats have no cards. Rendering is CPU-bound -> a worker thread.
+        """Render image cards (ig_card / ig_carousel / meme) and store them;
+        text formats have no cards. Rendering is CPU-bound -> a worker thread.
         When auto-theming is on, the card palette is resolved per item from the
-        campaign topic + the model's suggested palette."""
+        campaign topic + the model's suggested palette. Stock background
+        photos (optional per image_query) are fetched here — the renderers
+        stay network-free."""
         suggested = getattr(result.content, "suggested_palette", None)
         themed, _ = palettes.resolve_post_theme(eff, topic=topic,
                                                 suggested=suggested)
         logo = post_settings.load_logo(self.logo_store, themed)
         if result.fmt == "ig_card":
+            photo = await asyncio.to_thread(
+                self._photo, getattr(result.content, "image_query", ""))
             images = await asyncio.to_thread(
                 lambda: [render_card(result.content, settings=themed,
-                                     logo=logo)])
+                                     logo=logo, photo=photo)])
         elif result.fmt == "ig_carousel":
+            queries = [getattr(result.content, "image_query", ""),
+                       *[getattr(s, "image_query", "")
+                         for s in result.content.slides]]
+            photos = await asyncio.to_thread(
+                lambda: [self._photo(q, variant=i)
+                         for i, q in enumerate(queries)])
             images = await asyncio.to_thread(
-                render_carousel, result.content, settings=themed, logo=logo)
+                render_carousel, result.content, settings=themed, logo=logo,
+                photos=photos)
+        elif result.fmt == "meme":
+            photo = await asyncio.to_thread(
+                self._photo, getattr(result.content, "image_query", ""))
+            images = await asyncio.to_thread(
+                lambda: [render_meme(result.content, settings=themed,
+                                     logo=logo, photo=photo)])
         elif result.fmt == "ig_reel":
             # the reel renderer (Pillow frames + ffmpeg + TTS) returns one MP4;
             # its sha rides in card_shas like a card sha. Per-reel voice/music
@@ -273,6 +341,56 @@ class ContentService:
             rel = self.card_store.put(img)
             shas.append(rel.rsplit("/", 1)[-1])
         return shas
+
+    # -- verify (the content_verify job body, S2) -----------------------------
+
+    async def verify_item(self, conn: psycopg.AsyncConnection,
+                          item_id: int, *, promote_to: str = "approved") -> str:
+        """Re-run the editorial gate on a STORED item against the verbatim quotes
+        in its provenance graph (S1), persist the refreshed GateReport, and — if
+        the item is in the 'verifying' holding state — promote it out: to
+        'flagged' when enforcing and the gate flagged it, else to ``promote_to``.
+
+        Used by the content_verify job after approval (enforcing mode) and after
+        a hand-edit invalidates the generation-time report. Fails open: with no
+        provider it leaves the item untouched rather than blocking review."""
+        row = await item_dao.get_for_publish(conn, item_id)
+        if row is None:
+            raise LookupError(f"content_item {item_id} not found")
+        enforcing = bool(getattr(self.settings, "integrity_gate_enforcing",
+                                 False))
+        if self.provider is None:
+            # cannot verify without a model — never strand an item in
+            # 'verifying'. Unconditional CAS: the row snapshot can be stale
+            # (an approve may have flipped the item to 'verifying' after we
+            # read it), so let set_status's from_statuses guard decide.
+            await item_dao.set_status(
+                conn, item_id, owner_id=row["owner_id"], status=promote_to,
+                from_statuses=("verifying",))
+            return "no_provider"
+        links = await content_sources.list_for_item(conn, item_id)
+        report = await gate_mod.assess(
+            conn, self.provider,
+            content_texts=gate_mod.texts_from_content(row["content"] or {}),
+            source_quotes=[link["quote"] for link in links if link.get("quote")],
+            document_ids=[link["document_id"] for link in links
+                          if link.get("document_id")],
+            budget=AnalysisBudget(self.budget_usd), governor=self.governor,
+            viewer=row["owner_id"], enforcing=enforcing)
+        await item_dao.set_gate(conn, item_id, gate=report.model_dump())
+        await integrity_observe.record_gate(
+            conn, report.model_dump(), surface="content", subject_id=item_id,
+            user_id=row["owner_id"])
+        # unconditional CAS out of 'verifying': the row snapshot can be stale
+        # (an approve may have flipped the item to 'verifying' while the gate's
+        # LLM calls ran), so let set_status's from_statuses guard decide
+        # instead of the snapshot — a no-op when the item isn't verifying.
+        target = ("flagged" if (enforcing and report.verdict == "flagged")
+                  else promote_to)
+        await item_dao.set_status(
+            conn, item_id, owner_id=row["owner_id"], status=target,
+            from_statuses=("verifying",))
+        return report.verdict
 
     # -- publish (the content_publish job body) -------------------------------
 
@@ -291,7 +409,7 @@ class ContentService:
         s = self.settings
 
         card_urls: list[str] = []
-        if fmt in ("ig_card", "ig_carousel", "ig_reel"):
+        if fmt in ("ig_card", "ig_carousel", "ig_reel", "meme"):
             base = getattr(s, "public_base_url", None)
             if not base:
                 asset = "reel video" if fmt == "ig_reel" else "card image"
@@ -335,7 +453,7 @@ class ContentService:
         item = await item_dao.get(conn, item_id, viewer=owner_id)
         if item is None:
             return "gone"
-        if item.format not in ("ig_card", "ig_carousel", "ig_reel"):
+        if item.format not in ("ig_card", "ig_carousel", "ig_reel", "meme"):
             return "no media"
         content_obj = FORMAT_SCHEMA[item.format](**item.content)
         result = FormatResult(fmt=item.format, platform=item.platform,
@@ -346,6 +464,22 @@ class ContentService:
         await item_dao.set_card_shas(conn, item_id, owner_id=owner_id,
                                      card_shas=card_shas)
         return f"rendered {len(card_shas)}"
+
+
+def _strip_image_queries(content: Any) -> Any:
+    """Honor a planner media='none' pick: clear every image_query so _render
+    fetches no stock photos and the item ships as the clean themed treatment
+    the plan promised (and the plan chips display)."""
+    upd: dict[str, Any] = {}
+    if hasattr(content, "image_query"):
+        upd["image_query"] = ""
+    if hasattr(content, "slides"):
+        upd["slides"] = [s.model_copy(update={"image_query": ""})
+                         for s in content.slides]
+    if hasattr(content, "scenes"):
+        upd["scenes"] = [s.model_copy(update={"image_query": ""})
+                         for s in content.scenes]
+    return content.model_copy(update=upd) if upd else content
 
 
 def _is_cancel(exc: BaseException) -> bool:

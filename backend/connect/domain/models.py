@@ -212,7 +212,39 @@ class Source(_Frozen):
     created_at: str
     last_polled_at: str | None = None
     last_poll_status: str | None = None
+    reliability_score: float | None = None   # S4 dynamic credibility
     doc_count: int = 0
+
+
+class TrustSource(_Frozen):
+    """One cited source as the reader-facing trust panel shows it."""
+    ref: str
+    document_id: int | None = None
+    source_name: str | None = None
+    title: str | None = None
+    url: str | None = None
+    quote: str | None = None
+    credibility_tier: int | None = None
+    reliability_score: float | None = None
+
+
+class TrustReport(_Frozen):
+    """The 'why trust this' summary for a published deliverable (S6) — assembled
+    from the provenance graph (S1), the editorial gate (S2), corrections (S3),
+    and dynamic credibility (S4)."""
+    gate_verdict: str | None = None          # pass | flagged | error | None
+    flagged_count: int = 0
+    confidence: float | None = None          # coarse 0-1 trust signal
+    sources: list[TrustSource] = Field(default_factory=list)
+    tier_mix: dict[str, int] = Field(default_factory=dict)   # tier -> count
+    independent_publishers: int = 0
+    balance_score: float = 0.0
+    balance_label: str = "unknown"           # broad | moderate | narrow | single
+    one_sided: bool = False
+    contested: list[dict[str, Any]] = Field(default_factory=list)
+    corrections: list[dict[str, Any]] = Field(default_factory=list)
+    freshness: str | None = None             # newest source date seen
+    ai_disclosure: bool = True
 
 
 class SourceCreate(_Frozen):
@@ -495,6 +527,12 @@ class SocialPost(_Frozen):
     alt_text: str = Field(
         default="",
         description="One-sentence accessibility description of the card.")
+    image_query: str = Field(
+        default="",
+        description="Optional: 2-4 plain words to search the web for a"
+                    " background photo that fits the story — a concrete,"
+                    " photographable subject (e.g. 'Reserve Bank India"
+                    " building'). Empty for a clean themed card.")
     suggested_palette: str | None = Field(
         default=None,
         description="Optional: a palette name that fits the news mood, chosen"

@@ -30,6 +30,7 @@ dependencies = [
     "limits",
     "fastembed",
     "anthropic",
+    "langfuse>=3",
     "openpyxl",
     "xlrd",
     "python-docx",
@@ -53,3 +54,6 @@ include = ["connect*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# the evals harness (backend/evals/) is a top-level package that is not part
+# of the installed `connect` distribution; tests import it via the repo root
+pythonpath = ["."]

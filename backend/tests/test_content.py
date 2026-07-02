@@ -17,10 +17,13 @@ from connect.content.schema import (
     CarouselContent,
     CarouselSlide,
     LinkedInContent,
+    MemeContent,
     ReelContent,
     ReelScene,
     ThreadContent,
 )
+from connect.analysis.entailment import EntailmentJudgment
+from connect.content.plan import EditorialPlan, FormatPick
 from connect.content.service import ContentService
 from connect.domain.models import SocialPost
 from connect.storage import content_items as item_dao
@@ -46,6 +49,9 @@ def _set_content_llm(client, provider) -> None:
 def _content_provider(cite: str = "E1") -> MockProvider:
     m = f"[[{cite}]]"
     return MockProvider(respond_by_schema={
+        # the S2 editorial gate may entailment-check numeric sentences; default
+        # to 'entailed' so generation tests aren't gated on figure coverage.
+        EntailmentJudgment: lambda _u: EntailmentJudgment(label="entailed"),
         SocialPost: lambda _u: SocialPost(
             headline=f"RBI holds repo {m}",
             caption=f"The RBI held the repo rate {m}. Source: RBI.",
@@ -76,7 +82,22 @@ def _content_provider(cite: str = "E1") -> MockProvider:
                               image_query="vegetable market India")],
             caption="A quick look. Source: RBI.", hashtags=["RBI"],
             source_label="Source: RBI", alt_text="alt"),
+        MemeContent: lambda _u: MemeContent(
+            image_query="reserve bank building",
+            top_text="RBI meeting for hours",
+            bottom_text=f"Repo rate: still 6.5% {m}",
+            caption=f"The RBI held the repo rate {m}. Source: RBI.",
+            hashtags=["RBI"], source_label="Source: RBI", alt_text="meme"),
     })
+
+
+def _fake_photo_bytes() -> bytes:
+    """A tiny in-memory JPEG standing in for a fetched stock photo."""
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (320, 240), (40, 90, 140)).save(buf, format="JPEG")
+    return buf.getvalue()
 
 
 async def _wait_for_job(db, job_id: int, timeout: float = 15.0):
@@ -160,6 +181,78 @@ async def test_campaign_generates_all_formats(client, db):
     assert "event: done" in sse
 
 
+async def test_campaign_auto_plans_formats(client, db):
+    """formats=[] hands format choice to the editorial planner: the plan is
+    persisted on the campaign, the commissioned formats replace the empty
+    list, the items match the picks, and the media_query steers generation."""
+    inv_id = await _seed_investigation_with_finding(db)
+    prov = _content_provider()
+    prov.respond_by_schema[EditorialPlan] = lambda _u: EditorialPlan(
+        significance=4, rationale="major rate decision",
+        angle="fourth straight hold",
+        picks=[FormatPick(format="ig_card", reason="feed",
+                          media="stock_photo", media_query="rupee cash"),
+               FormatPick(format="x_thread", reason="fast", media="none")])
+    _set_content_llm(client, prov)
+
+    r = client.post("/api/campaigns",
+                    json={"investigation_id": inv_id, "formats": []})
+    assert r.status_code == 202, r.text
+    campaign_id, job_id = r.json()["campaign_id"], r.json()["job_id"]
+    assert (await _wait_for_job(db, job_id))["status"] == "done"
+
+    detail = client.get(f"/api/campaigns/{campaign_id}").json()
+    assert detail["status"] == "completed"
+    assert detail["formats"] == ["ig_card", "x_thread"]
+    assert detail["plan"]["significance"] == 4
+    assert detail["plan"]["big_news"] is True
+    assert detail["plan"]["significance_label"] == "major"
+    assert {it["format"] for it in detail["items"]} == {"ig_card", "x_thread"}
+
+    # the planner's media_query, angle and per-pick reason all reached the
+    # card generation prompt
+    card_calls = [c for c in prov.calls if c.get("schema") is SocialPost]
+    assert card_calls and "rupee cash" in card_calls[0]["user_text"]
+    assert "fourth straight hold" in card_calls[0]["user_text"]
+    assert "Why this format was commissioned: feed" in card_calls[0]["user_text"]
+    # a media='none' pick gets the angle but no visual-direction line
+    thread_calls = [c for c in prov.calls if c.get("schema") is ThreadContent]
+    assert thread_calls and "fourth straight hold" in thread_calls[0]["user_text"]
+    assert "Editorial visual direction" not in thread_calls[0]["user_text"]
+
+    # the plan step streamed as a section event
+    sse = client.get(f"/api/campaigns/{campaign_id}/events").text
+    assert '"section": "plan"' in sse or '"section":"plan"' in sse
+
+
+async def test_campaign_auto_honors_no_media_pick(client, db):
+    """A pick with media='none' (the clean themed treatment) is HONORED: even
+    when the generation model fills image_query, the stored item ships with
+    it cleared so no stock photo is fetched — the render matches the plan."""
+    inv_id = await _seed_investigation_with_finding(db)
+    prov = _content_provider()
+    prov.respond_by_schema[SocialPost] = lambda _u: SocialPost(
+        headline="RBI holds repo [[E1]]",
+        caption="The RBI held the repo rate [[E1]]. Source: RBI.",
+        hashtags=["RBI"], key_points=["Repo steady [[E1]]"],
+        source_label="Source: RBI", alt_text="card",
+        image_query="rupee note")
+    prov.respond_by_schema[EditorialPlan] = lambda _u: EditorialPlan(
+        significance=3, rationale="r",
+        picks=[FormatPick(format="ig_card", reason="clean card",
+                          media="none")])
+    _set_content_llm(client, prov)
+
+    r = client.post("/api/campaigns",
+                    json={"investigation_id": inv_id, "formats": []})
+    assert r.status_code == 202, r.text
+    assert (await _wait_for_job(db, r.json()["job_id"]))["status"] == "done"
+
+    detail = client.get(f"/api/campaigns/{r.json()['campaign_id']}").json()
+    item = next(it for it in detail["items"] if it["format"] == "ig_card")
+    assert item["content"]["image_query"] == ""
+
+
 async def test_campaign_generates_reel(client, db, monkeypatch):
     """ig_reel runs the full pipeline: grounded ReelContent -> ffmpeg MP4 ->
     item with the mp4 sha in card_shas -> served at the public reel endpoint.
@@ -189,6 +282,105 @@ async def test_campaign_generates_reel(client, db, monkeypatch):
     assert vid.status_code == 200
     assert vid.headers["content-type"] == "video/mp4"
     assert vid.content[4:8] == b"ftyp"          # a real MP4
+
+
+async def test_campaign_generates_meme(client, db, monkeypatch):
+    """meme runs the full pipeline: grounded MemeContent -> stock photo
+    (monkeypatched — no network) -> impact-caption JPEG in card_shas ->
+    served at the public card endpoint."""
+    import connect.content.imagery as imagery_mod
+    calls: list[str] = []
+
+    def fake_fetch(query, *, settings=None, variant=0):
+        calls.append(query)
+        return _fake_photo_bytes()
+
+    monkeypatch.setattr(imagery_mod, "fetch_scene_image", fake_fetch)
+
+    inv_id = await _seed_investigation_with_finding(db)
+    _set_content_llm(client, _content_provider())
+    r = client.post("/api/campaigns",
+                    json={"investigation_id": inv_id, "formats": ["meme"]})
+    assert r.status_code == 202, r.text
+    job_id = r.json()["job_id"]
+    assert (await _wait_for_job(db, job_id))["status"] == "done"
+
+    detail = client.get(f"/api/campaigns/{r.json()['campaign_id']}").json()
+    item = detail["items"][0]
+    assert item["format"] == "meme"
+    assert item["platform"] == "instagram"
+    assert item["status"] == "draft"
+    assert item["grounding"]["cited_count"] == 1
+    assert "[[" not in str(item["content"])     # markers stripped
+    assert item["content"]["top_text"] == "RBI meeting for hours"
+    assert len(item["card_shas"]) == 1
+    assert calls == ["reserve bank building"]   # the meme's photo was fetched
+
+    sha = item["card_shas"][0]
+    card = client.get(f"/api/social/card/{sha}.jpg")
+    assert card.status_code == 200
+    assert card.headers["content-type"] == "image/jpeg"
+
+
+def test_render_meme_offline():
+    """render_meme is pure: photo bytes in -> JPEG out; no photo -> themed
+    fallback; junk photo bytes -> themed fallback (never raises)."""
+    from connect.content.render import render_meme
+    from connect.domain.models import PostSettings
+
+    meme = MemeContent(
+        image_query="crowded train", top_text="Setup line",
+        bottom_text="Punchline", caption="The real news. Source: X.",
+        hashtags=[], source_label="Source: X")
+    s = PostSettings()
+    with_photo = render_meme(meme, settings=s, photo=_fake_photo_bytes())
+    plain = render_meme(meme, settings=s, photo=None)
+    junk = render_meme(meme, settings=s, photo=b"not an image")
+    for jpeg in (with_photo, plain, junk):
+        assert jpeg[:3] == b"\xff\xd8\xff"      # JPEG magic
+    assert with_photo != plain
+
+
+def test_render_card_and_carousel_photo_background():
+    """A photo becomes a scrimmed background on cards / carousel slides; the
+    plain render is unchanged when no photo is given."""
+    from connect.content.render import render_carousel
+    from connect.social.card import render_card
+    from connect.domain.models import PostSettings
+
+    s = PostSettings()
+    post = SocialPost(headline="Inflation eases", caption="c",
+                      key_points=["Food prices fell"],
+                      source_label="Source: RBI")
+    assert render_card(post, settings=s, photo=_fake_photo_bytes()) != \
+        render_card(post, settings=s)
+
+    car = CarouselContent(
+        title="Cover", image_query="market",
+        slides=[CarouselSlide(heading="One", bullets=["a"],
+                              image_query="veg"),
+                CarouselSlide(heading="Two", bullets=["b"])],
+        caption="c", hashtags=[], source_label="Source: X")
+    photod = render_carousel(car, settings=s,
+                             photos=[_fake_photo_bytes(), None, None])
+    plain = render_carousel(car, settings=s)
+    assert len(photod) == len(plain) == 3
+    assert photod[0] != plain[0]                # cover got the photo
+    assert photod[2] == plain[2]                # un-photoed slide unchanged
+
+
+def test_zapier_payload_for_meme():
+    from connect.content.publish import build_zapier_payload
+
+    payload = build_zapier_payload(
+        "meme",
+        {"image_query": "q", "top_text": "T", "bottom_text": "B",
+         "caption": "The news. Source: X.", "hashtags": ["News"]},
+        ["http://x/card/abc.jpg"], item_id=7)
+    assert payload["platform"] == "instagram"
+    assert payload["media_type"] == "image"
+    assert payload["caption"].startswith("The news.")
+    assert "#News" in payload["caption"]
 
 
 async def test_rerender_reel_after_edit(client, db, monkeypatch):

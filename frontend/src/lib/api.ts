@@ -2785,15 +2785,33 @@ export type ContentFormat =
   | "ig_carousel"
   | "x_thread"
   | "linkedin_post"
-  | "ig_reel";
+  | "ig_reel"
+  | "meme";
+
+/** Content payload for the "meme" format (platform "instagram"). Rendered
+ * server-side to one JPEG whose sha rides in card_shas (previewed via
+ * cardUrl, like ig_card); edits go through POST /content/{id}/rerender. */
+export interface MemeContent {
+  image_query: string;
+  top_text: string;
+  bottom_text: string;
+  caption: string;
+  hashtags: string[];
+  source_label?: string;
+  alt_text?: string;
+}
 
 export type ContentItemStatus =
   | "draft"
+  | "verifying"
   | "approved"
   | "scheduled"
   | "published"
   | "rejected"
-  | "failed";
+  | "failed"
+  | "flagged"
+  | "corrected"
+  | "retracted";
 
 /** Grounding telemetry for a generated item (how many cited menu items, etc.). */
 export interface ContentGrounding {
@@ -2813,6 +2831,7 @@ export interface ContentItem {
   content: Record<string, unknown>;
   sources: StorySource[];
   grounding: ContentGrounding;
+  gate?: GateReport;
   card_shas: string[];
   scheduled_at: string | null;
   published_at: string | null;
@@ -2820,6 +2839,49 @@ export interface ContentItem {
   error: string | null;
   edited: boolean;
   created_at: string;
+}
+
+/** The editorial verification-gate report (S2) carried on a content item. */
+export interface GateReport {
+  verdict?: "pass" | "flagged" | "error";
+  checked?: number;
+  flagged?: { statement: string; reason: string; detail?: string }[];
+  contested?: { claim_id: number; text: string; verdict: string }[];
+  enforcing?: boolean;
+  error?: string | null;
+}
+
+/** A cited source as the trust panel shows it (S6). */
+export interface TrustSource {
+  ref: string;
+  document_id: number | null;
+  source_name: string | null;
+  title: string | null;
+  url: string | null;
+  quote: string | null;
+  credibility_tier: number | null;
+  reliability_score: number | null;
+}
+
+/** The reader-facing "why trust this" report (S6). */
+export interface TrustReport {
+  gate_verdict: string | null;
+  flagged_count: number;
+  confidence: number | null;
+  sources: TrustSource[];
+  tier_mix: Record<string, number>;
+  independent_publishers: number;
+  balance_score: number;
+  balance_label: string;
+  one_sided: boolean;
+  contested: { claim_id: number; text: string; verdict: string }[];
+  corrections: { action: string; kind: string; to_verdict?: string; detail?: string }[];
+  freshness: string | null;
+  ai_disclosure: boolean;
+}
+
+export async function getContentTrust(itemId: number): Promise<TrustReport> {
+  return request<TrustReport>(`/api/content/${itemId}/trust`);
 }
 
 export interface CampaignListItem {
@@ -2832,12 +2894,28 @@ export interface CampaignListItem {
   created_at: string;
 }
 
+/** The editorial planner's decision on an 'auto' campaign (formats: []). */
+export interface EditorialPlan {
+  significance: number; // 1-5
+  significance_label: string; // breaking | major | notable | minor | routine
+  big_news: boolean;
+  angle: string;
+  rationale: string;
+  picks: {
+    format: ContentFormat;
+    reason: string;
+    media: "stock_photo" | "stock_video" | "none";
+    media_query: string;
+  }[];
+}
+
 export interface CampaignDetail {
   id: number;
   subject: string;
   input_type: string;
   status: string;
   formats: string[];
+  plan: EditorialPlan | null;
   error: string | null;
   items: ContentItem[];
   created_at: string;
@@ -2854,6 +2932,7 @@ export interface CampaignCreate {
   investigation_id?: number;
   workspace_id?: number;
   story_id?: number;
+  /** Empty => 'auto': the editorial planner picks the formats and media. */
   formats: ContentFormat[];
   options?: ReelOptions;
 }
@@ -2863,6 +2942,7 @@ export const CONTENT_FORMATS: { value: ContentFormat; label: string }[] = [
   { value: "ig_reel", label: "Instagram Reel" },
   { value: "ig_card", label: "Instagram Card" },
   { value: "ig_carousel", label: "Instagram Carousel" },
+  { value: "meme", label: "Meme" },
   { value: "x_thread", label: "X Thread" },
   { value: "linkedin_post", label: "LinkedIn Post" },
 ];

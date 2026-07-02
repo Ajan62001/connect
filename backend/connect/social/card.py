@@ -149,6 +149,78 @@ def _new(bg):
     return img, ImageDraw.Draw(img)
 
 
+_WHITE = (248, 250, 252)
+_SOFT = (226, 232, 240)
+
+
+def _photo_bg(photo: bytes | None, *, scrim: bool = True):
+    """Cover-crop ``photo`` to the square canvas, optionally baking in a scrim
+    (overall darken + a stronger bottom gradient) so white text reads on any
+    image. Returns None when the bytes aren't a usable image — callers fall
+    back to the themed solid background. The photo bytes are FETCHED BY THE
+    CALLER; this module stays network-free."""
+    if not photo:
+        return None
+    try:
+        from PIL import Image, ImageOps
+        img = ImageOps.fit(Image.open(io.BytesIO(photo)).convert("RGB"),
+                           (SIZE, SIZE), method=Image.LANCZOS)
+        if not scrim:
+            return img
+        col = []
+        for yy in range(SIZE):
+            ty = yy / SIZE
+            a = 0.42
+            if ty > 0.55:
+                a += 0.30 * (ty - 0.55) / 0.45
+            col.append(int(min(0.85, a) * 255))
+        alpha = Image.new("L", (1, SIZE))
+        alpha.putdata(col)
+        alpha = alpha.resize((SIZE, SIZE))
+        black = Image.new("RGB", (SIZE, SIZE), (0, 0, 0))
+        return Image.composite(black, img, alpha)
+    except Exception:  # noqa: BLE001 — a bad photo never breaks the card
+        return None
+
+
+def _shadow_block(draw, lines: list[str], font, fill, *, y: int, line_h: int,
+                  align: str, left: int = MARGIN,
+                  inner: int = SIZE - 2 * MARGIN) -> int:
+    """_draw_block with a drop shadow, for text over a photo."""
+    for line in lines:
+        x = left
+        if align == "center":
+            x = left + (inner - draw.textlength(line, font=font)) / 2
+        draw.text((x + 3, y + 3), line, font=font, fill=(10, 12, 16))
+        draw.text((x, y), line, font=font, fill=fill)
+        y += line_h
+    return y
+
+
+def _render_photo(content, t: _Theme, logo, img):
+    """The classic layout over a scrimmed photo — white shadowed text reads
+    on any image; the accent bar and logo keep the brand."""
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([0, 0, SIZE, 14], fill=t.accent)
+    _paste_logo(img, logo)
+    inner = SIZE - 2 * MARGIN
+    y = MARGIN + 12
+    label = (content.source_label or "connect").strip().upper()[:48]
+    y = _shadow_block(draw, [label], _font(_BOLD, 30), _WHITE, y=y, line_h=66,
+                      align=t.align)
+    head_font = _font(_BOLD, t.head_px)
+    head_lines = _wrap(draw, content.headline.strip(), head_font, inner)[:5]
+    y = _shadow_block(draw, head_lines, head_font, _WHITE, y=y,
+                      line_h=int(t.head_px * 1.22), align=t.align)
+    y += 34
+    _bullets(draw, content.key_points, _font(_REG, 38), _SOFT, t.accent,
+             y=y, align=t.align, dotted=True)
+    draw.text((MARGIN, SIZE - MARGIN + 6), t.sign_off, font=_font(_REG, 28),
+              fill=_SOFT)
+    return img
+
+
 def _render_classic(content, t: _Theme, logo):
     img, draw = _new(t.bg)
     draw.rectangle([0, 0, SIZE, 14], fill=t.accent)
@@ -229,12 +301,19 @@ _TEMPLATES = {
 
 
 def render_card(content: SocialPost, *, settings: PostSettings,
-                logo: bytes | None = None) -> bytes:
+                logo: bytes | None = None,
+                photo: bytes | None = None) -> bytes:
     """Render the post onto a branded square card per the effective
-    PostSettings; returns JPEG bytes ready for download or the Graph API."""
+    PostSettings; returns JPEG bytes ready for download or the Graph API.
+    ``photo`` (optional raw image bytes, fetched by the caller) becomes a
+    scrimmed full-bleed background with white shadowed text."""
     t = _Theme(settings)
-    render = _TEMPLATES.get(settings.card_template, _render_classic)
-    img = render(content, t, logo)
+    bg = _photo_bg(photo)
+    if bg is not None:
+        img = _render_photo(content, t, logo, bg)
+    else:
+        render = _TEMPLATES.get(settings.card_template, _render_classic)
+        img = render(content, t, logo)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=88)
     return buf.getvalue()

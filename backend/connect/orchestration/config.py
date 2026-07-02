@@ -331,9 +331,34 @@ class Settings(BaseSettings):
     # per-user override columns on app_user trump both.
     member_daily_budget_usd: float = 0.50
     member_investigation_daily_budget_usd: float = 2.0
+    # Editorial verification gate (S2). The gate always RUNS and annotates each
+    # item with a GateReport; this flag controls whether a 'flagged' verdict is
+    # a HARD publish-block (enforcing) or a soft, owner-visible hold (warn-only,
+    # the launch default until S5's live evals validate entailment precision).
+    integrity_gate_enforcing: bool = False
     # worker-flavor cap on concurrent Anthropic calls (runtime design §5;
     # wired in the safety/ops phase alongside the governors)
     llm_max_concurrent: int = 4
+    # Langfuse observability (optional): with BOTH keys set, every Anthropic
+    # call through AnthropicProvider is traced as a Langfuse generation
+    # (model, tier, input/output, token usage, latency, errors). Unset =>
+    # tracing is a no-op. Host defaults to Langfuse Cloud; point it at a
+    # self-hosted instance otherwise.
+    langfuse_public_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "LANGFUSE_PUBLIC_KEY", "CONNECT_LANGFUSE_PUBLIC_KEY"),
+    )
+    langfuse_secret_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "LANGFUSE_SECRET_KEY", "CONNECT_LANGFUSE_SECRET_KEY"),
+    )
+    langfuse_host: str = Field(
+        default="https://cloud.langfuse.com",
+        validation_alias=AliasChoices(
+            "LANGFUSE_HOST", "CONNECT_LANGFUSE_HOST"),
+    )
     # backpressure → 429 on POST /analyses|/investigations (runtime design
     # §5; enforced in api/limits.py against job.owner_id)
     user_max_interactive: int = 2

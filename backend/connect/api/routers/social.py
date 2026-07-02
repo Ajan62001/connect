@@ -246,6 +246,26 @@ async def publish_social_post(document_id: int, body: SocialPublishRequest,
             detail="Instagram is not connected (set INSTAGRAM_ACCESS_TOKEN, "
                    "INSTAGRAM_BUSINESS_ACCOUNT_ID and CONNECT_PUBLIC_BASE_URL)")
 
+    # S2 editorial gate: the publish body carries CLIENT-supplied content, so
+    # re-verify it server-side against the real source document before it can
+    # reach Instagram. In enforcing mode an unsupported (e.g. fabricated/drifted)
+    # figure hard-blocks; warn-only skips the check (it would not block anyway).
+    if (getattr(s, "integrity_gate_enforcing", False)
+            and container.llm is not None and (doc.content_text or "").strip()):
+        from connect.analysis.budget import AnalysisBudget
+        from connect.content import gate as gate_mod
+        report = await gate_mod.assess(
+            db, container.llm,
+            content_texts=gate_mod.texts_from_content(body.content.model_dump()),
+            source_quotes=[doc.content_text], document_ids=[document_id],
+            budget=AnalysisBudget(0.20), governor=container.governor,
+            viewer=user.id, enforcing=True)
+        if report.blocks():
+            raise HTTPException(
+                status_code=409,
+                detail="editorial gate blocked this post: a published statement"
+                       " is not supported by the source document")
+
     settings = await post_settings.effective(db)
     # re-apply the palette the draft chose (carried on the content) so the
     # published card matches the preview.

@@ -37,6 +37,10 @@ EXPECTED_TABLES = {
     "statement", "position_shift", "view_summary",
     "job", "job_event", "watch", "watch_hit", "post", "workspace", "workspace_chat", "social_draft",
     "campaign", "content_item",  # v16: social content pipeline
+    "content_item_source",  # v19: editorial-integrity provenance graph (S1)
+    "correction", "content_item_correction",  # v21: corrections (S3)
+    "source_credibility_history",  # v22: dynamic credibility (S4)
+    "integrity_event", "integrity_eval_run",  # v23: integrity obs (S5)
     "brief", "brief_item", "view_cursor", "calendar_event", "llm_call",
     "source_stats", "document_embedding", "event_embedding",
     "claim_embedding",
@@ -62,7 +66,7 @@ async def _insert_document(conn, content_hash: str, *, title=None,
 
 async def test_fresh_init_creates_full_schema(pg_fresh_dsn):
     version = await pg.init_db(pg_fresh_dsn)
-    assert version == PG_SCHEMA_VERSION == 18
+    assert version == PG_SCHEMA_VERSION == 25
 
     conn = await pg.connect(pg_fresh_dsn)
     try:
@@ -98,7 +102,9 @@ async def test_fresh_init_creates_full_schema(pg_fresh_dsn):
                 "idx_document_owner", "idx_document_visibility_fetched",
                 "idx_dossier_owner", "idx_dossier_visible",
                 "idx_watch_user", "idx_llm_call_user_day",
-                "idx_session_expires"):
+                "idx_session_expires",
+                "uq_job_poll_source", "uq_job_publish_item",
+                "uq_job_content_verify", "uq_job_content_correction"):
             assert required in indexes, required
 
         # named constraints exist, incl. the circular-pair closer
@@ -532,7 +538,7 @@ async def test_migrate_2_to_3_backfills_to_first_admin(pg_fresh_dsn):
             "INSERT INTO view_cursor (surface, ref_id, last_seen_at)"
             " VALUES ('entity', 1, %s)", (pg.utc_now(),))
 
-        assert await pg.init_db(pg_fresh_dsn) == PG_SCHEMA_VERSION == 18
+        assert await pg.init_db(pg_fresh_dsn) == PG_SCHEMA_VERSION == 25
 
         for table, col in (("dossier", "owner_id"), ("watch", "user_id"),
                            ("brief", "user_id"),

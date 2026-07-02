@@ -31,6 +31,19 @@ async def run_content_publish(ctx: WorkerContext,
         target=str(payload.get("target") or "direct"))
 
 
+@register("content_verify")
+async def run_content_verify(ctx: WorkerContext,
+                            payload: dict[str, Any]) -> Any:
+    """S2 editorial gate: re-verify a stored item against its provenance quotes,
+    persist the refreshed report, and (enforcing mode) promote it out of the
+    'verifying' holding state."""
+    service = ctx.services.content
+    assert service is not None, "ContentService not wired"
+    return await service.verify_item(
+        ctx.conn, int(payload["item_id"]),
+        promote_to=str(payload.get("promote_to") or "approved"))
+
+
 @register("content_render")
 async def run_content_render(ctx: WorkerContext,
                              payload: dict[str, Any]) -> Any:

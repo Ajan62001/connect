@@ -2,7 +2,7 @@
 
 import { useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FilmIcon, Loader2Icon, PlusIcon, Trash2Icon, Wand2Icon } from "lucide-react";
+import { FilmIcon, ImageIcon, Loader2Icon, PlusIcon, Trash2Icon, Wand2Icon } from "lucide-react";
 import { toast } from "sonner";
 
 import { EmptyState } from "@/components/shared/EmptyState";
@@ -24,12 +24,14 @@ import {
   type ContentFormat,
   type ContentItem,
   type ContentOptions,
+  type MemeContent,
   type StorySource,
   type VoiceOption,
   createCampaign,
   deleteCampaign,
   editContent,
   getCampaign,
+  getContentTrust,
   getReelCapabilities,
   getVoices,
   listCampaigns,
@@ -40,18 +42,34 @@ import {
   scheduleContent,
 } from "@/lib/api";
 import { absoluteTime, relativeTime } from "@/lib/format";
+import { TrustPanel } from "@/components/trust/TrustPanel";
 
 const STATUS_VARIANT: Record<string, "default" | "secondary" | "outline" | "destructive"> = {
   draft: "outline",
+  verifying: "outline",
   approved: "secondary",
   scheduled: "secondary",
   published: "default",
   rejected: "outline",
   failed: "destructive",
+  flagged: "destructive",
+  corrected: "destructive",
+  retracted: "destructive",
+};
+
+/** Planner significance label -> badge tone, so "breaking 5/5" and
+ * "routine 1/5" stop looking alike (labels are a closed set: the backend
+ * always derives them from the score). */
+const SIGNIFICANCE_VARIANT: Record<string, "default" | "secondary" | "outline" | "destructive"> = {
+  breaking: "destructive",
+  major: "default",
+  notable: "secondary",
+  minor: "outline",
+  routine: "outline",
 };
 
 /** Formats whose media (image/video) must be re-rendered after an edit. */
-const MEDIA_FORMATS = new Set<ContentFormat>(["ig_card", "ig_carousel", "ig_reel"]);
+const MEDIA_FORMATS = new Set<ContentFormat>(["ig_card", "ig_carousel", "ig_reel", "meme"]);
 
 const selectCls = "h-8 rounded-md border bg-background px-2 text-sm";
 
@@ -217,6 +235,8 @@ function NumberField({
 function CreateCampaign({ workspaceId }: { workspaceId?: number }) {
   const qc = useQueryClient();
   const [topic, setTopic] = useState("");
+  // auto: send formats [] and let the editorial planner pick the mix + media
+  const [auto, setAuto] = useState(false);
   const [formats, setFormats] = useState<Set<ContentFormat>>(new Set(["ig_reel"]));
   const [tone, setTone] = useState("");
   const [style, setStyle] = useState("");
@@ -242,9 +262,11 @@ function CreateCampaign({ workspaceId }: { workspaceId?: number }) {
       };
       if (tone.trim()) options.tone = tone.trim();
       if (style.trim()) options.style = style.trim();
-      if (formats.has("ig_reel")) Object.assign(options, reelOptionsFrom(reel));
+      // auto mode leaves the reel controls at server defaults so the planner's
+      // media decision (photo slideshow vs video b-roll) is not overridden
+      if (!auto && formats.has("ig_reel")) Object.assign(options, reelOptionsFrom(reel));
       const seed = workspaceId ? { workspace_id: workspaceId } : { topic: topic.trim() };
-      return createCampaign({ ...seed, formats: [...formats], options });
+      return createCampaign({ ...seed, formats: auto ? [] : [...formats], options });
     },
     onSuccess: () => {
       toast.success("Campaign started", { description: "Drafts appear below once generation finishes." });
@@ -262,10 +284,10 @@ function CreateCampaign({ workspaceId }: { workspaceId?: number }) {
       return next;
     });
 
-  const hasReel = formats.has("ig_reel");
-  const hasCarousel = formats.has("ig_carousel");
-  const hasThread = formats.has("x_thread");
-  const canSubmit = (workspaceId ? true : topic.trim().length > 0) && formats.size > 0;
+  const hasReel = !auto && formats.has("ig_reel");
+  const hasCarousel = !auto && formats.has("ig_carousel");
+  const hasThread = !auto && formats.has("x_thread");
+  const canSubmit = (workspaceId ? true : topic.trim().length > 0) && (auto || formats.size > 0);
 
   return (
     <div className="mb-6 space-y-3 rounded-xl border bg-muted/30 p-4">
@@ -282,19 +304,40 @@ function CreateCampaign({ workspaceId }: { workspaceId?: number }) {
         />
       )}
       <div className="flex flex-wrap gap-1.5">
+        <Button
+          type="button"
+          size="xs"
+          variant={auto ? "secondary" : "outline"}
+          aria-pressed={auto}
+          title="The editor decides: how big the story is, which formats to make, and the media treatment"
+          onClick={() => setAuto((a) => !a)}
+        >
+          <Wand2Icon data-icon="inline-start" />
+          Auto
+        </Button>
         {CONTENT_FORMATS.map((f) => (
           <Button
             key={f.value}
             type="button"
             size="xs"
-            variant={formats.has(f.value) ? "secondary" : "outline"}
-            aria-pressed={formats.has(f.value)}
-            onClick={() => toggle(f.value)}
+            className={auto ? "opacity-40" : undefined}
+            variant={!auto && formats.has(f.value) ? "secondary" : "outline"}
+            aria-pressed={!auto && formats.has(f.value)}
+            onClick={() => {
+              setAuto(false);
+              toggle(f.value);
+            }}
           >
             {f.label}
           </Button>
         ))}
       </div>
+      {auto ? (
+        <p className="text-xs text-muted-foreground">
+          Auto: the planner judges the story&rsquo;s significance and picks the format mix (reel, card,
+          carousel, thread, LinkedIn or meme) plus the media treatment for each.
+        </p>
+      ) : null}
 
       {/* shared generation controls */}
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
@@ -409,6 +452,7 @@ interface CardShape {
   hashtags?: string[];
   source_label?: string;
   alt_text?: string;
+  image_query?: string;
 }
 function CardEditor({ item, onRegenerating }: { item: ContentItem; onRegenerating: () => void }) {
   const [c, setC] = useState<CardShape>(() => structuredClone(item.content) as unknown as CardShape);
@@ -432,6 +476,9 @@ function CardEditor({ item, onRegenerating }: { item: ContentItem; onRegeneratin
           onChange={(e) => setC((p) => ({ ...p, key_points: textToLines(e.target.value) }))}
         />
       </Labeled>
+      <Labeled label="Background photo (2-4 words, optional)">
+        <Input value={c.image_query ?? ""} onChange={(e) => setC((p) => ({ ...p, image_query: e.target.value }))} />
+      </Labeled>
       <HashtagsField value={c.hashtags} onChange={(h) => setC((p) => ({ ...p, hashtags: h }))} />
       <SaveButton media pending={save.isPending} onClick={() => save.mutate({ content: c as unknown as Record<string, unknown> })} />
     </div>
@@ -441,6 +488,7 @@ function CardEditor({ item, onRegenerating }: { item: ContentItem; onRegeneratin
 interface CarouselSlideShape {
   heading: string;
   bullets?: string[];
+  image_query?: string;
 }
 interface CarouselShape {
   title: string;
@@ -449,6 +497,7 @@ interface CarouselShape {
   hashtags?: string[];
   source_label?: string;
   alt_text?: string;
+  image_query?: string;
 }
 function CarouselEditor({ item, onRegenerating }: { item: ContentItem; onRegenerating: () => void }) {
   const [c, setC] = useState<CarouselShape>(() => structuredClone(item.content) as unknown as CarouselShape);
@@ -459,6 +508,9 @@ function CarouselEditor({ item, onRegenerating }: { item: ContentItem; onRegener
     <div className={editorBox}>
       <Labeled label="Cover title">
         <Input value={c.title} onChange={(e) => setC((p) => ({ ...p, title: e.target.value }))} />
+      </Labeled>
+      <Labeled label="Cover background photo (2-4 words, optional)">
+        <Input value={c.image_query ?? ""} onChange={(e) => setC((p) => ({ ...p, image_query: e.target.value }))} />
       </Labeled>
       {c.slides.map((s, i) => (
         <div key={i} className="space-y-1 rounded-md border p-2">
@@ -484,6 +536,12 @@ function CarouselEditor({ item, onRegenerating }: { item: ContentItem; onRegener
             value={linesToText(s.bullets)}
             onChange={(e) => setSlide(i, { bullets: textToLines(e.target.value) })}
           />
+          <Input
+            className="text-xs"
+            placeholder="Background photo (2-4 words, optional)"
+            value={s.image_query ?? ""}
+            onChange={(e) => setSlide(i, { image_query: e.target.value })}
+          />
         </div>
       ))}
       <Button
@@ -494,6 +552,33 @@ function CarouselEditor({ item, onRegenerating }: { item: ContentItem; onRegener
         <PlusIcon data-icon="inline-start" />
         Add slide
       </Button>
+      <Labeled label="Caption">
+        <Textarea
+          className="min-h-16 text-sm"
+          value={c.caption}
+          onChange={(e) => setC((p) => ({ ...p, caption: e.target.value }))}
+        />
+      </Labeled>
+      <HashtagsField value={c.hashtags} onChange={(h) => setC((p) => ({ ...p, hashtags: h }))} />
+      <SaveButton media pending={save.isPending} onClick={() => save.mutate({ content: c as unknown as Record<string, unknown> })} />
+    </div>
+  );
+}
+
+function MemeEditor({ item, onRegenerating }: { item: ContentItem; onRegenerating: () => void }) {
+  const [c, setC] = useState<MemeContent>(() => structuredClone(item.content) as unknown as MemeContent);
+  const save = useItemSave(item, onRegenerating);
+  return (
+    <div className={editorBox}>
+      <Labeled label="Top text">
+        <Input value={c.top_text} onChange={(e) => setC((p) => ({ ...p, top_text: e.target.value }))} />
+      </Labeled>
+      <Labeled label="Bottom text">
+        <Input value={c.bottom_text} onChange={(e) => setC((p) => ({ ...p, bottom_text: e.target.value }))} />
+      </Labeled>
+      <Labeled label="Background photo (2-4 words)">
+        <Input value={c.image_query} onChange={(e) => setC((p) => ({ ...p, image_query: e.target.value }))} />
+      </Labeled>
       <Labeled label="Caption">
         <Textarea
           className="min-h-16 text-sm"
@@ -655,6 +740,8 @@ function ContentEditor({ item, onRegenerating }: { item: ContentItem; onRegenera
       return <CardEditor item={item} onRegenerating={onRegenerating} />;
     case "ig_carousel":
       return <CarouselEditor item={item} onRegenerating={onRegenerating} />;
+    case "meme":
+      return <MemeEditor item={item} onRegenerating={onRegenerating} />;
     case "x_thread":
       return <ThreadEditor item={item} onRegenerating={onRegenerating} />;
     case "linkedin_post":
@@ -683,7 +770,7 @@ function ItemPreview({ item }: { item: ContentItem }) {
       <p className="text-xs text-muted-foreground">No video rendered.</p>
     );
   }
-  if (item.format === "ig_card" || item.format === "ig_carousel") {
+  if (item.format === "ig_card" || item.format === "ig_carousel" || item.format === "meme") {
     return item.card_shas.length ? (
       <div className="flex flex-wrap gap-2">
         {item.card_shas.map((sha) => (
@@ -701,6 +788,17 @@ function ItemPreview({ item }: { item: ContentItem }) {
       ? c.body
       : JSON.stringify(c, null, 2);
   return <p className="whitespace-pre-wrap text-sm">{text}</p>;
+}
+
+/** Lazily fetches and renders the S6 trust report for one item. */
+function TrustPanelForItem({ item }: { item: ContentItem }) {
+  const { data } = useQuery({
+    queryKey: ["content-trust", item.id, item.status, item.edited],
+    queryFn: () => getContentTrust(item.id),
+    staleTime: 30_000,
+  });
+  if (!data) return null;
+  return <TrustPanel report={data} />;
 }
 
 function SourcesPanel({ item }: { item: ContentItem }) {
@@ -911,19 +1009,52 @@ function CampaignCard({ id }: { id: number }) {
   if (campaign.isError) return <QueryError error={campaign.error} onRetry={() => void campaign.refetch()} />;
 
   const d = campaign.data;
+  const running = ["pending", "running"].includes(d.status);
+  // the backend persists plan+formats BEFORE generating, so an empty formats
+  // list on a running campaign means the planner itself is still deciding
+  const progress = !running
+    ? null
+    : d.formats.length === 0
+      ? "Planning coverage…"
+      : `Generating ${Math.min(d.items.length + 1, d.formats.length)}/${d.formats.length}: ${
+          d.formats[Math.min(d.items.length, d.formats.length - 1)]
+        }…`;
   return (
     <div className="space-y-4 rounded-xl border p-4">
       <div className="flex items-center gap-2">
         <p className="font-medium">{d.subject}</p>
         <Badge variant={STATUS_VARIANT[d.status] ?? "outline"}>{d.status}</Badge>
+        {d.plan ? (
+          <Badge variant="outline" title="Formats chosen by the editorial planner">
+            <Wand2Icon data-icon="inline-start" />
+            auto
+          </Badge>
+        ) : null}
         <span className="text-xs text-muted-foreground">{relativeTime(d.created_at)}</span>
         <CampaignActions d={d} onGone={() => setGone(true)} />
       </div>
+      {d.plan ? (
+        <div className="rounded-lg border bg-muted/20 p-2.5 text-xs">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Wand2Icon className="size-3.5 text-muted-foreground" />
+            <Badge variant={SIGNIFICANCE_VARIANT[d.plan.significance_label] ?? "outline"}>
+              {d.plan.significance_label} · {d.plan.significance}/5
+            </Badge>
+            {d.plan.picks.map((p) => (
+              <Badge key={p.format} variant="outline" title={p.reason.slice(0, 300)}>
+                {p.media === "stock_video" ? <FilmIcon data-icon="inline-start" /> : null}
+                {p.media === "stock_photo" ? <ImageIcon data-icon="inline-start" /> : null}
+                {p.format}
+              </Badge>
+            ))}
+            {d.plan.angle ? <span className="font-medium">{d.plan.angle}</span> : null}
+          </div>
+          {d.plan.rationale ? <p className="mt-1 text-muted-foreground">{d.plan.rationale}</p> : null}
+        </div>
+      ) : null}
       {d.error ? <p className="text-sm text-destructive">{d.error}</p> : null}
       {d.items.length === 0 ? (
-        <p className="text-sm text-muted-foreground">
-          {["pending", "running"].includes(d.status) ? "Generating…" : "No items."}
-        </p>
+        <p className="text-sm text-muted-foreground">{progress ?? "No items."}</p>
       ) : (
         <div className="space-y-4">
           {d.items.map((item) => {
@@ -948,6 +1079,7 @@ function CampaignCard({ id }: { id: number }) {
                 <ItemPreview item={item} />
                 <ItemMeta item={item} />
                 {item.error ? <p className="text-xs text-destructive">{item.error}</p> : null}
+                <TrustPanelForItem item={item} />
                 <SourcesPanel item={item} />
                 {editing === item.id ? (
                   <ContentEditor item={item} onRegenerating={() => setRegenUntil(Date.now() + 50_000)} />
@@ -956,6 +1088,9 @@ function CampaignCard({ id }: { id: number }) {
               </div>
             );
           })}
+          {progress && d.items.length < d.formats.length ? (
+            <p className="text-sm text-muted-foreground">{progress}</p>
+          ) : null}
         </div>
       )}
     </div>

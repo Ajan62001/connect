@@ -110,7 +110,11 @@ JOB_KINDS = (
     "poll_source", "backfill_source", "ingest_url", "analysis",
     "enrich_t1_sync", "enrich_t1_batch", "enrich_t2", "reverify_claim",
     "brief_generate", "investigation", "workspace_task", "story",
-    "content_generate", "content_publish", "content_render")
+    "content_generate", "content_publish", "content_render",
+    "content_verify",  # v20: editorial verification gate (S2)
+    "content_correction", "source_recheck",  # v21: corrections (S3)
+    "credibility_recompute",  # v22: dynamic source credibility (S4)
+    "integrity_eval")  # v23: production integrity live-eval (S5)
 JOB_STATUSES = ("queued", "running", "done", "failed", "cancelled")
 
 # --- social post card theme ------------------------------------------------
@@ -136,9 +140,9 @@ CONTENT_PLATFORMS = ("instagram", "x", "linkedin")
 ContentPlatform = Literal["instagram", "x", "linkedin"]
 
 CONTENT_FORMATS = ("ig_card", "ig_carousel", "x_thread", "linkedin_post",
-                   "ig_reel")
+                   "ig_reel", "meme")
 ContentFormat = Literal["ig_card", "ig_carousel", "x_thread", "linkedin_post",
-                        "ig_reel"]
+                        "ig_reel", "meme"]
 
 # which platform each format publishes to (single source of truth)
 CONTENT_FORMAT_PLATFORM = {
@@ -147,6 +151,7 @@ CONTENT_FORMAT_PLATFORM = {
     "x_thread": "x",
     "linkedin_post": "linkedin",
     "ig_reel": "instagram",
+    "meme": "instagram",
 }
 
 CAMPAIGN_STATUSES = ("pending", "running", "completed", "failed", "cancelled")
@@ -154,11 +159,23 @@ CampaignStatus = Literal[
     "pending", "running", "completed", "failed", "cancelled"]
 
 # content_item lifecycle: drafts the pipeline produced -> human review ->
-# scheduled -> published by beat (or rejected / failed).
+# scheduled -> published by beat (or rejected / failed). v20 (S2) adds the
+# editorial-gate states: 'verifying' (the content_verify job is in flight, used
+# only in enforcing mode) and 'flagged' (the gate found an unsupported/contested
+# claim — a soft hold the owner can override in warn-only mode).
 CONTENT_ITEM_STATUSES = (
-    "draft", "approved", "scheduled", "published", "rejected", "failed")
+    "draft", "verifying", "approved", "scheduled", "published", "rejected",
+    "failed", "flagged", "corrected", "retracted")
 ContentItemStatus = Literal[
-    "draft", "approved", "scheduled", "published", "rejected", "failed"]
+    "draft", "verifying", "approved", "scheduled", "published", "rejected",
+    "failed", "flagged", "corrected", "retracted"]
+
+# Corrections / retractions (v21, S3). A `correction` is a propagation event:
+# the corpus changed its mind about a claim (verdict_flip) or an upstream source
+# edited/withdrew a document (source_edit / source_retraction). It fans out to
+# the published content_items that were grounded in the affected evidence.
+CORRECTION_KINDS = ("verdict_flip", "source_edit", "source_retraction")
+CORRECTION_STATUSES = ("open", "acknowledged", "resolved")
 
 # --- watches / consumption -------------------------------------------------
 

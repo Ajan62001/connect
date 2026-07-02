@@ -52,6 +52,7 @@ from connect.knowledge.taxonomy import seed_event_types
 from connect.knowledge.vector import VectorIndex, create_vector_index
 from connect.llm.anthropic_provider import AnthropicProvider
 from connect.llm.batch_runner import AnthropicBatchRunner
+from connect.llm.observability import LLMTracer, build_tracer
 from connect.llm.provider import LLMProvider
 from connect.llm.spend import (
     GENERAL_SCOPE,
@@ -113,10 +114,14 @@ class Container:
         # everything that needs them degrades cleanly (T0-only).
         self.llm: LLMProvider | None = None
         self.batch_runner: AnthropicBatchRunner | None = None
+        # Langfuse tracing — a no-op tracer without keys, so the provider is
+        # built the same way whether or not observability is configured.
+        self.llm_tracer: LLMTracer = build_tracer(settings)
         if settings.anthropic_api_key:
             self.llm = AnthropicProvider(
                 settings.anthropic_api_key,
-                tier_models=tier_models(settings))
+                tier_models=tier_models(settings),
+                tracer=self.llm_tracer)
             self.batch_runner = AnthropicBatchRunner(
                 settings.anthropic_api_key)
         self.governor: Governor | None = None
@@ -193,6 +198,7 @@ class Container:
             batch_runner=self.batch_runner,
             governor=self.governor,
             batch_poll_seconds=self.settings.batch_poll_seconds,
+            tracer=self.llm_tracer,
         )
         self.vectors = create_vector_index(
             enabled=self.settings.embeddings_enabled)
@@ -307,6 +313,7 @@ class Container:
             await self.llm.aclose()
         if self.batch_runner is not None:
             await self.batch_runner.aclose()
+        self.llm_tracer.flush()
         if self._pool is not None:
             await self._pool.close()
             self._pool = None

@@ -259,6 +259,9 @@ async def test_suggestion_calendar_and_tier1_components(container, db):
         "INSERT INTO event_assignment (document_id, event_id, method,"
         " created_at) VALUES (%s,%s, 'attach', %s)",
         (d1, event_id, utc_now()))
+    # the container seeds the real election/budget/session calendar; clear it
+    # so the nearest-entry pick is deterministic regardless of today's date
+    await conn.execute("DELETE FROM calendar_event")
     await conn.execute(
         "INSERT INTO calendar_event (kind, scope, occurs_on, label)"
         " VALUES ('election', 'BR', %s::date + 30, 'Bihar election')",

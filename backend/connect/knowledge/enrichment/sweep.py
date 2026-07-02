@@ -42,7 +42,8 @@ from connect.knowledge.enrichment.prompts import T1_PROMPT_VERSION
 from connect.knowledge.linking import position_tracker
 from connect.llm import spend
 from connect.llm.batch_runner import BatchItem, BatchRunner, BatchResult
-from connect.llm.provider import LLMError, LLMProvider
+from connect.llm.observability import LLMTracer, null_tracer
+from connect.llm.provider import LLMError, LLMProvider, Usage
 from connect.llm.spend import BudgetExceeded, Governor
 from connect.llm.tiers import ModelTier
 
@@ -87,11 +88,16 @@ class EnrichmentService:
     def __init__(self, *, provider: LLMProvider | None,
                  batch_runner: BatchRunner | None,
                  governor: Governor,
-                 batch_poll_seconds: float = 30.0):
+                 batch_poll_seconds: float = 30.0,
+                 tracer: LLMTracer | None = None):
         self.provider = provider
         self.batch_runner = batch_runner
         self.governor = governor
         self.batch_poll_seconds = batch_poll_seconds
+        # batch enrichment runs the Message Batches API directly (not through
+        # AnthropicProvider), so it carries its own tracer to record one
+        # Langfuse generation per item once results land.
+        self.tracer = tracer or null_tracer()
 
     # -- selection ----------------------------------------------------------------
 
@@ -299,8 +305,10 @@ class EnrichmentService:
             await asyncio.sleep(self.batch_poll_seconds)
 
         results = await runner.results(batch_id)
+        items_by_id = {item.custom_id: item for item in items}
         stats = await self._ingest_batch_results(conn, results, model=model,
-                                                 batch_id=batch_id)
+                                                 batch_id=batch_id,
+                                                 items=items_by_id)
         # anything still 'queued' got no result row back — release it
         cur = await conn.execute(
             "SELECT id FROM document WHERE enrichment_status = 'queued'"
@@ -315,7 +323,11 @@ class EnrichmentService:
     async def _ingest_batch_results(self, conn: psycopg.AsyncConnection,
                                     results: list[BatchResult], *,
                                     model: str,
-                                    batch_id: str) -> dict[str, int]:
+                                    batch_id: str,
+                                    items: Mapping[str, BatchItem]
+                                    | None = None,
+                                    ) -> dict[str, int]:
+        items = items or {}
         done = failed = promoted = 0
         for result in results:
             try:
@@ -324,6 +336,9 @@ class EnrichmentService:
                 log.warning("unrecognized batch custom_id %r",
                             result.custom_id)
                 continue
+            self._trace_batch_item(result, items.get(result.custom_id),
+                                   model=model, batch_id=batch_id,
+                                   document_id=document_id)
             if not result.ok:
                 log.warning("batch item failed for document %s: %s",
                             document_id, result.error)
@@ -349,6 +364,31 @@ class EnrichmentService:
             if await self._maybe_t2(conn, document_id) is not None:
                 promoted += 1
         return {"done": done, "failed": failed, "promoted_t2": promoted}
+
+    def _trace_batch_item(self, result: BatchResult,
+                          item: BatchItem | None, *, model: str,
+                          batch_id: str, document_id: int) -> None:
+        """Record one batch result as a Langfuse generation (no-op when
+        tracing is off). The Message Batches path bypasses AnthropicProvider,
+        so this is its only instrumentation — input comes from the submitted
+        item, output/usage from the result."""
+        if not self.tracer.enabled:
+            return
+        input_payload: Any = {"custom_id": result.custom_id}
+        if item is not None:
+            input_payload = {
+                "system": item.system,
+                "messages": [{"role": "user", "content": item.user_text}]}
+        self.tracer.record_generation(
+            name="enrich_t1_batch", model=model,
+            input=input_payload,
+            output=result.text if result.ok else None,
+            usage=result.usage if result.ok else Usage(),
+            tier=ModelTier.FAST,
+            extra={"purpose": PURPOSE_T1, "batch_id": batch_id,
+                   "document_id": document_id, "batch": True},
+            is_error=not result.ok,
+            status_message=None if result.ok else result.error)
 
     # -- internals --------------------------------------------------------------------
 

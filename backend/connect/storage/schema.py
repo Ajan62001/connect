@@ -65,7 +65,7 @@ class StorageVersionError(StorageError):
 # PostgreSQL baseline schema (v0.2, the canonical DDL) — fresh lineage, v1.
 # ==============================================================================
 
-PG_SCHEMA_VERSION = 18
+PG_SCHEMA_VERSION = 25
 
 # Extensions first: the compose image is pgvector/pgvector:pg17, so both are
 # present; IF NOT EXISTS keeps re-entry harmless.
@@ -150,7 +150,13 @@ CREATE TABLE IF NOT EXISTS source (
     quality_score      double precision,
     created_at         timestamptz NOT NULL,
     last_polled_at     timestamptz,
-    last_poll_status   text
+    last_poll_status   text,
+    last_rechecked_at  timestamptz,   -- v21 (S3): corrections recheck cursor
+    canonical_hash     text,          -- v21 (S3): last seen canonical content hash
+    -- v22 (S4): data-driven reliability in [0,1], anchored to credibility_tier
+    -- as a prior. NULL => no track record yet, fall back to the tier weight.
+    reliability_score      double precision,
+    reliability_updated_at timestamptz
 )"""
 
 # search_tsv replaces the FTS5 external-content table + 3 triggers. The
@@ -772,6 +778,19 @@ _PG_DDL_JOB_INDEXES = (
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_publish_item"
     " ON job ((payload->>'item_id'))"
     " WHERE kind = 'content_publish' AND status IN ('queued','running')",
+    # dedup: at most one QUEUED verify job per content item. Only queued —
+    # a RUNNING verify snapshotted its item row at claim time, so an enqueue
+    # for an edit/approve made since must survive it (the queued job re-reads
+    # everything when it starts). Also created by pg_migrate_19_to_20 and
+    # re-narrowed by pg_migrate_23_to_24.
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_content_verify"
+    " ON job ((payload->>'item_id'))"
+    " WHERE kind = 'content_verify' AND status = 'queued'",
+    # dedup: the corrections sweep is a singleton (beat enqueues blindly every
+    # tick while a correction is open — also created by pg_migrate_20_to_21)
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_content_correction"
+    " ON job ((kind)) WHERE kind = 'content_correction'"
+    " AND status IN ('queued','running')",
 )
 
 # seq: identity values are allocated at INSERT, not commit — globally, a
@@ -960,6 +979,11 @@ CREATE TABLE IF NOT EXISTS social_draft (
     document_id  bigint REFERENCES document(id) ON DELETE SET NULL,
     content      jsonb NOT NULL,
     card_sha     text NOT NULL,
+    -- v20 (S2): provenance + gate, mirroring content_item, so a draft pushed
+    -- through the gate (hard-delegated to generate_format) carries its closed-
+    -- menu citations and verification report rather than free-generated text.
+    sources      jsonb NOT NULL DEFAULT '[]'::jsonb,
+    grounding    jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at   timestamptz NOT NULL
 )"""
 
@@ -981,6 +1005,7 @@ CREATE TABLE IF NOT EXISTS campaign (
     input_type  text NOT NULL,
     seed        jsonb NOT NULL DEFAULT '{{}}'::jsonb,
     formats     jsonb NOT NULL DEFAULT '[]'::jsonb,
+    plan        jsonb,
     options     jsonb NOT NULL DEFAULT '{{}}'::jsonb,
     status      text NOT NULL DEFAULT 'pending'
                 CONSTRAINT ck_campaign_status
@@ -1021,6 +1046,9 @@ CREATE TABLE IF NOT EXISTS content_item (
     content      jsonb NOT NULL DEFAULT '{{}}'::jsonb,
     sources      jsonb NOT NULL DEFAULT '[]'::jsonb,
     grounding    jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    -- v20 (S2): the editorial verification-gate report (a GateReport dump):
+    -- per-sentence entailment verdicts, flagged claims, contested sources.
+    gate         jsonb NOT NULL DEFAULT '{{}}'::jsonb,
     card_shas    jsonb NOT NULL DEFAULT '[]'::jsonb,
     visibility   text NOT NULL DEFAULT 'shared'
                  CONSTRAINT ck_content_item_visibility
@@ -1042,6 +1070,89 @@ _PG_DDL_CONTENT_ITEM_INDEXES = (
     # the beat due-scan: scheduled items whose time has come
     "CREATE INDEX IF NOT EXISTS idx_content_item_due"
     " ON content_item(scheduled_at) WHERE status = 'scheduled'",
+)
+
+# v19 (S1, editorial-integrity suite) — content-to-evidence provenance graph.
+# One relational link row per cited source on a content_item, mirroring the
+# finding_evidence / claim_sighting pattern (verbatim quote + char offsets).
+# Dual-written alongside the legacy JSONB `content_item.sources` in the SAME
+# insert() transaction; `credibility_tier` is snapshotted from the cited
+# document's source at write time so the audit trail is immutable even if the
+# tier later changes. The reverse index on `document_id` is what the
+# corrections (S3), credibility (S4), and trust-panel (S6) subsystems read.
+# `document_id` is SET NULL (not CASCADE) on document delete: the provenance
+# that an item *claimed* a now-deleted source must not silently disappear.
+_PG_DDL_CONTENT_ITEM_SOURCE = """
+CREATE TABLE IF NOT EXISTS content_item_source (
+    id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    content_item_id  bigint NOT NULL REFERENCES content_item(id) ON DELETE CASCADE,
+    ref              text NOT NULL,
+    document_id      bigint REFERENCES document(id) ON DELETE SET NULL,
+    finding_id       bigint,
+    source_name      text,
+    title            text,
+    url              text,
+    quote            text,
+    quote_start      integer,
+    quote_end        integer,
+    occurred_on      text,
+    credibility_tier integer,
+    stance           text,
+    verdict          text,
+    created_at       timestamptz NOT NULL
+)"""
+
+_PG_DDL_CONTENT_ITEM_SOURCE_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_content_item_source_item"
+    " ON content_item_source(content_item_id)",
+    # reverse index (S3/S4/S6): all items grounded in a given document
+    "CREATE INDEX IF NOT EXISTS idx_content_item_source_document"
+    " ON content_item_source(document_id) WHERE document_id IS NOT NULL",
+)
+
+# v21 (S3) — corrections / retractions / verdict propagation.
+# A `correction` is one propagation EVENT: the corpus changed its mind about a
+# claim (verdict_flip, carrying from/to verdict) or an upstream source edited or
+# withdrew a document (source_edit / source_retraction). `content_item_correction`
+# fans it out to the published items grounded in the affected evidence, recording
+# what action was taken (so the trail is auditable and idempotent).
+_PG_DDL_CORRECTION = f"""
+CREATE TABLE IF NOT EXISTS correction (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    kind         text NOT NULL CONSTRAINT ck_correction_kind
+                 CHECK (kind IN {E.sql_in(E.CORRECTION_KINDS)}),
+    claim_id     bigint REFERENCES claim(id) ON DELETE CASCADE,
+    document_id  bigint REFERENCES document(id) ON DELETE CASCADE,
+    from_verdict text,
+    to_verdict   text,
+    detail       text,
+    status       text NOT NULL DEFAULT 'open'
+                 CONSTRAINT ck_correction_status
+                 CHECK (status IN {E.sql_in(E.CORRECTION_STATUSES)}),
+    created_at   timestamptz NOT NULL,
+    resolved_at  timestamptz
+)"""
+
+_PG_DDL_CORRECTION_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_correction_open"
+    " ON correction(status, created_at) WHERE status = 'open'",
+    "CREATE INDEX IF NOT EXISTS idx_correction_claim ON correction(claim_id)",
+)
+
+_PG_DDL_CONTENT_ITEM_CORRECTION = """
+CREATE TABLE IF NOT EXISTS content_item_correction (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    correction_id   bigint NOT NULL REFERENCES correction(id) ON DELETE CASCADE,
+    content_item_id bigint NOT NULL REFERENCES content_item(id) ON DELETE CASCADE,
+    prior_status    text,
+    action          text NOT NULL,
+    created_at      timestamptz NOT NULL,
+    UNIQUE (correction_id, content_item_id)
+)"""
+
+_PG_DDL_CONTENT_ITEM_CORRECTION_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_content_item_correction_item"
+    " ON content_item_correction(content_item_id)",
 )
 
 # the v15->v16 migration replays exactly this (tables before their indexes,
@@ -1166,6 +1277,66 @@ CREATE TABLE IF NOT EXISTS source_stats (
     PRIMARY KEY (source_id, day)
 )"""
 
+# v22 (S4) — auditable history of every dynamic-credibility recompute, so a
+# reliability score is always explainable (what sample, what trigger, when).
+_PG_DDL_SOURCE_CREDIBILITY_HISTORY = """
+CREATE TABLE IF NOT EXISTS source_credibility_history (
+    id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    source_id         bigint NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+    computed_at       timestamptz NOT NULL,
+    reliability_score double precision NOT NULL,
+    prior             double precision,
+    sample_size       integer NOT NULL DEFAULT 0,
+    trigger           text,
+    components        jsonb NOT NULL DEFAULT '{}'::jsonb
+)"""
+
+_PG_DDL_SOURCE_CREDIBILITY_HISTORY_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_source_credibility_history_source"
+    " ON source_credibility_history(source_id, computed_at DESC)",
+)
+
+# v23 (S5) — production integrity observability + live eval gate.
+# `integrity_event` is an append-only signal stream (one row per measurement:
+# a gate outcome, a grounding rate, a verdict, a contradiction), aggregated by
+# SQL into per-day rates like llm_call. `integrity_eval_run` is the ledger of
+# scheduled live-eval runs (the offline harness over sampled real traffic), with
+# the metrics + any threshold regressions for alerting.
+_PG_DDL_INTEGRITY_EVENT = """
+CREATE TABLE IF NOT EXISTS integrity_event (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    kind        text NOT NULL,
+    surface     text NOT NULL,
+    subject_id  bigint,
+    numerator   integer,
+    denominator integer,
+    value       text,
+    user_id     bigint REFERENCES app_user(id) ON DELETE SET NULL,
+    created_at  timestamptz NOT NULL
+)"""
+
+_PG_DDL_INTEGRITY_EVENT_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_integrity_event_kind_day"
+    " ON integrity_event(kind, created_at)",
+)
+
+_PG_DDL_INTEGRITY_EVAL_RUN = """
+CREATE TABLE IF NOT EXISTS integrity_eval_run (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    started_at  timestamptz NOT NULL,
+    finished_at timestamptz,
+    sample_size integer NOT NULL DEFAULT 0,
+    metrics     jsonb NOT NULL DEFAULT '{}'::jsonb,
+    regressions jsonb NOT NULL DEFAULT '[]'::jsonb,
+    status      text NOT NULL DEFAULT 'ok',
+    trigger     text
+)"""
+
+_PG_DDL_INTEGRITY_EVAL_RUN_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_integrity_eval_run_started"
+    " ON integrity_eval_run(started_at DESC)",
+)
+
 
 # --- vectors (pgvector) ---------------------------------------------------------
 
@@ -1271,6 +1442,12 @@ PG_DDL: tuple[str, ...] = (
     _PG_DDL_SOCIAL_DRAFT,
     *_PG_DDL_SOCIAL_DRAFT_INDEXES,
     *_PG_DDL_CAMPAIGN_DDL,
+    _PG_DDL_CONTENT_ITEM_SOURCE,
+    *_PG_DDL_CONTENT_ITEM_SOURCE_INDEXES,
+    _PG_DDL_CORRECTION,
+    *_PG_DDL_CORRECTION_INDEXES,
+    _PG_DDL_CONTENT_ITEM_CORRECTION,
+    *_PG_DDL_CONTENT_ITEM_CORRECTION_INDEXES,
     # NOTE: workspace_task (v12) was dropped at v14 — deep runs are now async
     # chat jobs streaming job_event; _PG_DDL_WORKSPACE_TASK is retained only
     # for the historical v11->v12 migration and is NOT in the fresh baseline.
@@ -1288,6 +1465,12 @@ PG_DDL: tuple[str, ...] = (
     _PG_DDL_LLM_CALL,
     *_PG_DDL_LLM_CALL_INDEXES,
     _PG_DDL_SOURCE_STATS,
+    _PG_DDL_SOURCE_CREDIBILITY_HISTORY,
+    *_PG_DDL_SOURCE_CREDIBILITY_HISTORY_INDEXES,
+    _PG_DDL_INTEGRITY_EVENT,
+    *_PG_DDL_INTEGRITY_EVENT_INDEXES,
+    _PG_DDL_INTEGRITY_EVAL_RUN,
+    *_PG_DDL_INTEGRITY_EVAL_RUN_INDEXES,
     _PG_DDL_DOCUMENT_EMBEDDING,
     _PG_DDL_EVENT_EMBEDDING,
     _PG_DDL_CLAIM_EMBEDDING,

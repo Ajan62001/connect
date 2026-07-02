@@ -18,6 +18,7 @@ from typing import Any, Mapping, Sequence
 import anthropic
 import pydantic
 
+from connect.llm.observability import LLMTracer, null_tracer, usage_details
 from connect.llm.provider import (
     Completion,
     LLMError,
@@ -48,10 +49,12 @@ def _usage(resp_usage: Any) -> Usage:
 class AnthropicProvider(LLMProvider):
     def __init__(self, api_key: str, *,
                  tier_models: Mapping[ModelTier, str] | None = None,
-                 max_retries: int = 2):
+                 max_retries: int = 2,
+                 tracer: LLMTracer | None = None):
         self._client = anthropic.AsyncAnthropic(
             api_key=api_key, max_retries=max_retries)
         self._tier_models = dict(tier_models or DEFAULT_TIER_MODELS)
+        self._tracer = tracer or null_tracer()
 
     def model_for(self, tier: ModelTier) -> str:
         return self._tier_models[tier]
@@ -63,15 +66,20 @@ class AnthropicProvider(LLMProvider):
         kwargs: dict[str, Any] = {}
         if system is not None:
             kwargs["system"] = system
-        try:
-            resp = await self._client.messages.create(
-                model=model, max_tokens=max_tokens,
-                messages=list(messages), **kwargs)
-        except anthropic.APIError as e:
-            raise LLMError(f"anthropic call failed: {e}") from e
-        text = "".join(
-            block.text for block in resp.content if block.type == "text")
-        return Completion(text=text, model=resp.model, usage=_usage(resp.usage))
+        with self._tracer.generation(
+                name="complete", model=model, messages=messages,
+                system=system, tier=tier) as gen:
+            try:
+                resp = await self._client.messages.create(
+                    model=model, max_tokens=max_tokens,
+                    messages=list(messages), **kwargs)
+            except anthropic.APIError as e:
+                raise LLMError(f"anthropic call failed: {e}") from e
+            text = "".join(
+                block.text for block in resp.content if block.type == "text")
+            usage = _usage(resp.usage)
+            gen.update(output=text, usage_details=usage_details(usage))
+            return Completion(text=text, model=resp.model, usage=usage)
 
     async def complete_with_tools(self, *, system: str | None,
                                   messages: Sequence[dict[str, Any]],
@@ -97,32 +105,39 @@ class AnthropicProvider(LLMProvider):
                 kwargs["system"] = system
         if tool_choice is not None:
             kwargs["tool_choice"] = {"type": "tool", "name": tool_choice}
-        try:
-            resp = await self._client.messages.create(
-                model=model, max_tokens=max_tokens,
-                messages=list(messages),
-                tools=[t.model_dump() for t in tools], **kwargs)
-        except anthropic.APIError as e:
-            raise LLMError(f"anthropic tool call failed: {e}") from e
-        text_parts: list[str] = []
-        calls: list[ToolCall] = []
-        raw: list[dict[str, Any]] = []
-        for block in resp.content:
-            if block.type == "text":
-                text_parts.append(block.text)
-                raw.append({"type": "text", "text": block.text})
-            elif block.type == "tool_use":
-                calls.append(ToolCall(id=block.id, name=block.name,
-                                      input=dict(block.input or {})))
-                raw.append({"type": "tool_use", "id": block.id,
-                            "name": block.name,
-                            "input": dict(block.input or {})})
-            else:  # pragma: no cover — future block types replay as-is
-                raw.append(block.model_dump(mode="json", exclude_none=True))
-        return ToolTurn(
-            text="".join(text_parts), tool_calls=calls,
-            stop_reason=resp.stop_reason or "end_turn", raw_content=raw,
-            model=resp.model, usage=_usage(resp.usage))
+        with self._tracer.generation(
+                name="complete_with_tools", model=model, messages=messages,
+                system=system, tier=tier,
+                extra={"tools": [t.name for t in tools],
+                       "tool_choice": tool_choice}) as gen:
+            try:
+                resp = await self._client.messages.create(
+                    model=model, max_tokens=max_tokens,
+                    messages=list(messages),
+                    tools=[t.model_dump() for t in tools], **kwargs)
+            except anthropic.APIError as e:
+                raise LLMError(f"anthropic tool call failed: {e}") from e
+            text_parts: list[str] = []
+            calls: list[ToolCall] = []
+            raw: list[dict[str, Any]] = []
+            for block in resp.content:
+                if block.type == "text":
+                    text_parts.append(block.text)
+                    raw.append({"type": "text", "text": block.text})
+                elif block.type == "tool_use":
+                    calls.append(ToolCall(id=block.id, name=block.name,
+                                          input=dict(block.input or {})))
+                    raw.append({"type": "tool_use", "id": block.id,
+                                "name": block.name,
+                                "input": dict(block.input or {})})
+                else:  # pragma: no cover — future block types replay as-is
+                    raw.append(block.model_dump(mode="json", exclude_none=True))
+            usage = _usage(resp.usage)
+            gen.update(output=raw, usage_details=usage_details(usage))
+            return ToolTurn(
+                text="".join(text_parts), tool_calls=calls,
+                stop_reason=resp.stop_reason or "end_turn", raw_content=raw,
+                model=resp.model, usage=usage)
 
     async def complete_structured(self, *, system: str | None,
                                   messages: Sequence[dict[str, Any]],
@@ -136,37 +151,46 @@ class AnthropicProvider(LLMProvider):
 
         last_error: Exception | None = None
         usage = Usage()
-        for attempt in range(2):  # one retry on a schema-shaped failure
-            try:
-                resp = await self._client.messages.parse(
-                    model=model, max_tokens=max_tokens,
-                    messages=list(messages), output_format=schema, **kwargs)
-            except anthropic.APIError as e:
-                raise LLMError(f"anthropic call failed: {e}") from e
-            except (pydantic.ValidationError, ValueError) as e:
-                # response came back but did not validate — retry once
-                last_error = e
-                log.warning("structured parse failed (attempt %s): %s",
-                            attempt + 1, e)
-                continue
-            usage = Usage(
-                input_tokens=usage.input_tokens + _usage(resp.usage).input_tokens,
-                output_tokens=usage.output_tokens + _usage(resp.usage).output_tokens,
-                cache_read_tokens=usage.cache_read_tokens
-                + _usage(resp.usage).cache_read_tokens,
-                cache_creation_tokens=usage.cache_creation_tokens
-                + _usage(resp.usage).cache_creation_tokens,
-            )
-            if resp.parsed_output is None:
-                last_error = LLMError(
-                    f"no parsed output (stop_reason={resp.stop_reason!r})")
-                log.warning("structured parse returned no output "
-                            "(attempt %s): %s", attempt + 1, last_error)
-                continue
-            return StructuredCompletion[schema](  # type: ignore[valid-type]
-                output=resp.parsed_output, model=resp.model, usage=usage)
-        raise LLMError(
-            f"structured output failed after retry: {last_error}")
+        with self._tracer.generation(
+                name="complete_structured", model=model, messages=messages,
+                system=system, tier=tier,
+                extra={"schema": schema.__name__}) as gen:
+            for attempt in range(2):  # one retry on a schema-shaped failure
+                try:
+                    resp = await self._client.messages.parse(
+                        model=model, max_tokens=max_tokens,
+                        messages=list(messages), output_format=schema,
+                        **kwargs)
+                except anthropic.APIError as e:
+                    raise LLMError(f"anthropic call failed: {e}") from e
+                except (pydantic.ValidationError, ValueError) as e:
+                    # response came back but did not validate — retry once
+                    last_error = e
+                    log.warning("structured parse failed (attempt %s): %s",
+                                attempt + 1, e)
+                    continue
+                usage = Usage(
+                    input_tokens=usage.input_tokens + _usage(resp.usage).input_tokens,
+                    output_tokens=usage.output_tokens + _usage(resp.usage).output_tokens,
+                    cache_read_tokens=usage.cache_read_tokens
+                    + _usage(resp.usage).cache_read_tokens,
+                    cache_creation_tokens=usage.cache_creation_tokens
+                    + _usage(resp.usage).cache_creation_tokens,
+                )
+                if resp.parsed_output is None:
+                    last_error = LLMError(
+                        f"no parsed output (stop_reason={resp.stop_reason!r})")
+                    log.warning("structured parse returned no output "
+                                "(attempt %s): %s", attempt + 1, last_error)
+                    continue
+                gen.update(
+                    output=resp.parsed_output.model_dump(mode="json"),
+                    usage_details=usage_details(usage))
+                return StructuredCompletion[schema](  # type: ignore[valid-type]
+                    output=resp.parsed_output, model=resp.model, usage=usage)
+            gen.update(usage_details=usage_details(usage))
+            raise LLMError(
+                f"structured output failed after retry: {last_error}")
 
     async def aclose(self) -> None:
         await self._client.close()

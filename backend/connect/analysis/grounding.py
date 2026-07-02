@@ -83,12 +83,17 @@ class EvidenceMenu:
 
     def render(self) -> str:
         """The menu exactly as a prompt shows it."""
+        return "\n".join(self.render_lines())
+
+    def render_lines(self) -> list[str]:
+        """One rendered line per entry — for callers that must truncate the
+        menu at entry boundaries instead of mid-quote."""
         lines = []
         for e in self.entries:
             src = e.source_name or "unknown source"
-            tier = f"tier {e.credibility_tier}" if e.credibility_tier else \
-                "tier unknown"
+            tier = (f"tier {e.credibility_tier}"
+                    if e.credibility_tier is not None else "tier unknown")
             stance = f", {e.stance}" if e.stance else ""
             lines.append(f"[{e.menu_id}] ({src}, {tier}{stance}) "
                          f"\"{e.quote}\"")
-        return "\n".join(lines)
+        return lines

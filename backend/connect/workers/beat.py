@@ -28,6 +28,7 @@ from typing import Any
 import psycopg
 
 from connect.ingestion.poller import is_due
+from connect.knowledge import corrections
 from connect.storage import content_items as content_item_dao
 from connect.storage import jobs as job_dao
 from connect.storage import sources as source_dao
@@ -100,7 +101,9 @@ async def tick(services: Any) -> dict[str, int]:
     """One beat pass; returns counters (for tests/logs)."""
     settings = services.settings
     counts = {"requeued": 0, "orphan_failed": 0, "polls": 0,
-              "nightly": 0, "briefs": 0, "publishes": 0}
+              "nightly": 0, "briefs": 0, "publishes": 0,
+              "corrections": 0, "rechecks": 0, "credibility": 0,
+              "integrity_eval": 0}
     async with services.pool.connection() as conn:
         # 1. orphan sweep — replaces v0.1's startup reconcile_orphans
         requeued, failed = await job_dao.reclaim_stale(
@@ -148,6 +151,35 @@ async def tick(services: Any) -> dict[str, int]:
         for item_id in await content_item_dao.list_due(conn):
             await services.jobs.enqueue("content_publish", {"item_id": item_id})
             counts["publishes"] += 1
+
+        # 6. S3 corrections: a single sweep job fans open corrections out to
+        # dependent items (the partial unique index keeps it single-flight).
+        cur = await conn.execute(
+            "SELECT 1 FROM correction WHERE status = 'open' LIMIT 1")
+        if await cur.fetchone():
+            await services.jobs.enqueue("content_correction", {})
+            counts["corrections"] = 1
+
+        # 7. nightly source re-check of documents backing published items
+        if await _nightly_due(conn, "source_recheck",
+                              settings.nightly_sweep_utc_hour):
+            for doc_id in await corrections.due_for_recheck(conn, limit=50):
+                await services.jobs.enqueue(
+                    "source_recheck", {"document_id": doc_id})
+                counts["rechecks"] += 1
+
+        # 8. nightly dynamic source-credibility recompute (S4)
+        if await _nightly_due(conn, "credibility_recompute",
+                              settings.nightly_sweep_utc_hour):
+            await services.jobs.enqueue("credibility_recompute", {})
+            counts["credibility"] = 1
+
+        # 9. nightly integrity-eval gate (S5): snapshot live integrity metrics
+        # and alert on regression
+        if await _nightly_due(conn, "integrity_eval",
+                              settings.nightly_sweep_utc_hour):
+            await services.jobs.enqueue("integrity_eval", {})
+            counts["integrity_eval"] = 1
     return counts
 
 

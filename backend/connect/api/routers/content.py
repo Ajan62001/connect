@@ -36,7 +36,8 @@ from connect.content.schema import (
     VoiceOption,
 )
 from connect.domain.enums import ContentItemStatus
-from connect.domain.models import CurrentUser, JobAccepted
+from connect.domain.models import CurrentUser, JobAccepted, TrustReport
+from connect.knowledge import trust
 from connect.social import heygen, tts
 from connect.llm.spend import BudgetExceeded
 from connect.orchestration.container import Container
@@ -76,8 +77,11 @@ async def create_campaign(body: CampaignCreate,
         raise HTTPException(status_code=503,
                             detail="background jobs are unavailable")
     try:
-        # one balanced call per format — a small look-ahead per requested format
-        await service.governor.check(0.05 * len(body.formats), user_id=user.id)
+        # one balanced call per format — a small look-ahead per requested
+        # format. Empty formats = 'auto': the planner decides, so budget for
+        # a typical commission (~3 formats + the plan call itself).
+        await service.governor.check(0.05 * max(len(body.formats), 3),
+                                     user_id=user.id)
     except BudgetExceeded as e:
         raise HTTPException(status_code=429, detail=str(e)) from e
     try:
@@ -246,17 +250,57 @@ async def _owned_item(db: psycopg.AsyncConnection, item_id: int,
     return item
 
 
+def _gate_block_reason(item: ContentItemDetail,
+                       container: Container) -> str | None:
+    """In enforcing mode, a 'flagged' editorial-gate verdict hard-blocks any
+    publish path. Warn-only (the default) returns None — the flag is advisory."""
+    if not getattr(container.settings, "integrity_gate_enforcing", False):
+        return None
+    if (item.gate or {}).get("verdict") == "flagged":
+        n = len((item.gate or {}).get("flagged") or [])
+        return (f"editorial gate flagged {n} unsupported statement(s); edit the"
+                " item to ground them before publishing")
+    return None
+
+
+async def _enqueue_verify(container: Container, item_id: int, owner_id: int, *,
+                          promote_to: str | None = None) -> None:
+    """Best-effort: enqueue a content_verify job to (re)compute the gate. No-op
+    when the queue is unavailable (the generation-time report still stands)."""
+    if container.jobs is None:
+        return
+    payload: dict = {"item_id": item_id}
+    if promote_to is not None:
+        payload["promote_to"] = promote_to
+    await container.jobs.enqueue("content_verify", payload, owner_id=owner_id)
+
+
+@content_router.get("/{item_id}/trust", response_model=TrustReport)
+async def content_trust(item_id: int,
+                        db: psycopg.AsyncConnection = Depends(get_db),
+                        user: CurrentUser = Depends(get_current_user)):
+    """The reader-facing 'why trust this' report for one item (S6): source mix +
+    credibility tiers, dynamic reliability, gate verdict, balance, corrections,
+    and the AI-generated disclosure."""
+    item = await _owned_item(db, item_id, user)
+    return await trust.build_trust_report(db, item_id, gate=item.gate)
+
+
 @content_router.patch("/{item_id}", response_model=ContentItemDetail)
 async def edit_content(item_id: int, body: ContentEdit,
+                       container: Container = Depends(get_container),
                        db: psycopg.AsyncConnection = Depends(get_db),
                        user: CurrentUser = Depends(get_current_user)):
-    """Hand-edit the generated payload (owner-only; flags grounding.edited)."""
+    """Hand-edit the generated payload (owner-only; flags grounding.edited). A
+    hand-edit invalidates the generation-time gate report, so it re-runs the
+    editorial gate against the edited text."""
     await _owned_item(db, item_id, user)
     ok = await item_dao.update_content(db, item_id, owner_id=user.id,
                                        content=body.content)
     if not ok:
         raise HTTPException(status_code=409,
                             detail="a published item cannot be edited")
+    await _enqueue_verify(container, item_id, user.id)
     item = await item_dao.get(db, item_id, viewer=user.id)
     assert item is not None
     return item
@@ -283,6 +327,9 @@ async def rerender_content(item_id: int, body: RerenderRequest,
                                 detail=f"invalid content: {e}") from e
         await item_dao.update_content(db, item_id, owner_id=user.id,
                                       content=body.content)
+        # a hand-edit invalidates the generation-time gate report, same as
+        # the PATCH path — re-run the editorial gate against the edited text
+        await _enqueue_verify(container, item_id, user.id)
     if container.jobs is None:
         raise HTTPException(status_code=503,
                             detail="background jobs are unavailable")
@@ -295,15 +342,32 @@ async def rerender_content(item_id: int, body: RerenderRequest,
 
 @content_router.post("/{item_id}/approve", response_model=ContentItemDetail)
 async def approve_content(item_id: int,
+                          container: Container = Depends(get_container),
                           db: psycopg.AsyncConnection = Depends(get_db),
                           user: CurrentUser = Depends(get_current_user)):
+    """Approve a draft/rejected/flagged item. In enforcing mode the item first
+    enters 'verifying' and a content_verify job re-checks it against its
+    provenance, promoting it to 'approved' or back to 'flagged'. In warn-only
+    mode it is approved directly (the gate annotation rides along; approving a
+    flagged item is an explicit owner override)."""
     await _owned_item(db, item_id, user)
-    ok = await item_dao.set_status(
-        db, item_id, owner_id=user.id, status="approved",
-        from_statuses=("draft", "rejected"))
+    froms = ("draft", "rejected", "flagged")
+    enforcing = getattr(container.settings, "integrity_gate_enforcing", False)
+    if enforcing and container.jobs is not None:
+        ok = await item_dao.set_status(
+            db, item_id, owner_id=user.id, status="verifying",
+            from_statuses=froms)
+    else:
+        ok = await item_dao.set_status(
+            db, item_id, owner_id=user.id, status="approved",
+            from_statuses=froms)
     if not ok:
-        raise HTTPException(status_code=409,
-                            detail="only a draft/rejected item can be approved")
+        raise HTTPException(
+            status_code=409,
+            detail="only a draft/rejected/flagged item can be approved")
+    if enforcing and container.jobs is not None:
+        await _enqueue_verify(container, item_id, user.id,
+                              promote_to="approved")
     item = await item_dao.get(db, item_id, viewer=user.id)
     assert item is not None
     return item
@@ -327,15 +391,21 @@ async def reject_content(item_id: int,
 
 @content_router.post("/{item_id}/schedule", response_model=ContentItemDetail)
 async def schedule_content(item_id: int, body: ScheduleRequest,
+                           container: Container = Depends(get_container),
                            db: psycopg.AsyncConnection = Depends(get_db),
                            user: CurrentUser = Depends(get_current_user)):
     """Set the publish time and move the item to 'scheduled' — beat publishes
-    it when the time arrives."""
-    await _owned_item(db, item_id, user)
+    it when the time arrives. The editorial gate is enforced here too (not just
+    on approve) so scheduling cannot bypass it."""
+    item = await _owned_item(db, item_id, user)
+    block = _gate_block_reason(item, container)
+    if block:
+        raise HTTPException(status_code=409, detail=block)
     when = _parse_ts(body.scheduled_at)
     ok = await item_dao.set_status(
         db, item_id, owner_id=user.id, status="scheduled",
-        from_statuses=("draft", "approved", "scheduled"), scheduled_at=when)
+        from_statuses=("draft", "approved", "scheduled", "flagged"),
+        scheduled_at=when)
     if not ok:
         raise HTTPException(
             status_code=409,
@@ -370,9 +440,12 @@ async def publish_content(item_id: int,
                             detail="background jobs are unavailable")
     if item.status == "published":
         raise HTTPException(status_code=409, detail="item already published")
+    block = _gate_block_reason(item, container)
+    if block:
+        raise HTTPException(status_code=409, detail=block)
     await item_dao.set_status(
         db, item_id, owner_id=user.id, status="approved",
-        from_statuses=("draft", "approved", "scheduled", "rejected"))
+        from_statuses=("draft", "approved", "scheduled", "rejected", "flagged"))
     job_id = await container.jobs.enqueue(
         "content_publish", {"item_id": item_id, "target": target},
         owner_id=user.id)

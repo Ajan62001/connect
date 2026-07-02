@@ -10,6 +10,7 @@ from connect.workers.handlers import (  # noqa: F401 — registration imports
     brief,
     content,
     enrichment,
+    integrity,
     investigation,
     poll,
     story,

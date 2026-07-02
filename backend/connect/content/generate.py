@@ -10,19 +10,21 @@ synthesis, applied to four output shapes.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from typing import Any
 
 import psycopg
 from pydantic import BaseModel
 
 from connect.analysis.budget import AnalysisBudget
-from connect.content import ground
+from connect.content import gate, ground
 from connect.content.schema import (
     CarouselContent,
     ContentOptions,
     FORMAT_SCHEMA,
     LinkedInContent,
+    MemeContent,
     ReelContent,
     ThreadContent,
 )
@@ -80,6 +82,16 @@ _FORMAT_GUIDE = {
         " sentence), and an IMAGE_QUERY of 2-4 plain words naming a concrete,"
         " photographable subject for the background photo. End with a caption"
         " and hashtags. Energetic and visual — never a bulleted summary."),
+    "meme": (
+        "Produce a NEWS MEME: a relevant stock PHOTO (image_query: 2-4 plain"
+        " words naming a concrete, photographable subject that carries the"
+        " joke) with a big TOP_TEXT setup and BOTTOM_TEXT punchline, plus a"
+        " caption giving the real, factual news. The humor comes from FRAMING"
+        " — relatability, irony of the situation, shared everyday frustration"
+        " — NEVER from invented facts, mockery of victims, or a tragedy played"
+        " for laughs (if the story is grim, skip the joke and be wry instead)."
+        " Any number or factual claim in the top/bottom text must be supported"
+        " by the menu; keep both lines short and punchy."),
 }
 
 
@@ -90,6 +102,7 @@ class FormatResult:
     content: BaseModel
     sources: list[StorySource]
     grounding: dict[str, Any]
+    gate: dict[str, Any] = field(default_factory=dict)
 
 
 # -- per-format text accessors (what to verify; what to strip) -----------------
@@ -111,6 +124,8 @@ def _texts(fmt: str, o: BaseModel) -> list[str]:
         return list(o.tweets)
     if isinstance(o, LinkedInContent):
         return [o.body]
+    if isinstance(o, MemeContent):
+        return [o.top_text, o.bottom_text, o.caption]
     return []
 
 
@@ -139,11 +154,30 @@ def _strip(o: BaseModel) -> BaseModel:
         return o.model_copy(update={"tweets": [s(t) for t in o.tweets]})
     if isinstance(o, LinkedInContent):
         return o.model_copy(update={"body": s(o.body)})
+    if isinstance(o, MemeContent):
+        return o.model_copy(update={
+            "top_text": s(o.top_text), "bottom_text": s(o.bottom_text),
+            "caption": s(o.caption)})
     return o
 
 
+# citation-marker-ish tokens: the planner sees a differently-numbered menu,
+# so an E# it echoes would mis-cite here — scrub at the sink too
+_MARKER_RE = re.compile(r"\[+\s*E\d+\s*\]+|\bE\d+\b")
+
+
+def _hint(text: str | None, cap: int = 80) -> str:
+    """One bounded, marker-free line for planner-provided free text — it is
+    model output over scraped sources, so it never gets to add its own prompt
+    lines or smuggle citation ids."""
+    return " ".join(_MARKER_RE.sub(" ", text or "").split())[:cap].strip()
+
+
 def _build_user_prompt(fmt: str, menu_text: str, factset: StoryFactSet,
-                       options: ContentOptions, settings: PostSettings) -> str:
+                       options: ContentOptions, settings: PostSettings,
+                       media_hint: str | None = None,
+                       angle: str | None = None,
+                       pick_reason: str | None = None) -> str:
     guide = _FORMAT_GUIDE[fmt].format(slides=options.slide_count,
                                       tweets=options.thread_length,
                                       scenes=options.scene_count)
@@ -156,10 +190,21 @@ def _build_user_prompt(fmt: str, menu_text: str, factset: StoryFactSet,
              if settings.auto_theme
              and fmt in ("ig_card", "ig_carousel", "ig_reel")
              else "")
+    hint = _hint(media_hint)
+    media = (f"Editorial visual direction (VISUALS ONLY — not evidence):"
+             f" build image queries around '{hint}' where they fit the"
+             " content.\n" if hint else "")
+    lead = _hint(angle, 300)
+    angle_line = (f"Editorial angle — LEAD with this: {lead}. Framing ONLY,"
+                  " not evidence: every factual claim still cites [[E#]].\n"
+                  if lead else "")
+    why = _hint(pick_reason, 200)
+    reason_line = (f"Why this format was commissioned: {why}\n" if why else "")
     return (
         f"SUBJECT: {factset.subject}\n\n{menu_text}\n\n"
         f"{guide}\nTone: {options.tone}. About {options.hashtag_count}"
         f" hashtags (without '#').\n{style_line}{brand}{theme}"
+        f"{angle_line}{reason_line}{media}"
         "Write it now, citing [[E#]] for every factual claim.")
 
 
@@ -167,13 +212,18 @@ async def generate_format(conn: psycopg.AsyncConnection,
                           provider: LLMProvider, *, fmt: str,
                           factset: StoryFactSet, options: ContentOptions,
                           settings: PostSettings, budget: AnalysisBudget,
-                          governor: Any, viewer: int) -> FormatResult:
+                          governor: Any, viewer: int,
+                          media_hint: str | None = None,
+                          angle: str | None = None,
+                          pick_reason: str | None = None) -> FormatResult:
     schema = FORMAT_SCHEMA[fmt]
     platform = CONTENT_FORMAT_PLATFORM[fmt]
     menu, by_id = ground.build_menu(factset)
     menu_text = menu.render()
     system = _SYSTEM_BASE.format(platform=platform)
-    user = _build_user_prompt(fmt, menu_text, factset, options, settings)
+    user = _build_user_prompt(fmt, menu_text, factset, options, settings,
+                              media_hint=media_hint, angle=angle,
+                              pick_reason=pick_reason)
 
     proj = spend.cost_usd(provider.model_for(ModelTier.BALANCED),
                           input_tokens=EST_IN, output_tokens=EST_OUT)
@@ -205,6 +255,17 @@ async def generate_format(conn: psycopg.AsyncConnection,
     # resolve attribution from the (possibly regenerated) text BEFORE stripping
     sources, grounding = ground.resolve(
         menu, by_id, _texts(fmt, out), regenerated=regenerated)
+
+    # S2 editorial gate: verify the generated prose is actually entailed by the
+    # evidence it is attributed to (warn-only; fails open on any LLM/budget
+    # error so generation is never blocked by the verifier).
+    report = await gate.assess(
+        conn, provider, content_texts=_texts(fmt, out),
+        source_quotes=[s.quote for s in sources if s.quote],
+        document_ids=[s.document_id for s in sources if s.document_id],
+        budget=budget, governor=governor, viewer=viewer)
+
     published = _strip(out)
     return FormatResult(fmt=fmt, platform=platform, content=published,
-                        sources=sources, grounding=grounding)
+                        sources=sources, grounding=grounding,
+                        gate=report.model_dump())

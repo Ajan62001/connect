@@ -28,6 +28,9 @@ from connect.analysis.context import (
 )
 from connect.analysis.prompts import ANALYSIS_PROMPT_VERSION, SAME_PROPOSITION_SYSTEM
 from connect.analysis.schema import ClaimKind, EvidenceRef, SameProposition
+from connect.integrity import observe as integrity_observe
+from connect.integrity.signals import IntegritySignal
+from connect.knowledge import corrections
 from connect.llm.provider import LLMError
 from connect.llm.tiers import ModelTier
 from connect.storage.pg import Jsonb, Vector, utc_now
@@ -176,6 +179,10 @@ async def update_verdict(conn: psycopg.AsyncConnection, *, claim_id: int,
          "stance": e.stance, "weight": round(e.weight, 4)}
         for e in evidence]
     async with conn.transaction():
+        cur = await conn.execute(
+            "SELECT verdict FROM claim WHERE id = %s", (claim_id,))
+        prior_row = await cur.fetchone()
+        prior = prior_row["verdict"] if prior_row else None
         await conn.execute(
             "UPDATE claim SET verdict = %s, confidence = %s,"
             " verdict_updated_at = %s WHERE id = %s",
@@ -185,3 +192,12 @@ async def update_verdict(conn: psycopg.AsyncConnection, *, claim_id: int,
             ' "trigger", evidence_snapshot) VALUES (%s,%s,%s,%s,%s)',
             (claim_id, verdict, now, f"analysis:{dossier_id}",
              Jsonb(snapshot)))
+        # S3: a real verdict flip into/out of refuted/mixed opens a correction
+        # that the content_correction sweep fans out to dependent published items
+        if corrections.is_propagating_flip(prior, verdict):
+            await corrections.record_verdict_flip(
+                conn, claim_id=claim_id, from_verdict=prior, to_verdict=verdict)
+        # S5: verdict-distribution telemetry (best-effort)
+        await integrity_observe.record(conn, IntegritySignal(
+            kind="verdict", surface="analysis", subject_id=claim_id,
+            value=verdict))

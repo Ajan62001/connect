@@ -57,7 +57,20 @@ def _to_model(row: Mapping[str, Any]) -> Job:
 # job kinds that dedup against a partial unique index, keyed by a payload
 # field (beat enqueues them blindly on every tick; the index DO-NOTHINGs the
 # duplicate). Each MUST have a matching uq_job_* index in storage/schema.py.
-_DEDUP_KEYS = {"poll_source": "source_id", "content_publish": "item_id"}
+_DEDUP_KEYS = {"poll_source": "source_id", "content_publish": "item_id",
+               "content_verify": "item_id"}
+
+# the statuses a kind's dedup window covers (must mirror its index predicate).
+# content_verify collapses onto QUEUED jobs only: a RUNNING verify snapshotted
+# its item row at claim time, so an enqueue for an edit/approve made since
+# must survive it — a queued job re-reads everything when it starts.
+_DEDUP_STATUS_SQL = "('queued','running')"
+_DEDUP_STATUS_SQL_BY_KIND = {"content_verify": "('queued')"}
+
+# job kinds where at most ONE live job may exist globally (the job itself fans
+# out over its work set). Dedup against a partial unique index on ((kind)) —
+# same schema.py contract as _DEDUP_KEYS.
+_SINGLETON_KINDS = frozenset({"content_correction"})
 
 
 async def create(conn: psycopg.AsyncConnection, kind: str,
@@ -71,16 +84,21 @@ async def create(conn: psycopg.AsyncConnection, kind: str,
     per-user interactive caps and the ambient spend attribution when a
     worker executes the job.
 
-    ``poll_source`` (keyed by source_id) and ``content_publish`` (keyed by
-    item_id) dedup against their partial unique indexes (at most one live job
-    per key); a deduped enqueue returns the EXISTING live job's id and
-    notifies nobody (the job is already known).
+    ``poll_source`` / ``content_publish`` / ``content_verify`` (keyed by a
+    payload field) and the singleton ``content_correction`` dedup against
+    their partial unique indexes (at most one live job per key); a deduped
+    enqueue returns the EXISTING live job's id and notifies nobody (the job
+    is already known).
     """
     dedup_key = _DEDUP_KEYS.get(kind)
+    statuses = _DEDUP_STATUS_SQL_BY_KIND.get(kind, _DEDUP_STATUS_SQL)
     conflict = ""
     if dedup_key is not None:
         conflict = (f" ON CONFLICT ((payload->>'{dedup_key}')) WHERE kind ="
-                    f" '{kind}' AND status IN ('queued','running') DO NOTHING")
+                    f" '{kind}' AND status IN {statuses} DO NOTHING")
+    elif kind in _SINGLETON_KINDS:
+        conflict = (f" ON CONFLICT ((kind)) WHERE kind = '{kind}'"
+                    f" AND status IN {statuses} DO NOTHING")
     while True:
         async with conn.transaction():
             cur = await conn.execute(
@@ -96,13 +114,18 @@ async def create(conn: psycopg.AsyncConnection, kind: str,
                 await conn.execute("SELECT pg_notify(%s, %s)",
                                    (CHANNEL_JOB_NEW, kind))
                 return int(row["id"])
-        # deduped: hand back the live job for this key; if it went terminal
-        # in the window since the conflict, loop and insert again
-        cur = await conn.execute(
-            f"SELECT id FROM job WHERE kind = '{kind}'"
-            " AND status IN ('queued','running')"
-            f" AND payload->>'{dedup_key}' = %s",
-            (str((payload or {})[dedup_key]),))
+        # deduped: hand back the live job for this key; if it left the dedup
+        # window since the conflict, loop and insert again
+        if dedup_key is not None:
+            cur = await conn.execute(
+                f"SELECT id FROM job WHERE kind = '{kind}'"
+                f" AND status IN {statuses}"
+                f" AND payload->>'{dedup_key}' = %s",
+                (str((payload or {})[dedup_key]),))
+        else:
+            cur = await conn.execute(
+                f"SELECT id FROM job WHERE kind = '{kind}'"
+                f" AND status IN {statuses}")
         existing = await cur.fetchone()
         if existing is not None:
             return int(existing["id"])

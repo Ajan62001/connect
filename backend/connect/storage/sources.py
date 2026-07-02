@@ -28,6 +28,7 @@ def _to_model(row: Mapping[str, Any]) -> Source:
         created_at=row["created_at"],
         last_polled_at=row["last_polled_at"],
         last_poll_status=row["last_poll_status"],
+        reliability_score=row.get("reliability_score"),
         doc_count=row.get("doc_count", 0),
     )
 

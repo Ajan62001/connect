@@ -285,6 +285,175 @@ async def pg_migrate_17_to_18(conn: "psycopg.AsyncConnection") -> None:
         f" CHECK (kind IN {schema.E.sql_in(schema.E.JOB_KINDS)})")
 
 
+async def pg_migrate_18_to_19(conn: "psycopg.AsyncConnection") -> None:
+    """v19 — S1, editorial-integrity suite: the `content_item_source` provenance
+    link table tying each content_item back to the source documents it was
+    grounded in (verbatim quote + char offsets + credibility-tier snapshot).
+    Fresh DDL, then a ONE-TIME idempotent backfill of link rows from the
+    existing JSONB `content_item.sources` so the reverse index (S3/S4/S6) is not
+    blind to pre-existing items. The credibility_tier is resolved from each
+    cited document's registered source at backfill time."""
+    for ddl in (schema._PG_DDL_CONTENT_ITEM_SOURCE,
+                *schema._PG_DDL_CONTENT_ITEM_SOURCE_INDEXES):
+        await conn.execute(ddl)
+    await conn.execute(
+        """
+        INSERT INTO content_item_source
+            (content_item_id, ref, document_id, finding_id, source_name,
+             title, url, quote, quote_start, quote_end, occurred_on,
+             credibility_tier, created_at)
+        SELECT ci.id,
+               COALESCE(s->>'ref', ''),
+               NULLIF(s->>'document_id', '')::bigint,
+               NULLIF(s->>'finding_id', '')::bigint,
+               s->>'source_name', s->>'title', s->>'url', s->>'quote',
+               NULLIF(s->>'quote_start', '')::int,
+               NULLIF(s->>'quote_end', '')::int,
+               s->>'occurred_on',
+               (SELECT src.credibility_tier FROM source src
+                  JOIN document d ON d.source_id = src.id
+                 WHERE d.id = NULLIF(s->>'document_id', '')::bigint),
+               COALESCE(ci.created_at, now())
+          FROM content_item ci
+          CROSS JOIN LATERAL jsonb_array_elements(ci.sources) AS s
+         WHERE jsonb_typeof(ci.sources) = 'array'
+           AND NOT EXISTS (SELECT 1 FROM content_item_source cis
+                            WHERE cis.content_item_id = ci.id)
+        """)
+
+
+async def pg_migrate_19_to_20(conn: "psycopg.AsyncConnection") -> None:
+    """v20 — S2, publish-time editorial verification gate. New vocabulary
+    ('verifying'/'flagged' content_item statuses, the 'content_verify' job
+    kind), the `gate` jsonb report column on content_item, and provenance
+    (`sources`/`grounding`) on social_draft so the (formerly unverified) social
+    path can be hard-delegated through the same closed-menu gate. Constraint
+    widening + additive columns; no data migration. A partial unique index
+    deduplicates in-flight content_verify jobs per item."""
+    await conn.execute(
+        "ALTER TABLE content_item DROP CONSTRAINT IF EXISTS"
+        " ck_content_item_status")
+    await conn.execute(
+        "ALTER TABLE content_item ADD CONSTRAINT ck_content_item_status"
+        f" CHECK (status IN {schema.E.sql_in(schema.E.CONTENT_ITEM_STATUSES)})")
+    await conn.execute("ALTER TABLE job DROP CONSTRAINT IF EXISTS ck_job_kind")
+    await conn.execute(
+        "ALTER TABLE job ADD CONSTRAINT ck_job_kind"
+        f" CHECK (kind IN {schema.E.sql_in(schema.E.JOB_KINDS)})")
+    await conn.execute(
+        "ALTER TABLE content_item ADD COLUMN IF NOT EXISTS gate"
+        " jsonb NOT NULL DEFAULT '{}'::jsonb")
+    await conn.execute(
+        "ALTER TABLE social_draft ADD COLUMN IF NOT EXISTS sources"
+        " jsonb NOT NULL DEFAULT '[]'::jsonb")
+    await conn.execute(
+        "ALTER TABLE social_draft ADD COLUMN IF NOT EXISTS grounding"
+        " jsonb NOT NULL DEFAULT '{}'::jsonb")
+    await conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_content_verify"
+        " ON job ((payload->>'item_id'))"
+        " WHERE kind = 'content_verify' AND status = 'queued'")
+
+
+async def pg_migrate_20_to_21(conn: "psycopg.AsyncConnection") -> None:
+    """v21 — S3, corrections / retractions / verdict propagation. The
+    `correction` + `content_item_correction` tables, the recheck cursor columns
+    on `source`, the 'retracted'/'corrected' content_item statuses, and the
+    'content_correction'/'source_recheck' job kinds. Constraint widening +
+    additive tables/columns; no data migration. A partial unique index keeps at
+    most one content_correction sweep job in flight."""
+    for ddl in (schema._PG_DDL_CORRECTION, *schema._PG_DDL_CORRECTION_INDEXES,
+                schema._PG_DDL_CONTENT_ITEM_CORRECTION,
+                *schema._PG_DDL_CONTENT_ITEM_CORRECTION_INDEXES):
+        await conn.execute(ddl)
+    await conn.execute(
+        "ALTER TABLE source ADD COLUMN IF NOT EXISTS last_rechecked_at"
+        " timestamptz")
+    await conn.execute(
+        "ALTER TABLE source ADD COLUMN IF NOT EXISTS canonical_hash text")
+    await conn.execute(
+        "ALTER TABLE content_item DROP CONSTRAINT IF EXISTS"
+        " ck_content_item_status")
+    await conn.execute(
+        "ALTER TABLE content_item ADD CONSTRAINT ck_content_item_status"
+        f" CHECK (status IN {schema.E.sql_in(schema.E.CONTENT_ITEM_STATUSES)})")
+    await conn.execute("ALTER TABLE job DROP CONSTRAINT IF EXISTS ck_job_kind")
+    await conn.execute(
+        "ALTER TABLE job ADD CONSTRAINT ck_job_kind"
+        f" CHECK (kind IN {schema.E.sql_in(schema.E.JOB_KINDS)})")
+    await conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_content_correction"
+        " ON job ((kind)) WHERE kind = 'content_correction'"
+        " AND status IN ('queued','running')")
+
+
+async def pg_migrate_21_to_22(conn: "psycopg.AsyncConnection") -> None:
+    """v22 — S4, dynamic source-credibility scoring. Adds the reliability_score
+    columns to `source`, the `source_credibility_history` audit table, and the
+    'credibility_recompute' job kind. Additive columns/table + constraint
+    widening; no data migration (NULL reliability falls back to the tier prior,
+    so existing verdicts are unchanged until the first recompute runs)."""
+    await conn.execute(
+        "ALTER TABLE source ADD COLUMN IF NOT EXISTS reliability_score"
+        " double precision")
+    await conn.execute(
+        "ALTER TABLE source ADD COLUMN IF NOT EXISTS reliability_updated_at"
+        " timestamptz")
+    for ddl in (schema._PG_DDL_SOURCE_CREDIBILITY_HISTORY,
+                *schema._PG_DDL_SOURCE_CREDIBILITY_HISTORY_INDEXES):
+        await conn.execute(ddl)
+    await conn.execute("ALTER TABLE job DROP CONSTRAINT IF EXISTS ck_job_kind")
+    await conn.execute(
+        "ALTER TABLE job ADD CONSTRAINT ck_job_kind"
+        f" CHECK (kind IN {schema.E.sql_in(schema.E.JOB_KINDS)})")
+
+
+async def pg_migrate_22_to_23(conn: "psycopg.AsyncConnection") -> None:
+    """v23 — S5, production integrity observability + live eval gate. The
+    `integrity_event` (append-only signal stream) and `integrity_eval_run`
+    (scheduled live-eval ledger) tables, and the 'integrity_eval' job kind.
+    Additive tables + constraint widening; no data migration."""
+    for ddl in (schema._PG_DDL_INTEGRITY_EVENT,
+                *schema._PG_DDL_INTEGRITY_EVENT_INDEXES,
+                schema._PG_DDL_INTEGRITY_EVAL_RUN,
+                *schema._PG_DDL_INTEGRITY_EVAL_RUN_INDEXES):
+        await conn.execute(ddl)
+    await conn.execute("ALTER TABLE job DROP CONSTRAINT IF EXISTS ck_job_kind")
+    await conn.execute(
+        "ALTER TABLE job ADD CONSTRAINT ck_job_kind"
+        f" CHECK (kind IN {schema.E.sql_in(schema.E.JOB_KINDS)})")
+
+
+async def pg_migrate_23_to_24(conn: "psycopg.AsyncConnection") -> None:
+    """v24 — the 'meme' content format (stock photo + top/bottom caption,
+    publishes to Instagram like ig_card), plus a NARROWER content_verify dedup
+    window: the unique index covers only QUEUED jobs, so an enqueue for an
+    edit/approve made while a verify is RUNNING survives it (the running job
+    snapshotted its item row at claim time and must not swallow it).
+    Constraint widening + index re-create; no data migration."""
+    await conn.execute(
+        "ALTER TABLE content_item DROP CONSTRAINT IF EXISTS"
+        " ck_content_item_format")
+    await conn.execute(
+        "ALTER TABLE content_item ADD CONSTRAINT ck_content_item_format"
+        f" CHECK (format IN {schema.E.sql_in(schema.E.CONTENT_FORMATS)})")
+    await conn.execute("DROP INDEX IF EXISTS uq_job_content_verify")
+    await conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_content_verify"
+        " ON job ((payload->>'item_id'))"
+        " WHERE kind = 'content_verify' AND status = 'queued'")
+
+
+async def pg_migrate_24_to_25(conn: "psycopg.AsyncConnection") -> None:
+    """v25 — the editorial planner ('auto' campaigns). ``campaign.plan``
+    stores the EditorialPlan the orchestrator produced when the request left
+    format choice to the system (formats = []): significance score, format
+    picks and per-format media treatment. NULL for user-picked campaigns.
+    Additive column; no data migration."""
+    await conn.execute(
+        "ALTER TABLE campaign ADD COLUMN IF NOT EXISTS plan jsonb")
+
+
 # Registry: version N -> async function taking N's schema to N+1's.
 # Forward-only.
 PG_MIGRATIONS: dict[
@@ -306,6 +475,13 @@ PG_MIGRATIONS: dict[
     15: pg_migrate_15_to_16,
     16: pg_migrate_16_to_17,
     17: pg_migrate_17_to_18,
+    18: pg_migrate_18_to_19,
+    19: pg_migrate_19_to_20,
+    20: pg_migrate_20_to_21,
+    21: pg_migrate_21_to_22,
+    22: pg_migrate_22_to_23,
+    23: pg_migrate_23_to_24,
+    24: pg_migrate_24_to_25,
 }
 
 

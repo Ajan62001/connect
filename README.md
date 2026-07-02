@@ -175,6 +175,11 @@ deployment-wide backstop that caps the actual API bill. The full list with defau
 lives in `backend/connect/orchestration/config.py` (env prefix `CONNECT_`); commonly
 toggled in dev: `CONNECT_POLLER_ENABLED=false`, `CONNECT_EMBEDDINGS_ENABLED=false`.
 
+For observability, set `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` (and optionally
+`LANGFUSE_HOST` for a self-hosted instance) to trace every Anthropic call to
+[Langfuse](https://langfuse.com) as a generation — model, tier, input/output, token
+usage, latency, and errors. Unset, tracing is a no-op and the LLM layer is unchanged.
+
 ## Budgets, limits & admin (v0.2 Phase D)
 
 Every LLM call is ledgered with the acting user (`llm_call.user_id`; jobs carry

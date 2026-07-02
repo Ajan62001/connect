@@ -162,6 +162,18 @@ def test_evidence_menu_rejects_off_menu_ids():
     assert "quote two" in rendered
 
 
+def test_evidence_menu_render_lines_matches_render():
+    """render() is exactly the joined render_lines() — the planner's
+    entry-aligned truncation depends on this — and tier 0 renders as a real
+    tier, not 'tier unknown'."""
+    menu = grounding.EvidenceMenu()
+    menu.add(document_id=1, quote="q1", source_name="PIB", credibility_tier=0)
+    menu.add(document_id=2, quote="q2")
+    assert menu.render() == "\n".join(menu.render_lines())
+    assert "(PIB, tier 0)" in menu.render_lines()[0]
+    assert "tier unknown" in menu.render_lines()[1]
+
+
 # --- stance: span-verification discard path -------------------------------------------
 
 async def test_stance_discard_after_failed_retry(container, db):

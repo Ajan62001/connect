@@ -42,6 +42,7 @@ from connect.api.routers import (
     events,
     feed,
     health,
+    integrity,
     investigations,
     position_shifts,
     posts,
@@ -88,6 +89,7 @@ _AUTHED_ROUTERS = (
     content.campaigns_router,
     content.content_router,
     position_shifts.router,
+    integrity.router,
     admin.router,
 )
 

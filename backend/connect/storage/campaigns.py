@@ -37,6 +37,17 @@ async def insert(conn: psycopg.AsyncConnection, *, owner_id: int,
         return int((await cur.fetchone())["id"])
 
 
+async def set_plan(conn: psycopg.AsyncConnection, campaign_id: int, *,
+                   plan: dict[str, Any], formats: list[str]) -> None:
+    """Persist the editorial planner's decision on an 'auto' campaign — the
+    plan itself plus the formats it commissioned (so the row reads like a
+    user-picked campaign from then on)."""
+    async with conn.transaction():
+        await conn.execute(
+            "UPDATE campaign SET plan = %s, formats = %s WHERE id = %s",
+            (Jsonb(plan), Jsonb(list(formats)), campaign_id))
+
+
 async def get_row(conn: psycopg.AsyncConnection, campaign_id: int, *,
                   viewer: int) -> dict[str, Any] | None:
     """The bare row for tenancy checks (owner_id, visibility, status)."""
@@ -59,7 +70,7 @@ async def job_id_for(conn: psycopg.AsyncConnection,
 async def get_detail(conn: psycopg.AsyncConnection, campaign_id: int, *,
                      viewer: int) -> CampaignDetail | None:
     cur = await conn.execute(
-        "SELECT id, subject, input_type, status, formats, visibility,"
+        "SELECT id, subject, input_type, status, formats, plan, visibility,"
         " owner_id, error, created_at, finished_at FROM campaign"
         f" WHERE id = %s AND {_VISIBLE}", (campaign_id, viewer))
     row = await cur.fetchone()
@@ -74,7 +85,8 @@ async def get_detail(conn: psycopg.AsyncConnection, campaign_id: int, *,
     return CampaignDetail(
         id=row["id"], subject=row["subject"], input_type=row["input_type"],
         status=row["status"], formats=list(row["formats"] or []),
-        visibility=row["visibility"], owner_id=row["owner_id"],
+        plan=row["plan"], visibility=row["visibility"],
+        owner_id=row["owner_id"],
         last_seq=last_seq, error=row["error"], items=items,
         created_at=str(row["created_at"]),
         updated_at=str(row["finished_at"]) if row["finished_at"] else None)

@@ -14,6 +14,7 @@ from connect.content.platforms import linkedin, x, zapier
 from connect.content.schema import (
     CarouselContent,
     LinkedInContent,
+    MemeContent,
     ReelContent,
     ThreadContent,
 )
@@ -63,6 +64,9 @@ def _shape(fmt: str, content: dict[str, Any]) -> tuple[str, str, list[str], str]
     if fmt == "linkedin_post":
         li = LinkedInContent(**content)
         return _with_tags(li.body, li.hashtags), li.body, list(li.hashtags), "none"
+    if fmt == "meme":
+        m = MemeContent(**content)
+        return _with_tags(m.caption, m.hashtags), m.caption, list(m.hashtags), "image"
     raise ValueError(f"unknown format {fmt!r}")
 
 
@@ -121,4 +125,11 @@ async def publish_item(settings, *, fmt: str, content: dict[str, Any],
         li = LinkedInContent(**content)
         return await linkedin.publish(
             settings, body=_with_tags(li.body, li.hashtags))
+    if fmt == "meme":
+        m = MemeContent(**content)
+        if not card_urls:
+            raise instagram.InstagramError("no rendered meme to publish")
+        return await instagram.publish(
+            settings, image_url=card_urls[0],
+            caption=_with_tags(m.caption, m.hashtags))
     raise ValueError(f"unknown format {fmt!r}")

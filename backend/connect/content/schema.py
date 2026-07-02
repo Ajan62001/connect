@@ -88,6 +88,11 @@ class CarouselSlide(BaseModel):
         default_factory=list,
         description="1-3 very short factual lines (<=100 chars each) for the"
                     " slide body, each grounded in a cited evidence item.")
+    image_query: str = Field(
+        default="",
+        description="Optional: 2-4 plain words for a background photo that"
+                    " fits this slide — a concrete, photographable subject."
+                    " Empty for a clean themed slide.")
 
 
 class CarouselContent(BaseModel):
@@ -96,6 +101,11 @@ class CarouselContent(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str = Field(
         description="The cover-slide title (<=70 chars), punchy and factual.")
+    image_query: str = Field(
+        default="",
+        description="Optional: 2-4 plain words for the COVER slide's"
+                    " background photo (a concrete, photographable subject"
+                    " tied to the story). Empty for a clean themed cover.")
     slides: list[CarouselSlide] = Field(
         default_factory=list,
         description="The content slides, in reading order (3-8 of them).")
@@ -207,6 +217,41 @@ class LinkedInContent(BaseModel):
         description="A few relevant hashtags WITHOUT the '#'.")
 
 
+class MemeContent(BaseModel):
+    """A news meme: a relevant stock photo with a bold top/bottom caption,
+    plus the post caption. The humor rides on FRAMING (relatability, irony of
+    the situation, shared frustration) — never on invented facts. Any number
+    or factual claim in the text must be supported by a cited [[E#]] item."""
+    model_config = ConfigDict(extra="forbid")
+    image_query: str = Field(
+        description="2-4 plain words to search the web for the meme's photo —"
+                    " a concrete, photographable subject that carries the joke"
+                    " (e.g. 'crowded Mumbai local train', 'empty wallet',"
+                    " 'traffic jam Delhi'). No punctuation.")
+    top_text: str = Field(
+        description="The SETUP line (<=90 chars), rendered big across the top"
+                    " of the photo. Relatable and punchy; grounded when it"
+                    " states a fact.")
+    bottom_text: str = Field(
+        description="The PUNCHLINE (<=90 chars), rendered big across the"
+                    " bottom. Lands the joke without mocking victims or"
+                    " inventing claims.")
+    caption: str = Field(
+        description="The post caption: 1-2 sentences giving the real, factual"
+                    " news behind the joke, citing its [[E#]] support. End by"
+                    " crediting the source.")
+    hashtags: list[str] = Field(
+        default_factory=list,
+        description="Relevant hashtags WITHOUT the '#' (e.g. 'RBI').")
+    source_label: str = Field(
+        default="",
+        description="Short source credit shown small on the image, e.g."
+                    " 'Source: RBI'.")
+    alt_text: str = Field(
+        default="",
+        description="One-sentence accessibility description of the meme.")
+
+
 # the output schema for each format (ig_card == SocialPost)
 FORMAT_SCHEMA: dict[str, type[BaseModel]] = {
     "ig_card": SocialPost,
@@ -214,6 +259,7 @@ FORMAT_SCHEMA: dict[str, type[BaseModel]] = {
     "x_thread": ThreadContent,
     "linkedin_post": LinkedInContent,
     "ig_reel": ReelContent,
+    "meme": MemeContent,
 }
 
 
@@ -221,7 +267,9 @@ FORMAT_SCHEMA: dict[str, type[BaseModel]] = {
 
 
 class CampaignCreate(BaseModel):
-    """POST /api/campaigns — seed fields flattened + formats + options."""
+    """POST /api/campaigns — seed fields flattened + formats + options.
+    EMPTY ``formats`` means 'auto': the editorial planner decides the format
+    mix (and media treatment) from the story's significance."""
     model_config = ConfigDict(extra="forbid")
     story_dossier_id: int | None = None
     story_id: int | None = None
@@ -230,7 +278,7 @@ class CampaignCreate(BaseModel):
     topic: str | None = Field(default=None, max_length=400)
     since: str | None = None
     until: str | None = None
-    formats: list[ContentFormat] = Field(min_length=1)
+    formats: list[ContentFormat] = Field(default_factory=list)
     options: ContentOptions = ContentOptions()
     visibility: str | None = None
 
@@ -256,6 +304,7 @@ class ContentItemDetail(_Frozen):
     content: dict[str, Any] = Field(default_factory=dict)
     sources: list[StorySource] = Field(default_factory=list)
     grounding: dict[str, Any] = Field(default_factory=dict)
+    gate: dict[str, Any] = Field(default_factory=dict)  # S2 GateReport dump
     card_shas: list[str] = Field(default_factory=list)
     visibility: str = "shared"
     owner_id: int | None = None
@@ -274,6 +323,7 @@ class CampaignDetail(_Frozen):
     input_type: str
     status: str
     formats: list[str] = Field(default_factory=list)
+    plan: dict[str, Any] | None = None  # EditorialPlan dump ('auto' campaigns)
     visibility: str = "shared"
     owner_id: int | None = None
     last_seq: int = 0

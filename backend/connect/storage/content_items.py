@@ -14,13 +14,15 @@ import psycopg
 
 from connect.content.schema import ContentItemDetail, ContentItemPage
 from connect.story.schema import StorySource
+from connect.storage import content_sources
 from connect.storage.pg import Jsonb, utc_now
 
 _VISIBLE = "(owner_id = %s OR visibility = 'shared')"
 
 _COLS = ("id, campaign_id, platform, format, status, content, sources,"
-         " grounding, card_shas, visibility, owner_id, edited, scheduled_at,"
-         " published_at, publish_ref, error, created_at, updated_at")
+         " grounding, gate, card_shas, visibility, owner_id, edited,"
+         " scheduled_at, published_at, publish_ref, error, created_at,"
+         " updated_at")
 
 
 def _to_detail(row: Mapping[str, Any]) -> ContentItemDetail:
@@ -31,6 +33,7 @@ def _to_detail(row: Mapping[str, Any]) -> ContentItemDetail:
         format=row["format"], status=row["status"],
         content=dict(row["content"] or {}), sources=sources,
         grounding=dict(row["grounding"] or {}),
+        gate=dict(row["gate"] or {}),
         card_shas=list(row["card_shas"] or []), visibility=row["visibility"],
         owner_id=row["owner_id"], edited=bool(row["edited"]),
         scheduled_at=_s(row["scheduled_at"]), published_at=_s(row["published_at"]),
@@ -48,17 +51,21 @@ async def insert(conn: psycopg.AsyncConnection, *, campaign_id: int,
                  owner_id: int, platform: str, format: str,
                  content: dict[str, Any], sources: list[dict[str, Any]],
                  grounding: dict[str, Any], card_shas: list[str],
-                 visibility: str) -> int:
+                 visibility: str, gate: dict[str, Any] | None = None) -> int:
     async with conn.transaction():
         cur = await conn.execute(
             "INSERT INTO content_item (campaign_id, owner_id, platform,"
-            " format, status, content, sources, grounding, card_shas,"
+            " format, status, content, sources, grounding, gate, card_shas,"
             " visibility, created_at) VALUES"
-            " (%s,%s,%s,%s,'draft',%s,%s,%s,%s,%s,%s) RETURNING id",
+            " (%s,%s,%s,%s,'draft',%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             (campaign_id, owner_id, platform, format, Jsonb(content),
-             Jsonb(sources), Jsonb(grounding), Jsonb(card_shas), visibility,
-             utc_now()))
-        return int((await cur.fetchone())["id"])
+             Jsonb(sources), Jsonb(grounding), Jsonb(gate or {}),
+             Jsonb(card_shas), visibility, utc_now()))
+        item_id = int((await cur.fetchone())["id"])
+        # S1 provenance graph: dual-write the relational link rows in the SAME
+        # transaction as the JSONB sources, so the two stores never diverge.
+        await content_sources.insert_links(conn, item_id, sources)
+        return item_id
 
 
 async def get(conn: psycopg.AsyncConnection, item_id: int, *,
@@ -103,6 +110,17 @@ async def list_queue(conn: psycopg.AsyncConnection, *, viewer: int,
         [*params, limit, offset])
     return ContentItemPage(
         items=[_to_detail(r) for r in await cur.fetchall()], total=total)
+
+
+async def set_gate(conn: psycopg.AsyncConnection, item_id: int, *,
+                   gate: dict[str, Any]) -> None:
+    """Persist a freshly-computed gate report (the content_verify job / an
+    edit re-check). System context — no owner scope; the job already owns the
+    item via its campaign."""
+    async with conn.transaction():
+        await conn.execute(
+            "UPDATE content_item SET gate = %s, updated_at = %s WHERE id = %s",
+            (Jsonb(gate), utc_now(), item_id))
 
 
 # -- review transitions (owner-only, status-guarded) ---------------------------

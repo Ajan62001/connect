@@ -26,15 +26,24 @@ _VISIBLE = "(owner_id = %s OR visibility = 'shared')"
 async def insert(conn: psycopg.AsyncConnection, *, owner_id: int,
                  subject: str, input_type: str, seed: dict[str, Any],
                  formats: list[str], options: dict[str, Any],
-                 visibility: str) -> int:
+                 visibility: str, workspace_id: int | None = None) -> int:
     async with conn.transaction():
         cur = await conn.execute(
-            "INSERT INTO campaign (owner_id, subject, input_type, seed,"
-            " formats, options, status, visibility, created_at)"
-            " VALUES (%s,%s,%s,%s,%s,%s,'pending',%s,%s) RETURNING id",
-            (owner_id, subject[:400], input_type, Jsonb(seed),
+            "INSERT INTO campaign (owner_id, workspace_id, subject, input_type,"
+            " seed, formats, options, status, visibility, created_at)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s) RETURNING id",
+            (owner_id, workspace_id, subject[:400], input_type, Jsonb(seed),
              Jsonb(formats), Jsonb(options), visibility, utc_now()))
         return int((await cur.fetchone())["id"])
+
+
+async def workspace_for(conn: psycopg.AsyncConnection,
+                        campaign_id: int) -> int | None:
+    """The campaign's channel-of-record workspace id (or None)."""
+    cur = await conn.execute(
+        "SELECT workspace_id FROM campaign WHERE id = %s", (campaign_id,))
+    row = await cur.fetchone()
+    return int(row["workspace_id"]) if row and row["workspace_id"] else None
 
 
 async def set_plan(conn: psycopg.AsyncConnection, campaign_id: int, *,
@@ -55,6 +64,17 @@ async def get_row(conn: psycopg.AsyncConnection, campaign_id: int, *,
         "SELECT id, owner_id, visibility, status FROM campaign"
         f" WHERE id = %s AND {_VISIBLE}", (campaign_id, viewer))
     return await cur.fetchone()
+
+
+async def options_for(conn: psycopg.AsyncConnection,
+                      campaign_id: int) -> dict[str, Any]:
+    """The options dict the campaign was created with ({} when gone) — the
+    render choices (visual/caption style, voice…) an item re-render inherits
+    for knobs the caller leaves unset."""
+    cur = await conn.execute(
+        "SELECT options FROM campaign WHERE id = %s", (campaign_id,))
+    row = await cur.fetchone()
+    return (row["options"] if row else None) or {}
 
 
 async def job_id_for(conn: psycopg.AsyncConnection,
@@ -95,11 +115,12 @@ async def get_detail(conn: psycopg.AsyncConnection, campaign_id: int, *,
 async def list_page(conn: psycopg.AsyncConnection, *, viewer: int,
                     limit: int = 50, offset: int = 0,
                     workspace_id: int | None = None) -> CampaignPage:
-    # optional scope to one workspace's campaigns (the seed carries the id)
+    # optional scope to one workspace's campaigns — the v27 workspace_id column,
+    # falling back to the seed JSONB for rows created before the backfill
     scope, scope_param = "", ()
     if workspace_id is not None:
-        scope = " AND seed->>'workspace_id' = %s"
-        scope_param = (str(workspace_id),)
+        scope = " AND (workspace_id = %s OR seed->>'workspace_id' = %s)"
+        scope_param = (workspace_id, str(workspace_id))
     cur = await conn.execute(
         f"SELECT count(*) AS n FROM campaign WHERE {_VISIBLE}{scope}",
         (viewer, *scope_param))

@@ -65,7 +65,7 @@ class StorageVersionError(StorageError):
 # PostgreSQL baseline schema (v0.2, the canonical DDL) — fresh lineage, v1.
 # ==============================================================================
 
-PG_SCHEMA_VERSION = 25
+PG_SCHEMA_VERSION = 27
 
 # Extensions first: the compose image is pgvector/pgvector:pg17, so both are
 # present; IF NOT EXISTS keeps re-entry harmless.
@@ -791,6 +791,12 @@ _PG_DDL_JOB_INDEXES = (
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_content_correction"
     " ON job ((kind)) WHERE kind = 'content_correction'"
     " AND status IN ('queued','running')",
+    # dedup: at most one LIVE factory run — concurrent runs would scout the
+    # same slate and commission duplicate campaigns (double LLM+render
+    # spend); a deduped enqueue returns the live run's job id (v26)
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_reel_factory"
+    " ON job ((kind)) WHERE kind = 'reel_factory'"
+    " AND status IN ('queued','running')",
 )
 
 # seq: identity values are allocated at INSERT, not commit — globally, a
@@ -922,6 +928,55 @@ _PG_DDL_POST_INDEXES = (
 # (topics / sources / FTS query) that drives a focused feed, and a tag that
 # groups a user's findings/watches. Owned + shared/private like dossiers. The
 # focus is stored as jsonb (topics: list[str], source_ids: list[int]).
+# A shared roster of presenter CHARACTERS (v27): the persona a reel/post is
+# written and narrated as. Referenced by workspace_channel.default_character_id
+# (ON DELETE SET NULL) and by ContentOptions.character_id per campaign. The
+# text fields are inserted verbatim into generation prompts, so they carry the
+# same trust class as ContentOptions.style — length caps live on the model.
+_PG_DDL_CHARACTER = """
+CREATE TABLE IF NOT EXISTS character (
+    id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    owner_id         bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    name             text NOT NULL,
+    description      text NOT NULL DEFAULT '',
+    speaking_style   text NOT NULL DEFAULT '',
+    sample_line      text NOT NULL DEFAULT '',
+    voice_id         text,
+    heygen_avatar_id text,
+    catchphrases     jsonb NOT NULL DEFAULT '[]'::jsonb,
+    sign_off         text NOT NULL DEFAULT '',
+    avatar_sha       text,
+    created_at       timestamptz NOT NULL,
+    updated_at       timestamptz
+)"""
+
+_PG_DDL_CHARACTER_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_character_owner"
+    " ON character(owner_id, created_at DESC)",
+)
+
+# Custom SCRIPT-TYPE presets (v27): a named shape/pacing/hook guidance the
+# generator applies (built-ins live in code — connect/content/presets.py). The
+# per-campaign pick is one string: a builtin slug or 'custom:<id>'.
+_PG_DDL_SCRIPT_PRESET = """
+CREATE TABLE IF NOT EXISTS script_preset (
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    owner_id      bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    name          text NOT NULL,
+    guidance      text NOT NULL DEFAULT '',
+    formats       jsonb NOT NULL DEFAULT '[]'::jsonb,
+    scene_count   integer,
+    caption_style text,
+    visual_style  text,
+    created_at    timestamptz NOT NULL,
+    updated_at    timestamptz
+)"""
+
+_PG_DDL_SCRIPT_PRESET_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_script_preset_owner"
+    " ON script_preset(owner_id, created_at DESC)",
+)
+
 _PG_DDL_WORKSPACE = f"""
 CREATE TABLE IF NOT EXISTS workspace (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -947,6 +1002,31 @@ _PG_DDL_WORKSPACE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_workspace_visibility"
     " ON workspace(visibility, created_at DESC)",
 )
+
+# The channel binding for a workspace (v27): the publishing account it acts as,
+# plus its default voice / character / script-type. A separate 1:1 table (not
+# columns/JSONB on workspace) because the zapier webhook is a capability URL and
+# ``credentials`` is reserved for future YouTube OAuth secrets — neither should
+# ride the widely-serialized Workspace model. platform is a label + routing hint
+# (CHANNEL_PLATFORMS), broader than the content_item platform vocabulary.
+_PG_DDL_WORKSPACE_CHANNEL = f"""
+CREATE TABLE IF NOT EXISTS workspace_channel (
+    workspace_id         bigint PRIMARY KEY
+                         REFERENCES workspace(id) ON DELETE CASCADE,
+    platform             text NOT NULL DEFAULT 'youtube'
+                         CONSTRAINT ck_workspace_channel_platform
+                         CHECK (platform IN {E.sql_in(E.CHANNEL_PLATFORMS)}),
+    channel_name         text NOT NULL DEFAULT '',
+    channel_handle       text NOT NULL DEFAULT '',
+    external_id          text,
+    zapier_webhook_url   text,
+    default_voice_id     text,
+    default_character_id bigint REFERENCES character(id) ON DELETE SET NULL,
+    default_script_type  text,
+    credentials          jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    created_at           timestamptz NOT NULL,
+    updated_at           timestamptz
+)"""
 
 # Saved workspace-agent conversations (v8): per-user, per-workspace. ``messages``
 # is the provider-shaped wire transcript (replayed to resume the agent);
@@ -1001,6 +1081,7 @@ _PG_DDL_CAMPAIGN = f"""
 CREATE TABLE IF NOT EXISTS campaign (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     owner_id    bigint NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    workspace_id bigint REFERENCES workspace(id) ON DELETE SET NULL,
     subject     text NOT NULL,
     input_type  text NOT NULL,
     seed        jsonb NOT NULL DEFAULT '{{}}'::jsonb,
@@ -1024,6 +1105,8 @@ _PG_DDL_CAMPAIGN_INDEXES = (
     " ON campaign(owner_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_campaign_visibility"
     " ON campaign(visibility, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_campaign_workspace"
+    " ON campaign(workspace_id, created_at DESC) WHERE workspace_id IS NOT NULL",
 )
 
 # One review-queue unit. `content` is the format-specific payload (an
@@ -1435,8 +1518,13 @@ PG_DDL: tuple[str, ...] = (
     _PG_DDL_FETCH_DOMAIN,
     _PG_DDL_ROBOTS_CACHE,
     _PG_DDL_BEAT_RUN,
+    _PG_DDL_CHARACTER,
+    *_PG_DDL_CHARACTER_INDEXES,
+    _PG_DDL_SCRIPT_PRESET,
+    *_PG_DDL_SCRIPT_PRESET_INDEXES,
     _PG_DDL_WORKSPACE,
     *_PG_DDL_WORKSPACE_INDEXES,
+    _PG_DDL_WORKSPACE_CHANNEL,
     _PG_DDL_WORKSPACE_CHAT,
     *_PG_DDL_WORKSPACE_CHAT_INDEXES,
     _PG_DDL_SOCIAL_DRAFT,

@@ -71,26 +71,48 @@ def _shape(fmt: str, content: dict[str, Any]) -> tuple[str, str, list[str], str]
 
 
 def build_zapier_payload(fmt: str, content: dict[str, Any],
-                         card_urls: list[str], *, item_id: int) -> dict:
-    """The JSON a Zap receives — everything needed to post anywhere."""
+                         card_urls: list[str], *, item_id: int,
+                         channel: dict[str, Any] | None = None) -> dict:
+    """The JSON a Zap receives — everything needed to post anywhere. When the
+    item's campaign is bound to a workspace channel, a ``channel`` block +
+    ``target_platform`` let one Zap fan out per channel (e.g. to the right
+    YouTube account)."""
     caption, text, hashtags, media_type = _shape(fmt, content)
-    return {
+    target_platform = (channel.get("platform") if channel
+                       else CONTENT_FORMAT_PLATFORM.get(fmt, ""))
+    payload = {
         "item_id": item_id,
         "format": fmt,
         "platform": CONTENT_FORMAT_PLATFORM.get(fmt, ""),
+        "target_platform": target_platform,
         "caption": caption,
         "text": text,
         "hashtags": hashtags,
         "media_urls": list(card_urls),
         "media_type": media_type if card_urls else "none",
     }
+    if channel:
+        payload["channel"] = {
+            "workspace_id": channel.get("workspace_id"),
+            "name": channel.get("channel_name") or "",
+            "handle": channel.get("channel_handle") or "",
+            "platform": channel.get("platform") or "",
+            "external_id": channel.get("external_id"),
+        }
+    return payload
 
 
 async def publish_via_zapier(settings, *, fmt: str, content: dict[str, Any],
-                             card_urls: list[str], item_id: int) -> dict:
-    """Send one item to the configured Zapier webhook (the user's Zap posts it)."""
-    payload = build_zapier_payload(fmt, content, card_urls, item_id=item_id)
-    return await zapier.publish(settings, payload=payload)
+                             card_urls: list[str], item_id: int,
+                             channel: dict[str, Any] | None = None,
+                             url_override: str | None = None) -> dict:
+    """Send one item to a Zapier webhook (the user's Zap posts it). ``channel``
+    adds the per-channel routing block; ``url_override`` targets that channel's
+    own webhook instead of the global one."""
+    payload = build_zapier_payload(fmt, content, card_urls, item_id=item_id,
+                                   channel=channel)
+    return await zapier.publish(settings, payload=payload,
+                                url_override=url_override)
 
 
 async def publish_item(settings, *, fmt: str, content: dict[str, Any],

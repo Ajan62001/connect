@@ -1961,6 +1961,10 @@ export function getTopics(): Promise<string[]> {
 
 /** How posts are generated (global default, overridable per workspace). */
 export type CardTemplate = "classic" | "bold" | "minimal";
+/** How a fetched photo sits on a card: 'poster' (default) = full-bleed photo
+ * + bold bottom accent caption (viral news-page look); 'fitted' = whole image
+ * on the solid theme colour; 'cover' = legacy full-bleed scrimmed crop. */
+export type PhotoStyle = "poster" | "fitted" | "cover";
 export type HeadlineSize = "s" | "m" | "l";
 export type HeadlineAlign = "left" | "center";
 
@@ -1975,6 +1979,7 @@ export interface PostSettings {
   card_muted: string;
   card_accent: string;
   card_template: CardTemplate;
+  card_photo_style: PhotoStyle;
   headline_size: HeadlineSize;
   headline_align: HeadlineAlign;
   sign_off: string;
@@ -3023,6 +3028,18 @@ export const CAPTION_STYLES: { value: CaptionStyle; label: string }[] = [
   { value: "boxed", label: "Boxed / TikTok" },
 ];
 
+/** Scene media treatment for reels (mirrors backend reel_visual_style):
+ * 'fitted' keeps the whole photo/clip on a solid theme-colour canvas (never
+ * side-cropped); 'poster' is the viral news-page look (full-bleed media, bold
+ * bottom accent caption); 'cover' is the legacy full-bleed crop under a
+ * scrim. */
+export type VisualStyle = "fitted" | "poster" | "cover";
+export const VISUAL_STYLES: { value: VisualStyle; label: string }[] = [
+  { value: "fitted", label: "Fitted (solid background)" },
+  { value: "poster", label: "Poster (bottom caption)" },
+  { value: "cover", label: "Full-bleed (cropped)" },
+];
+
 /** Generation + render controls for a campaign (mirrors backend ContentOptions).
  * Also reused for reel re-render. */
 export interface ContentOptions {
@@ -3040,14 +3057,197 @@ export interface ContentOptions {
   music_volume?: number | null;
   presenter?: boolean;
   caption_style?: CaptionStyle | null;
+  visual_style?: VisualStyle | null;
   video?: boolean | null;
+  character_id?: number | null;
+  script_type?: string | null;
 }
 
 /** @deprecated alias kept for older imports — use ContentOptions. */
 export type ReelOptions = ContentOptions;
 
 export function getVoices(): Promise<VoiceOption[]> {
-  return request<VoiceOption[]>("/api/content/voices");
+  return request<VoiceOption[]>("/api/voices");
+}
+
+/** Audition a voice — returns an object URL for the synthesized clip (caller
+ * must URL.revokeObjectURL when done). */
+export async function auditionVoice(body: { voice_id: string; text?: string }): Promise<string> {
+  const res = await fetch("/api/voices/audition", jsonInit("POST", body));
+  if (!res.ok) await raise(res);
+  return URL.createObjectURL(await res.blob());
+}
+
+/** A voicebox voice profile (the 'vb:' voices). */
+export interface VoiceboxProfile {
+  id: string;
+  name: string;
+  language?: string | null;
+  description?: string | null;
+  preset_voice_id?: string | null;
+  default_engine?: string | null;
+}
+
+/** A voicebox PRESET (a Kokoro catalog voice, addable as a profile). */
+export interface VoiceboxPreset {
+  voice_id: string;
+  name?: string | null;
+  gender?: string | null;
+  language?: string | null;
+}
+
+export function getVoiceboxProfiles(): Promise<VoiceboxProfile[]> {
+  return request<VoiceboxProfile[]>("/api/voices/profiles");
+}
+
+export async function getVoiceboxCatalog(engine = "kokoro"): Promise<VoiceboxPreset[]> {
+  const data = await request<{ voices?: VoiceboxPreset[] }>(`/api/voices/presets/${engine}`);
+  return data.voices ?? [];
+}
+
+export function addVoiceboxProfile(body: Record<string, unknown>): Promise<VoiceboxProfile> {
+  return request<VoiceboxProfile>("/api/voices/profiles", jsonInit("POST", body));
+}
+
+export function deleteVoiceboxProfile(id: string): Promise<void> {
+  return request<void>(`/api/voices/profiles/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+// --- characters (the shared persona roster) ---------------------------------
+
+export interface Character {
+  id: number;
+  name: string;
+  description: string;
+  speaking_style: string;
+  sample_line: string;
+  voice_id: string | null;
+  heygen_avatar_id: string | null;
+  catchphrases: string[];
+  sign_off: string;
+  avatar_sha: string | null;
+  owner_id: number | null;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface CharacterInput {
+  name: string;
+  description?: string;
+  speaking_style?: string;
+  sample_line?: string;
+  voice_id?: string | null;
+  heygen_avatar_id?: string | null;
+  catchphrases?: string[];
+  sign_off?: string;
+  avatar_sha?: string | null;
+}
+
+export function listCharacters(): Promise<Character[]> {
+  return request<Character[]>("/api/characters");
+}
+
+export function createCharacter(body: CharacterInput): Promise<Character> {
+  return request<Character>("/api/characters", jsonInit("POST", body));
+}
+
+export function updateCharacter(id: number, body: Partial<CharacterInput>): Promise<Character> {
+  return request<Character>(`/api/characters/${id}`, jsonInit("PATCH", body));
+}
+
+export function deleteCharacter(id: number): Promise<void> {
+  return request<void>(`/api/characters/${id}`, { method: "DELETE" });
+}
+
+// --- script-type presets -----------------------------------------------------
+
+export interface ScriptPreset {
+  id: string; // builtin slug or 'custom:<n>'
+  name: string;
+  guidance: string;
+  formats: string[];
+  scene_count: number | null;
+  caption_style: string | null;
+  visual_style: string | null;
+  builtin: boolean;
+}
+
+export interface ScriptPresetInput {
+  name: string;
+  guidance?: string;
+  formats?: string[];
+  scene_count?: number | null;
+  caption_style?: string | null;
+  visual_style?: string | null;
+}
+
+export function listScriptPresets(): Promise<ScriptPreset[]> {
+  return request<ScriptPreset[]>("/api/script-presets");
+}
+
+export function createScriptPreset(body: ScriptPresetInput): Promise<ScriptPreset> {
+  return request<ScriptPreset>("/api/script-presets", jsonInit("POST", body));
+}
+
+export function updateScriptPreset(id: string, body: Partial<ScriptPresetInput>): Promise<ScriptPreset> {
+  return request<ScriptPreset>(`/api/script-presets/${encodeURIComponent(id)}`, jsonInit("PATCH", body));
+}
+
+export function deleteScriptPreset(id: string): Promise<void> {
+  return request<void>(`/api/script-presets/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+// --- workspace channel + global channel settings ----------------------------
+
+export type ChannelPlatform = "youtube" | "instagram" | "x" | "linkedin" | "other";
+
+export interface WorkspaceChannel {
+  workspace_id: number;
+  platform: ChannelPlatform;
+  channel_name: string;
+  channel_handle: string;
+  external_id: string | null;
+  zapier_webhook_url: string | null;
+  webhook_set: boolean;
+  default_voice_id: string | null;
+  default_character_id: number | null;
+  default_script_type: string | null;
+  has_credentials: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface WorkspaceChannelUpdate {
+  platform?: ChannelPlatform;
+  channel_name?: string;
+  channel_handle?: string;
+  external_id?: string | null;
+  zapier_webhook_url?: string | null;
+  default_voice_id?: string | null;
+  default_character_id?: number | null;
+  default_script_type?: string | null;
+}
+
+export function getWorkspaceChannel(id: number): Promise<WorkspaceChannel> {
+  return request<WorkspaceChannel>(`/api/workspaces/${id}/channel`);
+}
+
+export function updateWorkspaceChannel(id: number, body: WorkspaceChannelUpdate): Promise<WorkspaceChannel> {
+  return request<WorkspaceChannel>(`/api/workspaces/${id}/channel`, jsonInit("PUT", body));
+}
+
+export interface ChannelSettings {
+  default_voice_id: string | null;
+  default_character_id: number | null;
+  default_script_type: string | null;
+}
+
+export function getChannelSettings(): Promise<ChannelSettings> {
+  return request<ChannelSettings>("/api/social/channel-settings");
+}
+
+export function updateChannelSettings(body: Partial<ChannelSettings>): Promise<ChannelSettings> {
+  return request<ChannelSettings>("/api/social/channel-settings", jsonInit("PUT", body));
 }
 
 /** Optional reel features configured on the server (e.g. the HeyGen presenter). */
@@ -3070,4 +3270,57 @@ export function rerenderContent(
     `/api/content/${id}/rerender`,
     jsonInit("POST", { content: body.content ?? null, options: body.options ?? {} }),
   );
+}
+
+// --- the reel factory --------------------------------------------------------
+
+export interface FactoryRunRequest {
+  count?: number;
+  window_hours?: number;
+  options?: ContentOptions;
+  workspace_id?: number;
+}
+
+/** One commissioned subject inside a factory run. */
+export interface FactoryAssignment {
+  subject: string;
+  kind: string; // thread | event | topic
+  heat: number;
+  angle?: string;
+  reason?: string;
+}
+
+export interface FactoryCampaignRef {
+  campaign_id: number;
+  job_id: number;
+  subject: string;
+}
+
+/** A past/running factory run: the job row + what its events reported. */
+export interface FactoryRun {
+  job_id: number;
+  status: string; // queued | running | done | failed | cancelled
+  created_at: string;
+  finished_at: string | null;
+  error: string | null;
+  result: string | null;
+  candidates: number;
+  assignments: FactoryAssignment[];
+  campaigns: FactoryCampaignRef[];
+}
+
+/** Start a factory run: scout the feed's hottest subjects and commission one
+ * reel-led campaign per pick. */
+export function startFactoryRun(body: FactoryRunRequest = {}): Promise<JobAccepted> {
+  return request<JobAccepted>("/api/factory/reels", jsonInit("POST", body));
+}
+
+export function listFactoryRuns(): Promise<{ items: FactoryRun[] }> {
+  return request<{ items: FactoryRun[] }>("/api/factory/runs");
+}
+
+/** Ask the worker to stop a queued/running factory run. Campaigns it already
+ * commissioned keep generating — cancel those individually. */
+export function cancelFactoryRun(jobId: number): Promise<JobAccepted> {
+  return request<JobAccepted>(`/api/factory/runs/${jobId}/cancel`, jsonInit("POST", {}));
 }

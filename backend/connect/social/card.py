@@ -11,6 +11,7 @@ hard-fails on a font-less box.
 from __future__ import annotations
 
 import io
+import re
 from pathlib import Path
 from typing import Sequence
 
@@ -36,6 +37,19 @@ _REG = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+)
+# the 'poster' caption wants a soft rounded display face (the viral news-page
+# look). Prefer rounded families when installed, then the friendliest faces
+# commonly present, then the _BOLD stack — rendering never hard-fails.
+_POSTER_BOLD = (
+    "/usr/share/fonts/truetype/quicksand/Quicksand-Bold.ttf",
+    "/usr/share/fonts/truetype/baloo2/Baloo2-Bold.ttf",
+    "/usr/share/fonts/truetype/nunito/Nunito-Bold.ttf",
+    "/usr/share/fonts/truetype/comfortaa/Comfortaa-Bold.ttf",
+    "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+    "/usr/share/fonts/truetype/lato/Lato-Bold.ttf",
+    "/usr/share/fonts/truetype/open-sans/OpenSans-Bold.ttf",
+    *_BOLD,
 )
 
 
@@ -94,6 +108,12 @@ class _Theme:
         self.head_px = _HEAD_PX.get(s.headline_size, _HEAD_PX["m"])
         self.align = s.headline_align
         self.sign_off = (s.sign_off or "via connect")[:60]
+        # 'poster': full-bleed photo + bottom-centred accent caption (viral
+        # news-page look, the default); 'fitted': the whole photo contained on
+        # the solid theme colour; 'cover': legacy full-bleed scrimmed crop
+        # (getattr: duck-typed settings in older callers/tests may predate
+        # the field)
+        self.photo_style = getattr(s, "card_photo_style", "poster") or "poster"
 
 
 def _draw_block(draw, lines: list[str], font, fill, *, y: int, line_h: int,
@@ -110,16 +130,18 @@ def _draw_block(draw, lines: list[str], font, fill, *, y: int, line_h: int,
 
 
 def _paste_logo(img, logo: bytes | None, *, canvas_w: int = SIZE,
-                margin: int = MARGIN) -> None:
+                margin: int = MARGIN, left: bool = False) -> None:
     # canvas_w/margin default to the square card; the vertical reel renderer
     # passes its own (1080-wide, larger margin) so the logo lands top-right.
+    # ``left`` pins it top-left instead (the poster style's corner).
     if not logo:
         return
     try:
         from PIL import Image
         lg = Image.open(io.BytesIO(logo)).convert("RGBA")
         lg.thumbnail((280, 72))
-        img.paste(lg, (canvas_w - margin - lg.width, margin - 8), lg)
+        x = margin if left else canvas_w - margin - lg.width
+        img.paste(lg, (x, margin - 8), lg)
     except Exception:  # noqa: BLE001 — a bad logo never breaks the card
         pass
 
@@ -151,6 +173,33 @@ def _new(bg):
 
 _WHITE = (248, 250, 252)
 _SOFT = (226, 232, 240)
+
+
+def _open_photo(photo: bytes | None):
+    """Decode photo bytes to a PIL RGB image, or None when unusable."""
+    if not photo:
+        return None
+    try:
+        from PIL import Image
+        return Image.open(io.BytesIO(photo)).convert("RGB")
+    except Exception:  # noqa: BLE001 — a bad photo never breaks the card
+        return None
+
+
+def _fit_into(img, canvas, *, box: tuple[int, int, int, int],
+              top_align: bool = False) -> tuple[int, int]:
+    """Contain the WHOLE ``img`` inside ``box`` on ``canvas`` (never crops).
+    Returns (top, bottom) of the pasted image. ``top_align`` pins it to the
+    box top (so content can follow below) instead of centring."""
+    from PIL import Image
+    x0, y0, x1, y1 = box
+    bw, bh = x1 - x0, y1 - y0
+    scale = min(bw / img.width, bh / img.height)
+    img = img.resize((max(1, int(img.width * scale)),
+                      max(1, int(img.height * scale))), Image.LANCZOS)
+    y = y0 if top_align else y0 + (bh - img.height) // 2
+    canvas.paste(img, (x0 + (bw - img.width) // 2, y))
+    return y, y + img.height
 
 
 def _photo_bg(photo: bytes | None, *, scrim: bool = True):
@@ -197,6 +246,79 @@ def _shadow_block(draw, lines: list[str], font, fill, *, y: int, line_h: int,
     return y
 
 
+# strip emoji/pictographs the bundled fonts render as tofu boxes (poster
+# headlines from viral copy often carry them) while keeping currency, dashes
+# and quotes.
+_EMOJI = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF"
+    "\U00002B00-\U00002BFF\U0000FE00-\U0000FE0F\U00002300-\U000023FF"
+    "\U0000200D]+")
+
+
+def _poster_bg(photo: bytes | None):
+    """Cover-crop ``photo`` full-bleed under the POSTER scrim: a whisper of
+    overall dim plus a strong bottom gradient the caption sits in. None when
+    the bytes aren't a usable image (callers fall back to a solid template)."""
+    img = _open_photo(photo)
+    if img is None:
+        return None
+    from PIL import Image, ImageOps
+    img = ImageOps.fit(img, (SIZE, SIZE), method=Image.LANCZOS)
+    col = []
+    for yy in range(SIZE):
+        ty = yy / SIZE
+        a = 0.14
+        if ty > 0.50:
+            a += 0.68 * (ty - 0.50) / 0.50
+        col.append(int(min(0.80, a) * 255))
+    alpha = Image.new("L", (1, SIZE))
+    alpha.putdata(col)
+    alpha = alpha.resize((SIZE, SIZE))
+    black = Image.new("RGB", (SIZE, SIZE), (8, 9, 14))
+    return Image.composite(black, img, alpha)
+
+
+def _poster_caption(draw, text: str, t: _Theme, *, bottom: int,
+                    source_label: str = "") -> None:
+    """The poster block: a bold, centred, accent-colour caption whose LAST
+    line ends at ``bottom``, shrunk to fit at most 4 lines, with an optional
+    small source credit underneath."""
+    text = _EMOJI.sub("", text or "").strip()
+    if not text:
+        return
+    inner = SIZE - 2 * MARGIN
+    for px in (72, 64, 56, 48):
+        font = _font(_POSTER_BOLD, px)
+        lines = _wrap(draw, text, font, inner)
+        if len(lines) <= 4:
+            break
+    lines = lines[:4]
+    line_h = int(px * 1.24)
+    label = (source_label or "").strip()
+    credit_h = 42 if label else 0
+    y = bottom - credit_h - len(lines) * line_h
+    y = _shadow_block(draw, lines, font, t.accent, y=y, line_h=line_h,
+                      align="center")
+    if label:
+        f = _font(_REG, 26)
+        x = (SIZE - draw.textlength(label, font=f)) / 2
+        draw.text((x + 2, y + 10 + 2), label, font=f, fill=(10, 12, 16))
+        draw.text((x, y + 10), label, font=f, fill=(203, 213, 225))
+
+
+def _render_photo_poster(content, t: _Theme, logo, img):
+    """The viral news-page look: full-bleed photo under a bottom gradient, a
+    bold centred accent-colour caption pinned to the bottom, small logo
+    top-left, a tiny source credit. No key points — the headline carries
+    the card."""
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(img)
+    _paste_logo(img, logo, left=True)
+    _poster_caption(draw, content.headline, t, bottom=SIZE - 84,
+                    source_label=content.source_label)
+    return img
+
+
 def _render_photo(content, t: _Theme, logo, img):
     """The classic layout over a scrimmed photo — white shadowed text reads
     on any image; the accent bar and logo keep the brand."""
@@ -218,6 +340,39 @@ def _render_photo(content, t: _Theme, logo, img):
              y=y, align=t.align, dotted=True)
     draw.text((MARGIN, SIZE - MARGIN + 6), t.sign_off, font=_font(_REG, 28),
               fill=_SOFT)
+    return img
+
+
+def _render_photo_fitted(content, t: _Theme, logo, photo):
+    """The fitted photo card: source chip + headline on the solid theme
+    colour, then the WHOLE photo contained below (never side-cropped), and
+    key points under it when the photo leaves room."""
+    img, draw = _new(t.bg)
+    draw.rectangle([0, 0, SIZE, 14], fill=t.accent)
+    _paste_logo(img, logo)
+    inner = SIZE - 2 * MARGIN
+    y = MARGIN + 12
+    label = (content.source_label or "connect").strip().upper()[:48]
+    y = _draw_block(draw, [label], _font(_BOLD, 30), t.accent, y=y, line_h=66,
+                    align=t.align)
+    head_font = _font(_BOLD, t.head_px)
+    head_lines = _wrap(draw, content.headline.strip(), head_font, inner)[:4]
+    y = _draw_block(draw, head_lines, head_font, t.text, y=y,
+                    line_h=int(t.head_px * 1.22), align=t.align)
+
+    # the media box: everything between the headline and the footer
+    box = (MARGIN, y + 36, SIZE - MARGIN, SIZE - MARGIN - 24)
+    if box[3] - box[1] >= 160:
+        # top-align when there's clearly room left for key points below
+        room = (box[3] - box[1]) - photo.height * min(
+            (box[2] - box[0]) / photo.width, (box[3] - box[1]) / photo.height)
+        _, photo_bottom = _fit_into(photo, img, box=box,
+                                    top_align=room >= 170)
+        if box[3] - photo_bottom >= 170:
+            _bullets(draw, content.key_points[:2], _font(_REG, 36), t.muted,
+                     t.accent, y=photo_bottom + 30, align=t.align, dotted=True)
+    draw.text((MARGIN, SIZE - MARGIN + 6), t.sign_off, font=_font(_REG, 28),
+              fill=t.muted)
     return img
 
 
@@ -306,12 +461,25 @@ def render_card(content: SocialPost, *, settings: PostSettings,
     """Render the post onto a branded square card per the effective
     PostSettings; returns JPEG bytes ready for download or the Graph API.
     ``photo`` (optional raw image bytes, fetched by the caller) becomes a
-    scrimmed full-bleed background with white shadowed text."""
+    full-bleed background with a bottom-centred accent caption
+    (card_photo_style='poster', default), is contained whole on the solid
+    theme colour ('fitted'), or becomes a scrimmed full-bleed background with
+    white shadowed text ('cover')."""
     t = _Theme(settings)
-    bg = _photo_bg(photo)
-    if bg is not None:
-        img = _render_photo(content, t, logo, bg)
+    img = None
+    if t.photo_style == "poster":
+        bg = _poster_bg(photo)
+        if bg is not None:
+            img = _render_photo_poster(content, t, logo, bg)
+    elif t.photo_style == "fitted":
+        opened = _open_photo(photo)
+        if opened is not None:
+            img = _render_photo_fitted(content, t, logo, opened)
     else:
+        bg = _photo_bg(photo)
+        if bg is not None:
+            img = _render_photo(content, t, logo, bg)
+    if img is None:
         render = _TEMPLATES.get(settings.card_template, _render_classic)
         img = render(content, t, logo)
     buf = io.BytesIO()

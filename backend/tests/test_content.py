@@ -23,6 +23,7 @@ from connect.content.schema import (
     ThreadContent,
 )
 from connect.analysis.entailment import EntailmentJudgment
+from connect.content.edit import ReelCritique
 from connect.content.plan import EditorialPlan, FormatPick
 from connect.content.service import ContentService
 from connect.domain.models import SocialPost
@@ -52,6 +53,11 @@ def _content_provider(cite: str = "E1") -> MockProvider:
         # the S2 editorial gate may entailment-check numeric sentences; default
         # to 'entailed' so generation tests aren't gated on figure coverage.
         EntailmentJudgment: lambda _u: EntailmentJudgment(label="entailed"),
+        # the reel script editor critiques every ig_reel draft; default to a
+        # clean 'ship' so single-shot generation tests stay single-shot.
+        ReelCritique: lambda _u: ReelCritique(
+            hook=5, pacing=5, visuals=5, clarity=5, retention=5,
+            verdict="ship", notes=[]),
         SocialPost: lambda _u: SocialPost(
             headline=f"RBI holds repo {m}",
             caption=f"The RBI held the repo rate {m}. Source: RBI.",
@@ -284,6 +290,57 @@ async def test_campaign_generates_reel(client, db, monkeypatch):
     assert vid.content[4:8] == b"ftyp"          # a real MP4
 
 
+async def test_campaign_uses_workspace_channel_persona(client, db, monkeypatch):
+    """A campaign bound to a workspace channel (channel_workspace_id) writes the
+    reel IN CHARACTER: the resolved persona + the workspace's tone reach the
+    generation prompt, and the citation system prompt is untouched. The
+    settings-ignored bug (get_global instead of effective) is fixed."""
+    import connect.content.reel as reel_mod
+    monkeypatch.setattr(reel_mod, "_DEFAULT_PROFILE", reel_mod.TEST_PROFILE)
+
+    captured: dict = {}
+    prov = _content_provider()
+    base_reel = prov.respond_by_schema[ReelContent]
+
+    def _reel(user_text):
+        captured["reel_prompt"] = user_text
+        captured["reel_system"] = None   # filled below via calls inspection
+        return base_reel(user_text)
+    prov.respond_by_schema[ReelContent] = _reel
+    _set_content_llm(client, prov)
+
+    # a workspace with a bound character + a distinctive brand override in its
+    # post_settings (which reaches the prompt only via effective(), the fix)
+    ws = client.post("/api/workspaces", json={"name": "Channel WS"}).json()
+    client.patch(f"/api/workspaces/{ws['id']}",
+                 json={"post_settings": {"brand_handle": "@bantuowl"}})
+    ch = client.post("/api/characters", json={
+        "name": "Bantu the Owl", "description": "a wise nocturnal explainer",
+        "speaking_style": "hoots between sentences", "voice_id": "vb:omega",
+        "sign_off": "Hoot hoot."}).json()
+    client.put(f"/api/workspaces/{ws['id']}/channel",
+               json={"default_character_id": ch["id"]})
+
+    inv_id = await _seed_investigation_with_finding(db)
+    r = client.post("/api/campaigns", json={
+        "investigation_id": inv_id, "formats": ["ig_reel"],
+        "channel_workspace_id": ws["id"]})
+    assert r.status_code == 202, r.text
+    assert (await _wait_for_job(db, r.json()["job_id"]))["status"] == "done"
+
+    prompt = captured["reel_prompt"]
+    assert "Bantu the Owl" in prompt              # persona reached the prompt
+    assert "hoots between sentences" in prompt
+    # the workspace's post_settings brand reached the prompt — proof the
+    # pipeline now uses effective(workspace), not the global-only settings
+    assert "@bantuowl" in prompt
+    # the persona is framing-only: the citation discipline is restated
+    assert "[[E#]]" in prompt
+    # the reel still renders and grounds normally
+    detail = client.get(f"/api/campaigns/{r.json()['campaign_id']}").json()
+    assert detail["items"][0]["grounding"]["cited_count"] == 1
+
+
 async def test_campaign_generates_meme(client, db, monkeypatch):
     """meme runs the full pipeline: grounded MemeContent -> stock photo
     (monkeypatched — no network) -> impact-caption JPEG in card_shas ->
@@ -367,6 +424,233 @@ def test_render_card_and_carousel_photo_background():
     assert len(photod) == len(plain) == 3
     assert photod[0] != plain[0]                # cover got the photo
     assert photod[2] == plain[2]                # un-photoed slide unchanged
+
+
+def test_fitted_photo_keeps_whole_image():
+    """The default 'fitted' style contains the WHOLE photo on the solid theme
+    colour (both side edges visible — nothing side-cropped), on cards and on
+    reel scene backgrounds; 'cover' still crops full-bleed."""
+    import io
+    from PIL import Image
+    from connect.content.reel import _fit_box, _scene_bg
+    from connect.social.card import _Theme, render_card
+    from connect.domain.models import PostSettings
+
+    # a wide photo with a unique red border so its true edges are detectable
+    edge = (250, 40, 30)
+    src = Image.new("RGB", (1600, 900), (40, 90, 140))
+    for xy in ([0, 0, 1599, 12], [0, 887, 1599, 899],
+               [0, 0, 12, 899], [1587, 0, 1599, 899]):
+        src.paste(edge, xy)
+    buf = io.BytesIO()
+    src.save(buf, format="PNG")
+    photo = buf.getvalue()
+
+    s = PostSettings().model_copy(update={"card_photo_style": "fitted"})
+    t = _Theme(s)
+
+    bg = _scene_bg(photo, t, (1080, 1920), style="fitted")
+    assert bg.getpixel((2, 2)) == t.bg            # solid colour, not photo
+    assert bg.getpixel((1077, 1917)) == t.bg
+    x0, y0, x1, y1 = _fit_box((1080, 1920))
+    mid = (y0 + y1) // 2
+    def reddish(p):
+        return p[0] > 180 and p[1] < 110 and p[2] < 110
+    assert reddish(bg.getpixel((x0 + 3, mid)))    # LEFT photo edge on frame
+    assert reddish(bg.getpixel((x1 - 4, mid)))    # RIGHT photo edge on frame
+
+    covered = _scene_bg(photo, t, (1080, 1920), style="cover")
+    left, right = covered.getpixel((2, 960)), covered.getpixel((1077, 960))
+    assert not (reddish(left) and reddish(right))  # cover crops the sides
+
+    # Ken-Burns safety: zoompan magnifies about the FRAME centre, so a scene
+    # with max zoom 1.14 (the hook) must pre-shrink the media enough that the
+    # magnified media still stays inside the design box — never under the
+    # logo band above it, never into the text panel below it.
+    from PIL import ImageChops
+    zoomed = _scene_bg(photo, t, (1080, 1920), style="fitted", zoom=1.14)
+    bbox = ImageChops.difference(
+        zoomed, Image.new("RGB", zoomed.size, t.bg)).getbbox()
+    assert bbox is not None
+    for p, c, lo, hi in ((bbox[0], 540, x0, x1), (bbox[2], 540, x0, x1),
+                         (bbox[1], 960, y0, y1), (bbox[3], 960, y0, y1)):
+        assert lo - 2 <= c + (p - c) * 1.14 <= hi + 2   # at full magnification
+
+    post = SocialPost(headline="Inflation eases", caption="c",
+                      key_points=["Food prices fell"],
+                      source_label="Source: RBI")
+    fitted = render_card(post, settings=s, photo=photo)
+    cover = render_card(post, settings=s.model_copy(
+        update={"card_photo_style": "cover"}), photo=photo)
+    junk = render_card(post, settings=s, photo=b"not an image")
+    for jpeg in (fitted, cover, junk):
+        assert jpeg[:3] == b"\xff\xd8\xff"
+    assert fitted != cover
+    card = Image.open(io.BytesIO(fitted)).convert("RGB")
+    reds = [p for p in card.getdata() if reddish(p)]
+    assert reds                                    # the photo edge survived
+
+
+def test_poster_card_is_default_and_captioned():
+    """'poster' (the default) renders the photo full-bleed with the headline
+    in the accent colour pinned to the bottom; junk photo bytes fall back to
+    the solid template; the other styles still render distinct cards."""
+    import io
+    from PIL import Image
+    from connect.social.card import render_card
+    from connect.domain.models import PostSettings
+
+    s = PostSettings()
+    assert s.card_photo_style == "poster"
+
+    src = Image.new("RGB", (1600, 900), (40, 90, 140))
+    buf = io.BytesIO()
+    src.save(buf, format="JPEG")
+    photo = buf.getvalue()
+
+    post = SocialPost(
+        headline="Portugal knocks out Croatia after the most dramatic 2nd half",
+        caption="c", key_points=["Late winner in extra time"],
+        source_label="Source: FIFA")
+    poster = render_card(post, settings=s, photo=photo)
+    fitted = render_card(post, settings=s.model_copy(
+        update={"card_photo_style": "fitted"}), photo=photo)
+    junk = render_card(post, settings=s, photo=b"junk")
+    for jpeg in (poster, fitted, junk):
+        assert jpeg[:3] == b"\xff\xd8\xff"
+    assert poster != fitted
+
+    # the headline renders in the accent colour in the bottom half
+    img = Image.open(io.BytesIO(poster)).convert("RGB")
+    from connect.social.card import _Theme
+    ar, ag, ab = _Theme(s).accent
+    hits = sum(
+        1 for yy in range(540, 1080, 6) for xx in range(0, 1080, 6)
+        if (lambda p: abs(p[0] - ar) < 40 and abs(p[1] - ag) < 40
+            and abs(p[2] - ab) < 40)(img.getpixel((xx, yy))))
+    assert hits > 20
+
+
+def test_fitted_video_segment_pads_solid():
+    """The fitted ffmpeg path scales the clip INTO the media box and pads the
+    rest with the theme colour (validates the pad expression end-to-end)."""
+    import io
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    from PIL import Image
+    from connect.content.reel import (ReelProfile, _fit_box,
+                                      _render_video_segment)
+    from connect.social.card import _Theme
+    from connect.domain.models import PostSettings
+
+    prof = ReelProfile(size=(270, 480), fps=12, preset="ultrafast", crf=30)
+    t = _Theme(PostSettings())
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        src = work / "src.png"
+        Image.new("RGB", (320, 180), (250, 40, 30)).save(src)
+        clip = work / "clip.mp4"
+        subprocess.run(["ffmpeg", "-y", "-loop", "1", "-i", str(src),
+                        "-t", "1", "-r", "12", "-pix_fmt", "yuv420p",
+                        str(clip)], check=True, capture_output=True)
+        overlay = work / "ov.png"
+        Image.new("RGBA", prof.size, (0, 0, 0, 0)).save(overlay)
+        seg = work / "seg.mp4"
+        _render_video_segment("ffmpeg", clip, overlay, 1.0, prof, seg,
+                              style="fitted", bg_rgb=t.bg)
+        frame = work / "frame.png"
+        subprocess.run(["ffmpeg", "-y", "-i", str(seg), "-vframes", "1",
+                        str(frame)], check=True, capture_output=True)
+        img = Image.open(frame).convert("RGB")
+        corner = img.getpixel((2, 2))
+        assert all(abs(a - b) < 24 for a, b in zip(corner, t.bg))  # solid pad
+        x0, y0, x1, y1 = _fit_box(prof.size)
+        centre = img.getpixel(((x0 + x1) // 2, (y0 + y1) // 2))
+        assert centre[0] > 180 and centre[1] < 110                # clip visible
+
+
+def test_poster_reel_karaoke_matches_brand():
+    """In the poster visual style (the reel default) the burned karaoke
+    captions restyle to match the poster cards: accent colour, rounded font,
+    sentence case, pinned low — instead of white uppercase mid-frame."""
+    from connect.content.reel import _build_ass, _visual_style
+    from connect.social.card import _Theme
+    from connect.domain.models import PostSettings
+
+    assert _visual_style(None) == "poster"        # the server default
+    t = _Theme(PostSettings())
+    scenes = [{"kind": "scene"}]
+    words = [[("Ronaldo", 0.0, 0.4), ("scores", 0.4, 0.8)]]
+
+    poster = _build_ass(scenes, [1.0], words, (1080, 1920), t=t,
+                        visual_style="poster")
+    r, g, b = t.accent
+    assert f"&H00{b:02X}{g:02X}{r:02X}" in poster  # accent (ASS is BGR)
+    assert "Ubuntu" in poster
+    assert "Ronaldo scores" in poster              # sentence case kept
+
+    plain = _build_ass(scenes, [1.0], words, (1080, 1920), t=t,
+                       visual_style="cover")
+    assert "&H00FFFFFF" in plain
+    assert "RONALDO SCORES" in plain
+
+
+def test_voicebox_engine_switchable():
+    """voicebox slots in as a switchable TTS engine: 'auto' prefers ElevenLabs
+    then voicebox then Piper; picking a 'vb:' voice from the studio switches
+    that render's engine + profile; voicebox profiles join the voice list."""
+    from types import SimpleNamespace
+    from connect.content.service import ContentService
+    from connect.social import tts
+
+    # engine resolution order
+    def s(**kw):
+        base = {"reel_tts_engine": "auto", "elevenlabs_api_key": None,
+                "voicebox_url": None, "piper_voice_dir": None}
+        return SimpleNamespace(**{**base, **kw})
+    assert tts._resolve_engine(s(voicebox_url="http://x")) == "voicebox"
+    assert tts._resolve_engine(
+        s(elevenlabs_api_key="k", voicebox_url="http://x")) == "elevenlabs"
+    assert tts._resolve_engine(s()) == "none"
+    assert tts._resolve_engine(
+        s(reel_tts_engine="voicebox")) == "voicebox"   # explicit switch
+
+    # a 'vb:' voice pick maps to the voicebox engine + profile
+    from connect.content.schema import ContentOptions
+    from connect.orchestration.config import Settings
+    svc = SimpleNamespace(settings=Settings(_env_file=None))
+    eff = ContentService._render_settings(
+        svc, ContentOptions(voice_id="vb:abc-123"))
+    assert eff.reel_tts_engine == "voicebox"
+    assert eff.voicebox_profile_id == "abc-123"
+    eff = ContentService._render_settings(
+        svc, ContentOptions(voice_id="ELVoiceId99"))
+    assert eff.reel_tts_engine == "elevenlabs"
+    assert eff.elevenlabs_voice_id == "ELVoiceId99"
+
+    # voicebox profiles appear in the combined picker list as vb: entries
+    import unittest.mock as mock
+    with mock.patch.object(tts, "voicebox_profiles", return_value=[
+            {"id": "p1", "name": "Omega", "language": "hi",
+             "description": "Kokoro preset voice (Hindi)"}]):
+        voices = tts.list_voices(s(voicebox_url="http://x"))
+    assert voices == [{"id": "vb:p1", "name": "Omega (voicebox)",
+                       "description": "HI · Kokoro preset voice (Hindi)"}]
+
+
+def test_worker_options_tolerate_version_skew():
+    """A job payload written by a different build may carry option keys this
+    build doesn't know (ContentOptions is extra='forbid'); the worker drops
+    them instead of failing the job."""
+    from connect.content.schema import ContentOptions
+    from connect.workers.handlers.content import _options
+
+    opts = _options({"visual_style": "fitted", "music": False,
+                     "from_a_newer_build": 1})
+    assert opts.visual_style == "fitted"
+    assert opts.music is False
+    assert _options(None) == ContentOptions()
 
 
 def test_zapier_payload_for_meme():
@@ -650,9 +934,11 @@ async def test_publish_via_zapier(client, db, monkeypatch):
     assert client.get("/api/content/capabilities").json()["zapier"] is True
 
     captured: dict = {}
+    seen_url: dict = {}
 
-    async def _fake(settings, *, payload):
+    async def _fake(settings, *, payload, url_override=None):
         captured.update(payload)
+        seen_url["url"] = url_override
         return {"media_id": "zap-1", "permalink": None, "via": "zapier"}
 
     monkeypatch.setattr("connect.content.platforms.zapier.publish", _fake)
@@ -662,6 +948,9 @@ async def test_publish_via_zapier(client, db, monkeypatch):
     assert captured["media_type"] == "image"
     assert captured["media_urls"][0].startswith("https://connect")
     assert "#" in captured["caption"]  # hashtags folded into the caption
+    # no channel bound => global webhook, no per-channel override or block
+    assert seen_url["url"] is None
+    assert "channel" not in captured
     item = await item_dao.get(db, item_id, viewer=1)
     assert item.status == "published" and item.publish_ref["via"] == "zapier"
 

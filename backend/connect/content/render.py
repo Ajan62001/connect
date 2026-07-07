@@ -22,9 +22,13 @@ from connect.social.card import (
     _WHITE,
     _Theme,
     _draw_block,
+    _fit_into,
     _font,
+    _open_photo,
     _paste_logo,
     _photo_bg,
+    _poster_bg,
+    _poster_caption,
     _shadow_block,
     _wrap,
 )
@@ -60,6 +64,18 @@ def _to_jpeg(img) -> bytes:
     return buf.getvalue()
 
 
+def _fit_photo_below(img, photo: bytes | None, *, y_top: int) -> None:
+    """Fitted style: contain the WHOLE photo (never cropped) in the space
+    between ``y_top`` and the footer on the solid card. No-op when the bytes
+    are unusable or the leftover space is too thin to be worth it."""
+    im = _open_photo(photo)
+    if im is None:
+        return
+    box = (MARGIN, y_top, SIZE - MARGIN, SIZE - MARGIN - 24)
+    if box[3] - box[1] >= 200:
+        _fit_into(im, img, box=box)
+
+
 def render_carousel(content: CarouselContent, *, settings: PostSettings,
                     logo: bytes | None = None,
                     photos: Sequence[bytes | None] | None = None
@@ -67,9 +83,14 @@ def render_carousel(content: CarouselContent, *, settings: PostSettings,
     """Cover slide (source chip + title) then one card per content slide
     (heading + bullets), all themed by the effective PostSettings. Returns
     JPEG bytes per slide, in order. ``photos`` (cover first, then one per
-    slide; None entries fall back to the themed solid) become scrimmed
-    full-bleed backgrounds."""
+    slide; None entries just leave the themed solid) style per
+    card_photo_style: 'poster' (default) gives the COVER slide the full-bleed
+    photo + bottom accent caption (content slides keep the scrimmed-photo
+    treatment); 'fitted' contains each photo whole on the solid theme colour
+    below the text; 'cover' is the legacy scrimmed full-bleed."""
     t = _Theme(settings)
+    fitted = t.photo_style == "fitted"
+    poster = t.photo_style == "poster"
     total = len(content.slides) + 1
     cards: list[bytes] = []
     inner = SIZE - 2 * MARGIN
@@ -78,24 +99,36 @@ def render_carousel(content: CarouselContent, *, settings: PostSettings,
         return photos[idx] if photos and idx < len(photos) else None
 
     # -- cover ----------------------------------------------------------------
-    img, draw, on_photo = _new_card(t, _photo_at(0))
-    _paste_logo(img, logo)
-    y = MARGIN + 12
-    label = (content.source_label or "connect").strip().upper()[:48]
-    block = _shadow_block if on_photo else _draw_block
-    block(draw, [label], _font(_BOLD, 30), _WHITE if on_photo else t.accent,
-          y=y, line_h=80, align=t.align)
-    y += 80
-    head_font = _font(_BOLD, max(t.head_px, 80))
-    head_lines = _wrap(draw, content.title.strip(), head_font, inner)[:6]
-    block(draw, head_lines, head_font, _WHITE if on_photo else t.text, y=y,
-          line_h=int(max(t.head_px, 80) * 1.22), align=t.align)
-    _footer(draw, t, index=1, total=total, on_photo=on_photo)
+    poster_bg = _poster_bg(_photo_at(0)) if poster else None
+    if poster_bg is not None:
+        from PIL import ImageDraw
+        img, draw = poster_bg, ImageDraw.Draw(poster_bg)
+        _paste_logo(img, logo, left=True)
+        _poster_caption(draw, content.title, t, bottom=SIZE - 110,
+                        source_label=content.source_label)
+        _footer(draw, t, index=1, total=total, on_photo=True)
+    else:
+        img, draw, on_photo = _new_card(t, None if (fitted or poster)
+                                        else _photo_at(0))
+        _paste_logo(img, logo)
+        y = MARGIN + 12
+        label = (content.source_label or "connect").strip().upper()[:48]
+        block = _shadow_block if on_photo else _draw_block
+        block(draw, [label], _font(_BOLD, 30),
+              _WHITE if on_photo else t.accent, y=y, line_h=80, align=t.align)
+        y += 80
+        head_font = _font(_BOLD, max(t.head_px, 80))
+        head_lines = _wrap(draw, content.title.strip(), head_font, inner)[:6]
+        y = block(draw, head_lines, head_font, _WHITE if on_photo else t.text,
+                  y=y, line_h=int(max(t.head_px, 80) * 1.22), align=t.align)
+        if fitted:
+            _fit_photo_below(img, _photo_at(0), y_top=y + 36)
+        _footer(draw, t, index=1, total=total, on_photo=on_photo)
     cards.append(_to_jpeg(img))
 
     # -- content slides -------------------------------------------------------
     for i, slide in enumerate(content.slides, start=2):
-        img, draw, on_photo = _new_card(t, _photo_at(i - 1))
+        img, draw, on_photo = _new_card(t, None if fitted else _photo_at(i - 1))
         block = _shadow_block if on_photo else _draw_block
         y = MARGIN + 12
         head_font = _font(_BOLD, 60)
@@ -118,6 +151,8 @@ def render_carousel(content: CarouselContent, *, settings: PostSettings,
             y += 18
             if y > SIZE - MARGIN - 90:
                 break
+        if fitted:
+            _fit_photo_below(img, _photo_at(i - 1), y_top=y + 24)
         _footer(draw, t, index=i, total=total, on_photo=on_photo)
         cards.append(_to_jpeg(img))
 

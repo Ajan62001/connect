@@ -104,11 +104,13 @@ class Settings(BaseSettings):
             "CONNECT_PIPER_VOICE_DIR", "PIPER_VOICE_DIR"),
     )
     piper_voice: str = "en_US-ryan-high"   # natural, less robotic than -medium
-    # Reel narration engine: 'auto' (ElevenLabs if a key is set, else Piper,
-    # else silent), or force 'elevenlabs' / 'piper' / 'none'.
+    # Reel narration engine: 'auto' (ElevenLabs if a key is set, else voicebox
+    # if a URL is set, else Piper, else silent), or force 'elevenlabs' /
+    # 'voicebox' / 'piper' / 'none'. Failures fall through the same order.
     reel_tts_engine: str = "auto"
     # ElevenLabs cloud TTS (most natural). Optional; ElevenLabs falls back to
-    # Piper then silent. Voice 'George' (warm storyteller) by default.
+    # voicebox then Piper then silent. Voice 'George' (warm storyteller) by
+    # default.
     elevenlabs_api_key: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
@@ -116,6 +118,18 @@ class Settings(BaseSettings):
     )
     elevenlabs_voice_id: str = "JBFqnCBsd6RMkjVDRZzb"
     elevenlabs_model: str = "eleven_multilingual_v2"
+    # voicebox — a LOCAL TTS server (profile-based; Kokoro presets include
+    # Hindi/Indian-accented voices) as a free offline alternative to
+    # ElevenLabs. Point at its API base URL; unset => voicebox unavailable.
+    # Voices appear in the studio's voice picker as 'vb:' entries; picking one
+    # switches that render to the voicebox engine.
+    voicebox_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("VOICEBOX_URL", "CONNECT_VOICEBOX_URL"),
+    )
+    voicebox_profile_id: str | None = None  # default profile (else the first)
+    voicebox_language: str = "en"           # language code sent per generation
+    voicebox_timeout_s: float = 300.0       # per-scene budget (CPU can be slow)
     # Background-music bed for reels: a dir of audio files (CC0/your own). One
     # is mixed (ducked) under the narration. Empty/missing => no music.
     reel_music_dir: Path | None = Field(
@@ -130,6 +144,15 @@ class Settings(BaseSettings):
     # On-screen caption style: 'karaoke' (word-by-word, burned when the TTS gives
     # word timing, else lower-third), 'lower_third', 'centered', or 'boxed'.
     reel_caption_style: str = "karaoke"
+    # How scene media sits in the 9:16 frame: 'poster' (default — matches the
+    # poster cards/carousels) is the viral news-page look: full-bleed scrimmed
+    # media, bold centred accent-colour caption pinned to the bottom, logo
+    # top-left, karaoke captions restyled to match; 'fitted' keeps the whole
+    # photo/clip contained in a media box on the solid theme colour, text on
+    # the solid panel below (nothing is cropped); 'cover' is the legacy
+    # full-bleed treatment (centre-crops the sides, white text over a scrim).
+    # Per-campaign ContentOptions.visual_style overlays this.
+    reel_visual_style: str = "poster"
 
     # HeyGen avatar "presenter" for reels (optional, paid). When configured AND
     # a reel is rendered in presenter mode, a photoreal talking-head clip of the
@@ -161,6 +184,25 @@ class Settings(BaseSettings):
     # over the b-roll), or 'full' (avatar fills the frame). Per-campaign
     # ContentOptions.presenter overlays this at render time.
     reel_presenter: str = "off"
+
+    # The reel FACTORY — autonomous production runs that scout the hottest
+    # subjects from the feed (story threads / event clusters / topic tags,
+    # ranked by multi-outlet corroboration) and commission one reel-led
+    # campaign per pick. Always available on demand (POST /api/factory/reels);
+    # the beat schedules a daily run only when reel_factory_enabled is set.
+    reel_factory_enabled: bool = False
+    reel_factory_count: int = 3            # reels per scheduled run
+    reel_factory_window_hours: int = 24    # how far back the scout looks
+    reel_factory_utc_hour: int = 1         # daily run hour (01 UTC ≈ 06:30 IST)
+    reel_factory_dedup_days: int = 3       # skip subjects covered this recently
+    # The script EDITOR — a bounded critique->revise loop over every generated
+    # reel script (hook strength, pacing, visual variety) before render. Off
+    # switches reels back to single-shot generation.
+    reel_editor_enabled: bool = True
+    # Disk cache for fetched scene assets (photos + b-roll) under
+    # blob_dir/asset_cache: fetch once, reuse across renders/processes/days
+    # (also protects the Pexels quota). Size-capped, oldest pruned; 0 = off.
+    asset_cache_mb: int = 2048
 
     # X (Twitter) + LinkedIn direct publishing for the content pipeline
     # (optional; SCAFFOLDED). Unset => the platform reports "not connected"
@@ -368,7 +410,10 @@ class Settings(BaseSettings):
     # process: restarts reset them, the PG governors remain the hard cost
     # backstop). SSE endpoints are exempt.
     rate_limit_enabled: bool = True
-    rate_limit_read_per_minute: int = 120
+    # the abuse backstop, not a UI throttle — sized so a single studio tab
+    # with several campaigns generating (each card polls its detail) plus
+    # the factory-runs poll stays well under it.
+    rate_limit_read_per_minute: int = 300
     rate_limit_ingest_per_minute: int = 10
     rate_limit_create_per_minute: int = 5
     # sync fast-path: enrich watch-hit / fact-checker docs right after ingest

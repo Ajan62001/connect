@@ -1,12 +1,15 @@
 "use client";
 
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FilmIcon, ImageIcon, Loader2Icon, PlusIcon, Trash2Icon, Wand2Icon } from "lucide-react";
+import { FactoryIcon, FilmIcon, FlameIcon, ImageIcon, Loader2Icon, PlusIcon, Trash2Icon, Wand2Icon } from "lucide-react";
 import { toast } from "sonner";
 
+import { CharacterPicker } from "@/components/characters/CharacterPicker";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { QueryError } from "@/components/shared/QueryError";
+import { VoiceAuditionButton } from "@/components/voice/VoiceAuditionButton";
+import { VoicePicker } from "@/components/voice/VoicePicker";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -16,6 +19,7 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   approveContent,
   cancelCampaign,
+  cancelFactoryRun,
   cardUrl,
   CAPTION_STYLES,
   CONTENT_FORMATS,
@@ -26,21 +30,25 @@ import {
   type ContentOptions,
   type MemeContent,
   type StorySource,
-  type VoiceOption,
+  type VisualStyle,
+  VISUAL_STYLES,
   createCampaign,
   deleteCampaign,
   editContent,
+  type FactoryRun,
   getCampaign,
   getContentTrust,
   getReelCapabilities,
-  getVoices,
   listCampaigns,
+  listFactoryRuns,
   publishContent,
   reelUrl,
   rejectContent,
   rerenderContent,
   scheduleContent,
+  startFactoryRun,
 } from "@/lib/api";
+import { useScriptPresets } from "@/lib/queries";
 import { absoluteTime, relativeTime } from "@/lib/format";
 import { TrustPanel } from "@/components/trust/TrustPanel";
 
@@ -87,10 +95,6 @@ const textToLines = (t: string) =>
     .map((s) => s.trim())
     .filter(Boolean);
 
-function useVoices() {
-  return useQuery({ queryKey: ["voices"], queryFn: getVoices, staleTime: Infinity });
-}
-
 function useReelCapabilities(): { presenter: boolean; video: boolean; zapier: boolean } {
   const { data } = useQuery({
     queryKey: ["reel-capabilities"],
@@ -128,11 +132,19 @@ function VideoToggle({ checked, onChange }: { checked: boolean; onChange: (v: bo
   );
 }
 
-function CaptionStylePicker({ value, onChange }: { value: CaptionStyle; onChange: (v: CaptionStyle) => void }) {
+/** null = "Default": the option is omitted from the request, so a re-render
+ * keeps the campaign's original choice (or the server default) instead of
+ * silently restyling an already-reviewed item. */
+function CaptionStylePicker({ value, onChange }: { value: CaptionStyle | null; onChange: (v: CaptionStyle | null) => void }) {
   return (
     <label className="flex items-center gap-1.5">
       <span className="text-muted-foreground">Captions</span>
-      <select className={selectCls} value={value} onChange={(e) => onChange(e.target.value as CaptionStyle)}>
+      <select
+        className={selectCls}
+        value={value ?? ""}
+        onChange={(e) => onChange((e.target.value || null) as CaptionStyle | null)}
+      >
+        <option value="">Default</option>
         {CAPTION_STYLES.map((c) => (
           <option key={c.value} value={c.value}>
             {c.label}
@@ -143,48 +155,106 @@ function CaptionStylePicker({ value, onChange }: { value: CaptionStyle; onChange
   );
 }
 
-function VoicePicker({ value, onChange }: { value: string | null; onChange: (v: string | null) => void }) {
-  const voices = useVoices();
+/** Scene media treatment: fitted (whole image on the solid theme colour) vs
+ * the legacy full-bleed crop. null = "Default" (keep campaign/server choice). */
+function VisualStylePicker({ value, onChange }: { value: VisualStyle | null; onChange: (v: VisualStyle | null) => void }) {
   return (
-    <select className={selectCls} value={value ?? ""} onChange={(e) => onChange(e.target.value || null)}>
-      <option value="">Default voice</option>
-      {(voices.data ?? []).map((v: VoiceOption) => (
-        <option key={v.id} value={v.id}>
-          {v.name}
-          {v.description ? ` — ${v.description}` : ""}
-        </option>
-      ))}
-    </select>
+    <label className="flex items-center gap-1.5">
+      <span className="text-muted-foreground">Visuals</span>
+      <select
+        className={selectCls}
+        value={value ?? ""}
+        onChange={(e) => onChange((e.target.value || null) as VisualStyle | null)}
+      >
+        <option value="">Default</option>
+        {VISUAL_STYLES.map((c) => (
+          <option key={c.value} value={c.value}>
+            {c.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+/** Script-type select (built-ins + custom presets). null = channel/server default. */
+function ScriptTypeSelect({
+  value,
+  onChange,
+  nullLabel,
+}: {
+  value: string | null;
+  onChange: (v: string | null) => void;
+  nullLabel: string;
+}) {
+  const presets = useScriptPresets();
+  return (
+    <label className="flex items-center gap-1.5">
+      <span className="text-muted-foreground">Script</span>
+      <select className={selectCls} value={value ?? ""} onChange={(e) => onChange(e.target.value || null)}>
+        <option value="">{nullLabel}</option>
+        {(presets.data ?? []).map((p) => (
+          <option key={p.id} value={p.id}>
+            {p.name}
+            {p.builtin ? "" : " (custom)"}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 
 /** Reel render controls shared by the create form and the reel editor. */
 interface ReelControlsState {
   voiceId: string | null;
+  characterId: number | null;
+  scriptType: string | null;
   music: boolean;
-  captionStyle: CaptionStyle;
+  captionStyle: CaptionStyle | null;
+  visualStyle: VisualStyle | null;
   video: boolean;
   presenter: boolean;
 }
 function ReelControls({
   state,
   set,
+  workspaceScoped = false,
   children,
 }: {
   state: ReelControlsState;
   set: (patch: Partial<ReelControlsState>) => void;
+  workspaceScoped?: boolean;
   children?: ReactNode;
 }) {
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
       <label className="flex items-center gap-1.5">
         <span className="text-muted-foreground">Voice</span>
-        <VoicePicker value={state.voiceId} onChange={(v) => set({ voiceId: v })} />
+        <VoicePicker
+          value={state.voiceId}
+          onChange={(v) => set({ voiceId: v })}
+          defaultLabel={workspaceScoped ? "Channel voice" : "Default voice"}
+        />
+        <VoiceAuditionButton voiceId={state.voiceId ?? undefined} />
       </label>
+      <label className="flex items-center gap-1.5">
+        <span className="text-muted-foreground">Character</span>
+        <CharacterPicker
+          value={state.characterId}
+          onChange={(v) => set({ characterId: v })}
+          nullLabel={workspaceScoped ? "Channel default" : "None"}
+        />
+      </label>
+      <ScriptTypeSelect
+        value={state.scriptType}
+        onChange={(v) => set({ scriptType: v })}
+        nullLabel={workspaceScoped ? "Channel default" : "Auto"}
+      />
       <label className="flex items-center gap-1.5">
         <span className="text-muted-foreground">Music</span>
         <Switch checked={state.music} onCheckedChange={(v) => set({ music: v })} />
       </label>
+      <VisualStylePicker value={state.visualStyle} onChange={(v) => set({ visualStyle: v })} />
       <CaptionStylePicker value={state.captionStyle} onChange={(v) => set({ captionStyle: v })} />
       <VideoToggle checked={state.video} onChange={(v) => set({ video: v })} />
       <PresenterToggle checked={state.presenter} onChange={(v) => set({ presenter: v })} />
@@ -194,10 +264,15 @@ function ReelControls({
 }
 const reelOptionsFrom = (s: ReelControlsState): ContentOptions => ({
   music: s.music,
-  caption_style: s.captionStyle,
   video: s.video,
   presenter: s.presenter,
+  // omit unset knobs: the backend then keeps the campaign's stored choice
+  // (re-render) or the server default (create)
+  ...(s.captionStyle ? { caption_style: s.captionStyle } : {}),
+  ...(s.visualStyle ? { visual_style: s.visualStyle } : {}),
   ...(s.voiceId ? { voice_id: s.voiceId } : {}),
+  ...(s.characterId ? { character_id: s.characterId } : {}),
+  ...(s.scriptType ? { script_type: s.scriptType } : {}),
 });
 
 // === create campaign =========================================================
@@ -246,8 +321,11 @@ function CreateCampaign({ workspaceId }: { workspaceId?: number }) {
   const [threadLength, setThreadLength] = useState(5);
   const [reel, setReel] = useState<ReelControlsState>({
     voiceId: null,
+    characterId: null,
+    scriptType: null,
     music: true,
-    captionStyle: "karaoke",
+    captionStyle: null,
+    visualStyle: null,
     video: true,
     presenter: false,
   });
@@ -381,13 +459,213 @@ function CreateCampaign({ workspaceId }: { workspaceId?: number }) {
         ) : null}
       </div>
 
-      {hasReel ? <ReelControls state={reel} set={(p) => setReel((s) => ({ ...s, ...p }))} /> : null}
+      {hasReel ? (
+        <ReelControls
+          state={reel}
+          set={(p) => setReel((s) => ({ ...s, ...p }))}
+          workspaceScoped={workspaceId !== undefined}
+        />
+      ) : null}
 
       <Button disabled={!canSubmit || create.isPending} onClick={() => create.mutate()}>
         {create.isPending ? <Loader2Icon className="animate-spin" data-icon="inline-start" /> : null}
         Generate content
       </Button>
     </div>
+  );
+}
+
+// === reel factory ============================================================
+
+const FACTORY_STATUS_VARIANT: Record<string, "default" | "secondary" | "outline" | "destructive"> = {
+  queued: "outline",
+  running: "secondary",
+  done: "default",
+  failed: "destructive",
+  cancelled: "outline",
+};
+
+/** Run statuses that mean the factory job is still working. */
+const FACTORY_LIVE = new Set(["queued", "running"]);
+const FACTORY_WINDOWS = [6, 12, 24, 48];
+const FACTORY_RUNS_SHOWN = 8;
+
+/** One factory run: when / status / candidate count, then the commissioned
+ * subjects as chips (heat = corroborating tier-1/2 outlets; the picker's
+ * angle + reason live in the tooltip). Once a pick's campaign exists the chip
+ * becomes a button that scrolls to its card in the list below. */
+function FactoryRunRow({ run }: { run: FactoryRun }) {
+  const qc = useQueryClient();
+  const cancel = useMutation({
+    mutationFn: () => cancelFactoryRun(run.job_id),
+    onSuccess: () => {
+      toast.success("Cancelling…");
+      void qc.invalidateQueries({ queryKey: ["factory-runs"] });
+    },
+    onError: (e: Error) => toast.error("Could not cancel", { description: e.message }),
+  });
+  return (
+    <div className="space-y-1.5 rounded-lg border bg-background p-2.5">
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <Badge variant={FACTORY_STATUS_VARIANT[run.status] ?? "outline"}>{run.status}</Badge>
+        <span className="text-muted-foreground">{relativeTime(run.created_at)}</span>
+        <span className="text-muted-foreground">
+          {run.candidates} candidate{run.candidates === 1 ? "" : "s"}
+        </span>
+        {FACTORY_LIVE.has(run.status) ? (
+          <Button
+            size="xs"
+            variant="outline"
+            className="ml-auto"
+            disabled={cancel.isPending}
+            onClick={() => cancel.mutate()}
+          >
+            Cancel
+          </Button>
+        ) : null}
+      </div>
+      {run.assignments.length ? (
+        <div className="flex flex-wrap items-center gap-1.5">
+          {run.assignments.map((a, i) => {
+            const hint = [a.angle, a.reason].filter(Boolean).join(" — ");
+            const campaign = run.campaigns.find((c) => c.subject === a.subject);
+            return campaign ? (
+              <Button
+                key={i}
+                size="xs"
+                variant="outline"
+                title={hint ? `${hint}\n\nJump to the campaign below` : "Jump to the campaign below"}
+                onClick={() => {
+                  const el = document.getElementById(`campaign-${campaign.campaign_id}`);
+                  if (el) {
+                    el.scrollIntoView({ behavior: "smooth", block: "start" });
+                  } else {
+                    // card not rendered yet (list hasn't refetched / filtered out)
+                    void qc.invalidateQueries({ queryKey: ["campaigns"] });
+                    toast.info("Refreshing campaigns…", {
+                      description: "The campaign card isn't on screen yet — look for it below shortly.",
+                    });
+                  }
+                }}
+              >
+                <FlameIcon data-icon="inline-start" />
+                {a.subject} · {a.heat}
+              </Button>
+            ) : (
+              <Badge key={i} variant="outline" title={hint}>
+                <FlameIcon data-icon="inline-start" />
+                {a.subject} · {a.heat}
+              </Badge>
+            );
+          })}
+        </div>
+      ) : null}
+      {run.error ? <p className="text-xs text-destructive">{run.error}</p> : null}
+    </div>
+  );
+}
+
+/** The Reel Factory: scout the feed's hottest subjects over a time window and
+ * commission one reel-led campaign per pick. Each pick lands as an ordinary
+ * campaign in the list below (same progress, review and publish flow). */
+function ReelFactory() {
+  const qc = useQueryClient();
+  const [count, setCount] = useState(3);
+  const [windowHours, setWindowHours] = useState(24);
+
+  const runs = useQuery({
+    queryKey: ["factory-runs"],
+    queryFn: listFactoryRuns,
+    // poll fast while a run is live; keep a slow poll otherwise so runs
+    // started elsewhere (beat schedule, another tab) still show up
+    refetchInterval: (q) =>
+      (q.state.data?.items ?? []).some((r) => FACTORY_LIVE.has(r.status)) ? 8000 : 30000,
+  });
+
+  const items = runs.data?.items ?? [];
+  const live = items.some((r) => FACTORY_LIVE.has(r.status));
+
+  // a live run commissions campaigns as it goes — refresh the campaign list
+  // whenever a poll reports new ones so they appear below without a reload.
+  // On the FIRST payload refresh too if a run is live: the campaign list
+  // fetches in parallel and may miss campaigns commissioned in between.
+  const commissioned = runs.data?.items.reduce((n, r) => n + r.campaigns.length, 0);
+  const seen = useRef<number | null>(null);
+  useEffect(() => {
+    if (commissioned === undefined) return;
+    if (seen.current === null ? live : commissioned !== seen.current) {
+      void qc.invalidateQueries({ queryKey: ["campaigns"] });
+    }
+    seen.current = commissioned;
+  }, [commissioned, live, qc]);
+
+  const start = useMutation({
+    mutationFn: () => startFactoryRun({ count, window_hours: windowHours }),
+    onSuccess: () => {
+      toast.success("Factory run started", {
+        description: "Commissioned campaigns appear below as the run progresses.",
+      });
+      void qc.invalidateQueries({ queryKey: ["factory-runs"] });
+      void qc.invalidateQueries({ queryKey: ["campaigns"] });
+    },
+    onError: (e: Error) => toast.error("Could not start the factory", { description: e.message }),
+  });
+
+  return (
+    <details className="mb-6 rounded-xl border bg-muted/30">
+      <summary className="cursor-pointer px-4 py-3 text-sm font-medium">
+        Reel Factory <span className="font-normal text-muted-foreground">— scout the feed, commission reels</span>
+        {live ? (
+          <Badge className="ml-2" variant="secondary">
+            running
+          </Badge>
+        ) : null}
+      </summary>
+      <div className="space-y-3 px-4 pb-4">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+          <label className="flex items-center gap-1.5">
+            <span className="text-muted-foreground">Reels</span>
+            <select className={selectCls} value={count} onChange={(e) => setCount(Number(e.target.value))}>
+              {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-1.5">
+            <span className="text-muted-foreground">Window</span>
+            <select
+              className={selectCls}
+              value={windowHours}
+              onChange={(e) => setWindowHours(Number(e.target.value))}
+            >
+              {FACTORY_WINDOWS.map((h) => (
+                <option key={h} value={h}>
+                  {h}h
+                </option>
+              ))}
+            </select>
+          </label>
+          <Button size="sm" disabled={start.isPending} onClick={() => start.mutate()}>
+            {start.isPending ? (
+              <Loader2Icon className="animate-spin" data-icon="inline-start" />
+            ) : (
+              <FactoryIcon data-icon="inline-start" />
+            )}
+            Run factory
+          </Button>
+        </div>
+        {runs.isPending ? <Skeleton className="h-10 w-full" /> : null}
+        {runs.isError ? <QueryError error={runs.error} onRetry={() => void runs.refetch()} /> : null}
+        {runs.isSuccess && items.length === 0 ? (
+          <p className="text-xs text-muted-foreground">No runs yet.</p>
+        ) : null}
+        {items.slice(0, FACTORY_RUNS_SHOWN).map((run) => (
+          <FactoryRunRow key={run.job_id} run={run} />
+        ))}
+      </div>
+    </details>
   );
 }
 
@@ -678,8 +956,11 @@ function ReelEditor({ item, onRegenerating }: { item: ContentItem; onRegeneratin
   const [c, setC] = useState<ReelShape>(() => structuredClone(item.content) as unknown as ReelShape);
   const [reel, setReel] = useState<ReelControlsState>({
     voiceId: null,
+    characterId: null,
+    scriptType: null,
     music: true,
-    captionStyle: "karaoke",
+    captionStyle: null,
+    visualStyle: null,
     video: true,
     presenter: false,
   });
@@ -1000,8 +1281,11 @@ function CampaignCard({ id }: { id: number }) {
     queryKey: ["campaign", id],
     queryFn: () => getCampaign(id),
     enabled: !gone,
+    // generation runs for minutes; 6s keeps progress feeling live while a
+    // factory batch (several cards polling at once) stays far from the
+    // API's per-user read limit
     refetchInterval: (q) =>
-      ["pending", "running"].includes(q.state.data?.status ?? "") || Date.now() < regenUntil ? 2500 : false,
+      ["pending", "running"].includes(q.state.data?.status ?? "") || Date.now() < regenUntil ? 6000 : false,
   });
 
   if (gone) return null;
@@ -1020,7 +1304,8 @@ function CampaignCard({ id }: { id: number }) {
           d.formats[Math.min(d.items.length, d.formats.length - 1)]
         }…`;
   return (
-    <div className="space-y-4 rounded-xl border p-4">
+    // the DOM id is the Reel Factory's scroll-to anchor for its campaign chips
+    <div id={`campaign-${id}`} className="space-y-4 rounded-xl border p-4">
       <div className="flex items-center gap-2">
         <p className="font-medium">{d.subject}</p>
         <Badge variant={STATUS_VARIANT[d.status] ?? "outline"}>{d.status}</Badge>
@@ -1130,6 +1415,9 @@ export function ContentStudio({ workspaceId }: { workspaceId?: number }) {
   return (
     <>
       <CreateCampaign workspaceId={workspaceId} />
+      {/* the factory scouts the shared news feed and makes topic campaigns,
+          which the workspace-scoped list would not show — so hide it there */}
+      {workspaceId ? null : <ReelFactory />}
       <CampaignList workspaceId={workspaceId} />
     </>
   );

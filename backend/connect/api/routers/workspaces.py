@@ -29,6 +29,8 @@ from connect.domain.models import (
     PostSettings,
     SocialDraft,
     Workspace,
+    WorkspaceChannel,
+    WorkspaceChannelUpdate,
     WorkspaceChatAsyncAccepted,
     WorkspaceChatDetail,
     WorkspaceChatRequest,
@@ -44,14 +46,24 @@ from connect.llm.provider import LLMError
 from connect.llm.spend import BudgetExceeded
 from connect.orchestration.container import Container
 from connect.social import settings as post_settings
+from connect.storage import characters as character_dao
 from connect.storage import documents as doc_dao
 from connect.storage import social_drafts as social_draft_dao
+from connect.storage import workspace_channels as channel_dao
 from connect.storage import workspace_chats as chat_dao
 from connect.storage import workspaces as workspace_dao
 
 router = APIRouter(prefix="/workspaces", tags=["workspaces"])
 
 MAX_PAGE_SIZE = 100
+
+
+async def _bound_character(db: psycopg.AsyncConnection, workspace_id: int):
+    """The character bound to a workspace's channel (or None) — gives the agent
+    its persona voice."""
+    channel = await channel_dao.get_raw(db, workspace_id)
+    char_id = channel.get("default_character_id") if channel else None
+    return await character_dao.get(db, char_id) if char_id else None
 
 
 @router.get("", response_model=list[Workspace])
@@ -135,6 +147,40 @@ async def workspace_post_settings(workspace_id: int,
     if ws is None:
         raise HTTPException(status_code=404, detail="workspace not found")
     return await post_settings.effective(db, ws)
+
+
+@router.get("/{workspace_id}/channel", response_model=WorkspaceChannel)
+async def get_workspace_channel(
+        workspace_id: int,
+        db: psycopg.AsyncConnection = Depends(get_db),
+        user: CurrentUser = Depends(get_current_user)):
+    """The workspace's publishing-channel binding (voice/character/script +
+    account). Secrets (webhook URL, creds) are revealed only to the owner; other
+    viewers see ``webhook_set`` / ``has_credentials`` booleans."""
+    ws = await workspace_dao.get(db, workspace_id, viewer=user.id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    is_owner = ws.owner_id == user.id
+    channel = await channel_dao.get(db, workspace_id, reveal_secrets=is_owner)
+    # a workspace with no channel row yet reads as an empty (default) channel
+    return channel or WorkspaceChannel(workspace_id=workspace_id)
+
+
+@router.put("/{workspace_id}/channel", response_model=WorkspaceChannel)
+async def put_workspace_channel(
+        workspace_id: int, body: WorkspaceChannelUpdate,
+        db: psycopg.AsyncConnection = Depends(get_db),
+        user: CurrentUser = Depends(get_current_user)):
+    """Create/update the channel binding (owner only)."""
+    ws = await workspace_dao.get(db, workspace_id, viewer=user.id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    if ws.owner_id != user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="only the owner may edit this workspace's channel")
+    return await channel_dao.upsert(
+        db, workspace_id, patch=body.model_dump(exclude_unset=True))
 
 
 @router.get("/{workspace_id}/feed", response_model=DocumentPage)
@@ -267,6 +313,7 @@ async def workspace_chat(workspace_id: int, body: WorkspaceChatRequest,
             card_store=container.card_store,
             logo_store=container.logo_store,
             post_settings=await post_settings.effective(db, ws),
+            character=await _bound_character(db, workspace_id),
             mode="quick")
     except BudgetExceeded as e:
         raise HTTPException(status_code=429, detail=str(e)) from e

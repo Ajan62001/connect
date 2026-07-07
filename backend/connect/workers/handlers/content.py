@@ -9,13 +9,23 @@ from connect.content.schema import ContentOptions, ContentSeed
 from connect.workers.registry import WorkerContext, register
 
 
+def _options(raw: dict[str, Any] | None) -> ContentOptions:
+    """Job payloads are durable DB rows that outlive deploys: a payload written
+    by a newer (or older) build may carry option keys this build doesn't know,
+    and ContentOptions is extra='forbid' — reconstructing it verbatim fails the
+    whole job on version skew (seen live: the api enqueued ``visual_style``
+    before the worker was restarted). Unknown keys are dropped instead."""
+    return ContentOptions(**{k: v for k, v in (raw or {}).items()
+                             if k in ContentOptions.model_fields})
+
+
 @register("content_generate")
 async def run_content_generate(ctx: WorkerContext,
                                payload: dict[str, Any]) -> Any:
     service = ctx.services.content
     assert service is not None, "ContentService not wired"
     seed = ContentSeed(**payload["seed"])
-    opts = ContentOptions(**payload["options"])
+    opts = _options(payload["options"])
     return await service.run(
         ctx.conn, payload["campaign_id"], seed, list(payload["formats"]),
         opts, job_id=ctx.job_id, cancel=ctx.cancel)
@@ -52,5 +62,18 @@ async def run_content_render(ctx: WorkerContext,
     assert service is not None, "ContentService not wired"
     return await service.rerender(
         ctx.conn, int(payload["item_id"]),
-        ContentOptions(**(payload.get("options") or {})),
+        _options(payload.get("options")),
         job_id=ctx.job_id, owner_id=int(payload["owner_id"]))
+
+
+@register("reel_factory")
+async def run_reel_factory(ctx: WorkerContext,
+                           payload: dict[str, Any]) -> Any:
+    """One factory run: scout hot subjects from the feed and commission one
+    reel-led campaign per pick (the campaigns then generate/render in their
+    own content_generate jobs)."""
+    service = ctx.services.reel_factory
+    assert service is not None, "ReelFactoryService not wired"
+    return await service.run(
+        ctx.conn, payload, job_id=ctx.job_id,
+        owner_id=int(payload["owner_id"]), cancel=ctx.cancel)

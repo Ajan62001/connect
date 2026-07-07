@@ -460,6 +460,7 @@ async def run_workspace_agent(
         messages: list[dict[str, Any]],
         card_store: Any = None, logo_store: Any = None,
         post_settings: PostSettings | None = None,
+        character: Any = None,
         on_turn: Any = None, should_cancel: Any = None,
         mode: str = "quick") -> WorkspaceAgentResult:
     """Drive the bounded tool-loop for one user turn. ``mode`` selects the
@@ -514,8 +515,13 @@ async def run_workspace_agent(
     async def cancelled() -> bool:
         return should_cancel is not None and await should_cancel()
 
+    # a bound channel character gives the assistant its voice (framing only —
+    # the grounding/citation discipline in the tools is unchanged)
+    from connect.content.channel import persona_lines
+    system = WS_AGENT_SYSTEM + ("\n\n" + persona_lines(character)
+                                if character is not None else "")
     turns = await run_metered_tool_loop(
-        llm, system=WS_AGENT_SYSTEM, tools=WS_TOOL_DEFS, executor=executor,
+        llm, system=system, tools=WS_TOOL_DEFS, executor=executor,
         messages=msgs, tier=ModelTier.BALANCED, max_tokens=2048,
         max_iters=max_iters, terminal_tool="final_answer",
         should_force=should_force, after_turn=after_turn,

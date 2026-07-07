@@ -70,7 +70,7 @@ _DEDUP_STATUS_SQL_BY_KIND = {"content_verify": "('queued')"}
 # job kinds where at most ONE live job may exist globally (the job itself fans
 # out over its work set). Dedup against a partial unique index on ((kind)) —
 # same schema.py contract as _DEDUP_KEYS.
-_SINGLETON_KINDS = frozenset({"content_correction"})
+_SINGLETON_KINDS = frozenset({"content_correction", "reel_factory"})
 
 
 async def create(conn: psycopg.AsyncConnection, kind: str,

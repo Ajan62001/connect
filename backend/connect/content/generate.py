@@ -18,6 +18,7 @@ import psycopg
 from pydantic import BaseModel
 
 from connect.analysis.budget import AnalysisBudget
+from connect.content import edit as edit_mod
 from connect.content import gate, ground
 from connect.content.schema import (
     CarouselContent,
@@ -70,18 +71,31 @@ _FORMAT_GUIDE = {
         "Produce ONE LinkedIn post: 2-5 short paragraphs, explanatory and"
         " accessible, ending with a source credit."),
     "ig_reel": (
-        "Produce a FAST, punchy Instagram REEL built to STOP THE SCROLL. Open"
-        " with a HOOK (the title) that lands in the first 2 seconds: lead with"
-        " the single most surprising NUMBER or highest-stakes claim, as a sharp"
-        " question or bold stake (aim for <=8 words). Make a viewer feel they'll"
-        " miss something — punchy, never clickbait-false."
-        " Then EXACTLY {scenes} tight scenes that pay off the hook. Keep it"
-        " SHORT — the whole thing should run about 20-30 seconds when read"
-        " aloud. Each scene: ONE short spoken NARRATION sentence (conversational,"
-        " no filler), a SHORT punchy on-screen caption (a few big words, not a"
-        " sentence), and an IMAGE_QUERY of 2-4 plain words naming a concrete,"
-        " photographable subject for the background photo. End with a caption"
-        " and hashtags. Energetic and visual — never a bulleted summary."),
+        "Produce a FAST, punchy Instagram REEL engineered to stop the scroll"
+        " AND hold it to the end.\n"
+        "THE HOOK (title) decides everything in the first 2 seconds. Build it"
+        " from the single most surprising element in the evidence using one of"
+        " these shapes: the shock number ('90 to the dollar. It happened'),"
+        " the reversal ('They said X. Then Y happened'), the stake ('This"
+        " decides what you pay for Z'), or the sharp question. <=8 words,"
+        " spoken language not headline-ese, never clickbait-false.\n"
+        "Then EXACTLY {scenes} tight scenes that pay off the hook as a story"
+        " arc — setup, escalation, payoff — not a list. Each scene's NARRATION"
+        " is ONE conversational spoken sentence (contractions fine, zero"
+        " bureaucratic phrasing) that adds a NEW fact; every scene except the"
+        " last should end leaning forward — a tension, contrast or 'but/so'"
+        " turn that makes scrolling away feel like missing the point. The"
+        " last scene lands the consequence: what changes, who pays, or what"
+        " happens next.\n"
+        "ON_SCREEN_CAPTION: the scene's 2-5 punchiest words — a number beats"
+        " a noun, a verb beats an adjective. IMAGE_QUERY: 2-4 plain words"
+        " naming a concrete, photographable subject, DIFFERENT from every"
+        " other scene's (repeated backgrounds read as lazy).\n"
+        "Whole reel ~20-30 seconds read aloud. CAPTION: open with a curiosity"
+        " line that makes non-followers comment, then 1-2 factual sentences,"
+        " end crediting the source. HASHTAGS: mix 2-3 broad-reach tags with"
+        " topical niche tags. Energetic and visual — never a bulleted"
+        " summary."),
     "meme": (
         "Produce a NEWS MEME: a relevant stock PHOTO (image_query: 2-4 plain"
         " words naming a concrete, photographable subject that carries the"
@@ -177,7 +191,8 @@ def _build_user_prompt(fmt: str, menu_text: str, factset: StoryFactSet,
                        options: ContentOptions, settings: PostSettings,
                        media_hint: str | None = None,
                        angle: str | None = None,
-                       pick_reason: str | None = None) -> str:
+                       pick_reason: str | None = None,
+                       style_context: str = "") -> str:
     guide = _FORMAT_GUIDE[fmt].format(slides=options.slide_count,
                                       tweets=options.thread_length,
                                       scenes=options.scene_count)
@@ -200,10 +215,14 @@ def _build_user_prompt(fmt: str, menu_text: str, factset: StoryFactSet,
                   if lead else "")
     why = _hint(pick_reason, 200)
     reason_line = (f"Why this format was commissioned: {why}\n" if why else "")
+    # persona (character) + script-type framing — voice/form ONLY, never
+    # evidence; built upstream (connect/content/channel.py) so it is bounded and
+    # citation-safe by construction.
+    persona = style_context or ""
     return (
         f"SUBJECT: {factset.subject}\n\n{menu_text}\n\n"
         f"{guide}\nTone: {options.tone}. About {options.hashtag_count}"
-        f" hashtags (without '#').\n{style_line}{brand}{theme}"
+        f" hashtags (without '#').\n{style_line}{persona}{brand}{theme}"
         f"{angle_line}{reason_line}{media}"
         "Write it now, citing [[E#]] for every factual claim.")
 
@@ -215,7 +234,9 @@ async def generate_format(conn: psycopg.AsyncConnection,
                           governor: Any, viewer: int,
                           media_hint: str | None = None,
                           angle: str | None = None,
-                          pick_reason: str | None = None) -> FormatResult:
+                          pick_reason: str | None = None,
+                          editor_passes: int = 0,
+                          style_context: str = "") -> FormatResult:
     schema = FORMAT_SCHEMA[fmt]
     platform = CONTENT_FORMAT_PLATFORM[fmt]
     menu, by_id = ground.build_menu(factset)
@@ -223,7 +244,8 @@ async def generate_format(conn: psycopg.AsyncConnection,
     system = _SYSTEM_BASE.format(platform=platform)
     user = _build_user_prompt(fmt, menu_text, factset, options, settings,
                               media_hint=media_hint, angle=angle,
-                              pick_reason=pick_reason)
+                              pick_reason=pick_reason,
+                              style_context=style_context)
 
     proj = spend.cost_usd(provider.model_for(ModelTier.BALANCED),
                           input_tokens=EST_IN, output_tokens=EST_OUT)
@@ -252,9 +274,23 @@ async def generate_format(conn: psycopg.AsyncConnection,
             "\n\nYour previous draft cited ids NOT in the menu: "
             f"{', '.join(bad)}. Rewrite citing ONLY ids that appear above.")
 
+    # the reel script editor: a bounded critique->revise loop that raises the
+    # craft floor (hook / pacing / visuals) BEFORE attribution + gate — an
+    # accepted revision is citation-clean by construction (edit_reel discards
+    # revisions that leave the menu), so the discipline downstream is intact.
+    editor_report = None
+    if fmt == "ig_reel" and editor_passes > 0 and isinstance(out, ReelContent):
+        out, editor_report = await edit_mod.edit_reel(
+            conn, provider, draft=out, menu=menu, menu_text=menu_text,
+            gen_system=system, budget=budget, governor=governor,
+            viewer=viewer, max_passes=editor_passes,
+            style_context=style_context)
+
     # resolve attribution from the (possibly regenerated) text BEFORE stripping
     sources, grounding = ground.resolve(
         menu, by_id, _texts(fmt, out), regenerated=regenerated)
+    if editor_report is not None:
+        grounding["editor"] = editor_report
 
     # S2 editorial gate: verify the generated prose is actually entailed by the
     # evidence it is attributed to (warn-only; fails open on any LLM/budget

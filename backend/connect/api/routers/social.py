@@ -27,6 +27,8 @@ from connect.api.deps import (
 )
 from connect.domain.enums import T1_TOPICS
 from connect.domain.models import (
+    ChannelSettings,
+    ChannelSettingsUpdate,
     CurrentUser,
     InstagramStatus,
     PostSettings,
@@ -41,6 +43,7 @@ from connect.llm.provider import LLMError
 from connect.llm.spend import BudgetExceeded
 from connect.llm.tiers import ModelTier
 from connect.orchestration.container import Container
+from connect.social import channel_settings as channel_settings_mod
 from connect.social import generate, instagram, palettes
 from connect.social import settings as post_settings
 from connect.social.card import render_card
@@ -151,6 +154,26 @@ async def put_post_settings(body: PostSettingsUpdate,
     current = await post_settings.get_global(db)
     merged = post_settings._merge(current, body.model_dump(exclude_unset=True))
     await post_settings.set_global(db, merged)
+    return merged
+
+
+@router.get("/channel-settings", response_model=ChannelSettings)
+async def get_channel_settings(db: psycopg.AsyncConnection = Depends(get_db),
+                               user: CurrentUser = Depends(get_current_user)):
+    """The global default channel settings — the voice/character/script-type
+    floor under every workspace channel (readable by any user)."""
+    return await channel_settings_mod.get_global(db)
+
+
+@router.put("/channel-settings", response_model=ChannelSettings,
+            dependencies=[Depends(require_admin)])
+async def put_channel_settings(body: ChannelSettingsUpdate,
+                               db: psycopg.AsyncConnection = Depends(get_db)):
+    """Update the global default channel settings (admin)."""
+    current = await channel_settings_mod.get_global(db)
+    merged = channel_settings_mod._merge(
+        current, body.model_dump(exclude_unset=True))
+    await channel_settings_mod.set_global(db, merged)
     return merged
 
 

@@ -37,6 +37,7 @@ from connect.analysis.pipeline import AnalysisService
 from connect.auth.oauth import GoogleOAuth
 from connect.ingestion.blobs import BlobStore
 from connect.investigation.runner import InvestigationService
+from connect.content.factory import ReelFactoryService
 from connect.content.service import ContentService
 from connect.story.service import StoryService
 from connect.ingestion.fetcher import Fetcher
@@ -141,6 +142,8 @@ class Container:
         self.stories: StoryService | None = None
         # v16: social content pipeline — campaigns -> review queue -> publish.
         self.content: ContentService | None = None
+        # v26: the reel factory — on-demand/scheduled feed -> reels runs.
+        self.reel_factory: ReelFactoryService | None = None
         # Phase B auth: Google OAuth client — None without credentials
         # (the signin page then offers only the dev hatch, if enabled).
         # Construction is offline (discovery is fetched lazily at first
@@ -286,6 +289,14 @@ class Container:
             reel_store=self.reel_store,
             embedder=self.embedder,
             vectors=self.vectors,
+        )
+        self.reel_factory = ReelFactoryService(
+            pool,
+            jobs=self.jobs,
+            provider=self.llm,
+            governor=self.governor,
+            settings=self.settings,
+            content=self.content,
         )
         log.info("container up: db=%s schema=v%s vectors=%s",
                  pg_mod.redact_dsn(self.settings.database_url),

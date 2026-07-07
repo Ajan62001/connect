@@ -28,8 +28,10 @@ from connect.domain.models import PostSettings
 from connect.social import heygen, tts
 from connect.social.card import (
     _BOLD,
+    _POSTER_BOLD,
     _REG,
     _Theme,
+    _contrast_on,
     _draw_block,
     _font,
     _paste_logo,
@@ -41,10 +43,27 @@ log = logging.getLogger(__name__)
 VW, VH, VMARGIN = 1080, 1920, 96          # reference vertical canvas
 _REF_W = float(VW)                        # font sizes are tuned for this width
 
+# 'fitted' visual style: the media box (on the reference canvas) the photo/clip
+# is CONTAINED in — the whole image shows, never side-cropped — with the theme
+# colour filling the rest; headline/captions live on the solid panel below the
+# box. The 192 top edge clears the accent bar + logo band (logo bottom ~160);
+# the 1128 bottom edge clears the karaoke caption block (whose top reaches
+# ~1170). Ken-Burns scenes pre-shrink the media toward the frame centre by the
+# scene's max zoom (see _fit) so the magnification never pushes it out of the
+# box — under the logo or into the text panel.
+_FIT_X, _FIT_TOP, _FIT_BOTTOM = 72, 192, 1128
+
 # per-scene video duration bounds when narrated (seconds)
 _MIN_SCENE, _MAX_SCENE = 2.0, 8.0
-_SCENE_PAD = 0.45                         # head+tail padding around narration
-_XFADE = 0.45                             # scene-to-scene transition duration
+# INVARIANT: _SCENE_PAD == _XFADE. The narration WAV and the karaoke caption
+# timeline are the raw per-scene clips laid back-to-back; the video timeline
+# pads each scene by _SCENE_PAD and each crossfade overlap removes _XFADE —
+# scene k's visuals start at sum(voice)+k*(_SCENE_PAD - _XFADE), so any gap
+# between the two constants makes audio+captions drift 0.15s/scene ahead of
+# the picture. Change them TOGETHER.
+_SCENE_PAD = 0.30                         # head+tail padding around narration
+_XFADE = 0.30                             # scene-to-scene transition duration
+                                          # (short-form pacing: snappy cuts)
 
 
 class ReelRenderError(Exception):
@@ -55,8 +74,11 @@ class ReelRenderError(Exception):
 class ReelProfile:
     size: tuple[int, int] = (VW, VH)
     fps: int = 30
-    preset: str = "veryfast"
-    crf: int = 23
+    # 'fast'/crf 20 over 'veryfast'/23: b-roll is often already-compressed
+    # stock that a second veryfast/23 pass visibly smears; the render is a
+    # worker-thread batch job, so the extra encode time is cheap.
+    preset: str = "fast"
+    crf: int = 20
     crossfade: bool = True               # xfade transitions between scenes
     kenburns: bool = True                # gentle per-scene zoom (motion)
     use_images: bool = True              # fetch web background photos per scene
@@ -126,6 +148,40 @@ def _cover(img, w: int, h: int):
     return img.crop((left, top, left + w, top + h))
 
 
+def _fit_box(size: tuple[int, int]) -> tuple[int, int, int, int]:
+    """The fitted-mode media box (x0, y0, x1, y1), scaled from the reference
+    1080x1920 canvas to ``size`` (the 2x supersampled bg canvas included)."""
+    w, h = size
+    x = int(_FIT_X * w / VW)
+    return (x, int(_FIT_TOP * h / VH), w - x, int(_FIT_BOTTOM * h / VH))
+
+
+def _fit(img, t: _Theme, size: tuple[int, int], zoom: float = 1.0):
+    """Contain the WHOLE ``img`` inside the fitted-mode media box, centred on
+    a solid theme-colour canvas — the no-crop counterpart of _cover+_scrim.
+
+    ``zoom`` is the scene's maximum Ken-Burns magnification (zoompan magnifies
+    about the FRAME centre): the box is pre-shrunk toward that centre by the
+    same factor, so at full zoom the media grows to exactly the design box and
+    never slides under the logo band or into the text panel."""
+    from PIL import Image
+
+    w, h = size
+    x0, y0, x1, y1 = _fit_box(size)
+    if zoom > 1.0:
+        cx, cy = w / 2, h / 2
+        x0, x1 = int(cx + (x0 - cx) / zoom), int(cx + (x1 - cx) / zoom)
+        y0, y1 = int(cy + (y0 - cy) / zoom), int(cy + (y1 - cy) / zoom)
+    bw, bh = x1 - x0, y1 - y0
+    iw, ih = img.size
+    scale = min(bw / iw, bh / ih)
+    img = img.resize((max(1, int(iw * scale)), max(1, int(ih * scale))),
+                     Image.LANCZOS)
+    canvas = Image.new("RGB", (w, h), t.bg)
+    canvas.paste(img, (x0 + (bw - img.width) // 2, y0 + (bh - img.height) // 2))
+    return canvas
+
+
 def _scrim_alpha(h: int) -> list[int]:
     """Per-row darkening alpha (0-255): light overall darken (keep the colour)
     plus a strong bottom gradient for the lower-third caption and a subtle top
@@ -171,12 +227,15 @@ def _scrim_overlay(size: tuple[int, int]) -> "object":
 
 def _shadow_block(draw, lines, font, *, y, line_h, w, fill=_WHITE, off=3,
                   align="center", left=0, inner=None):
-    """Draw each line with a drop shadow; centred or left-aligned. New y."""
+    """Draw each line with a drop shadow (off=0 skips it — fitted-mode text
+    sits on a solid colour and wants flat type); centred or left-aligned.
+    Returns the new y."""
     inner = w if inner is None else inner
     for line in lines:
         tw = draw.textlength(line, font=font)
         x = left + (inner - tw) / 2 if align == "center" else left
-        draw.text((x + off, y + off), line, font=font, fill=_SHADOW)
+        if off:
+            draw.text((x + off, y + off), line, font=font, fill=_SHADOW)
         draw.text((x, y), line, font=font, fill=fill)
         y += line_h
     return y
@@ -184,11 +243,16 @@ def _shadow_block(draw, lines, font, *, y, line_h, w, fill=_WHITE, off=3,
 
 def _draw_scene_caption(draw, *, style: str, heading: str, bullets: list[str],
                         t: _Theme, w: int, h: int, px, margin: int,
-                        inner: int) -> None:
+                        inner: int, panel_top: int | None = None,
+                        fill=_WHITE, muted=(214, 222, 233),
+                        off: int = 3) -> None:
     """Draw the scene's on-screen caption in the chosen static style:
     'lower_third' (default), 'centered' (big mid-frame), or 'boxed' (words on
     accent-colour blocks, TikTok-style). 'karaoke' is handled elsewhere (burned
-    word-timed subtitles), so it never reaches here."""
+    word-timed subtitles), so it never reaches here. ``panel_top`` (fitted
+    visual style) is the top of the solid text panel — captions are kept below
+    it so they never sit on the media; ``fill``/``muted``/``off`` let the
+    fitted style use flat, contrast-aware type."""
     head = heading.strip()
     if not head:
         return
@@ -203,10 +267,16 @@ def _draw_scene_caption(draw, *, style: str, heading: str, bullets: list[str],
             cap_px = int(cap_px * 0.9)
         lines = lines[:4]
         line_h = int(cap_px * 1.12)
-        y0 = int(h * 0.46) - (len(lines) * line_h) // 2
+        if panel_top is None:
+            y0 = int(h * 0.46) - (len(lines) * line_h) // 2
+        else:   # centred within the solid panel, not the (media-holding) frame
+            y0 = (panel_top + h - int(margin * 1.5)) // 2 \
+                - (len(lines) * line_h) // 2
+            y0 = max(y0, panel_top + px(56))
         draw.rectangle([(w - px(110)) // 2, y0 - px(40),
                         (w + px(110)) // 2, y0 - px(28)], fill=t.accent)
-        _shadow_block(draw, lines, cap_font, y=y0, line_h=line_h, w=w)
+        _shadow_block(draw, lines, cap_font, y=y0, line_h=line_h, w=w,
+                      fill=fill, off=off)
         return
 
     if style == "boxed":
@@ -216,12 +286,15 @@ def _draw_scene_caption(draw, *, style: str, heading: str, bullets: list[str],
         line_h = int(cap_px * 1.30)
         pad_x, pad_y = px(22), px(10)
         y = int(h * 0.72) - len(lines) * line_h
+        if panel_top is not None:
+            y = max(y, panel_top + px(24))
+        on_accent = _contrast_on(t.accent)
         for line in lines:
             tw = draw.textlength(line, font=cap_font)
             x = (w - tw) / 2
             draw.rectangle([x - pad_x, y - pad_y, x + tw + pad_x,
                             y + cap_px + pad_y], fill=t.accent)
-            draw.text((x, y), line, font=cap_font, fill=_WHITE)
+            draw.text((x, y), line, font=cap_font, fill=on_accent)
             y += line_h
         return
 
@@ -231,7 +304,10 @@ def _draw_scene_caption(draw, *, style: str, heading: str, bullets: list[str],
     lines = _wrap(draw, head, cap_font, inner)[:3]
     line_h = int(cap_px * 1.12)
     y = int(h * 0.74) - len(lines) * line_h
-    bottom = _shadow_block(draw, lines, cap_font, y=y, line_h=line_h, w=w)
+    if panel_top is not None:
+        y = max(y, panel_top + px(24))
+    bottom = _shadow_block(draw, lines, cap_font, y=y, line_h=line_h, w=w,
+                           fill=fill, off=off)
     draw.rectangle([margin, bottom + px(14), margin + px(120),
                     bottom + px(24)], fill=t.accent)
     b = next((x.strip() for x in bullets if x.strip()), "")
@@ -239,36 +315,75 @@ def _draw_scene_caption(draw, *, style: str, heading: str, bullets: list[str],
         sf = _font(_REG, px(40))
         _shadow_block(draw, _wrap(draw, b, sf, inner)[:1], sf,
                       y=bottom + px(40), line_h=int(px(40) * 1.3), w=w,
-                      fill=(214, 222, 233))
+                      fill=muted, off=off)
 
 
-def _scene_bg(bg_image: bytes | None, t: _Theme,
-              size: tuple[int, int]) -> "object":
-    """The moving layer: a cover-fit photo under a legibility scrim, or the
-    themed solid colour. No text — so the Ken-Burns zoom never shakes type."""
+def _kb_amount(index: int) -> float:
+    """Ken-Burns zoom amplitude for scene ``index``: the HOOK (scene 0) gets a
+    harder punch-in — the first 2 seconds carry the retention battle; later
+    scenes keep the gentle drift. Shared by the zoompan filter and the fitted
+    media-box shrink so the two can never drift apart."""
+    return 0.14 if index == 0 else 0.08
+
+
+def _scene_bg(bg_image: bytes | None, t: _Theme, size: tuple[int, int],
+              style: str = "cover", zoom: float = 1.0) -> "object":
+    """The moving layer: the scene photo — contained on the solid theme colour
+    ('fitted', whole image, no scrim) or cover-cropped under a legibility scrim
+    ('cover') — else the themed solid. No text — so the Ken-Burns zoom never
+    shakes type. ``zoom`` (fitted only) is the scene's max Ken-Burns
+    magnification, keeping the media inside its box at any zoom (see _fit)."""
     from PIL import Image
 
     w, h = size
     if bg_image:
         try:
             photo = Image.open(io.BytesIO(bg_image)).convert("RGB")
+            if style == "fitted":
+                return _fit(photo, t, size, zoom=zoom)
             return _scrim(_cover(photo, w, h))
         except Exception:  # noqa: BLE001 — a bad image just falls back to colour
             pass
     return Image.new("RGB", (w, h), t.bg)
 
 
+def _poster_block(draw, text: str, t: _Theme, *, w: int, h: int, px,
+                  margin: int, inner: int) -> None:
+    """The poster caption: bold, centred, accent-colour lines pinned to the
+    bottom of the frame (above the footer), shrunk to fit at most 4 lines —
+    the viral news-page look. Sentence case, no accent rule, no bullets."""
+    text = (text or "").strip()
+    if not text:
+        return
+    for size in (84, 72, 62, 54):
+        f = _font(_POSTER_BOLD, px(size))
+        lines = _wrap(draw, text, f, inner)
+        if len(lines) <= 4:
+            break
+    lines = lines[:4]
+    line_h = int(px(size) * 1.22)
+    y = h - margin - px(52) - len(lines) * line_h
+    _shadow_block(draw, lines, f, y=y, line_h=line_h, w=w, fill=t.accent)
+
+
 def _scene_overlay(*, kind: str, heading: str, bullets: list[str],
                    source_label: str, sign_off: str, index: int, total: int,
                    t: _Theme, logo: bytes | None, size: tuple[int, int],
                    show_caption: bool = True,
-                   caption_style: str = "lower_third") -> "object":
+                   caption_style: str = "lower_third",
+                   visual_style: str = "cover") -> "object":
     """The PINNED layer: a transparent RGBA frame holding the accent bar, logo,
     headline/caption and footer. Composited (static) over the moving bg, so text
     stays rock-steady. The HOOK reads huge and centred; scene captions are drawn
     in ``caption_style`` (lower_third / centered / boxed). ``show_caption=False``
     drops the scene caption (used when burned-in karaoke captions carry the
-    words)."""
+    words).
+
+    ``visual_style='fitted'`` moves ALL text onto the solid panel below the
+    media box (the media is contained, not full-bleed) and switches to flat,
+    theme-contrast type — there is no scrim to guarantee white-on-photo.
+    ``visual_style='poster'`` keeps the full-bleed scrimmed media and pins a
+    bold centred accent-colour caption to the bottom (viral news-page look)."""
     from PIL import Image, ImageDraw
 
     w, h = size
@@ -277,47 +392,75 @@ def _scene_overlay(*, kind: str, heading: str, bullets: list[str],
     margin = px(VMARGIN)
     inner = w - 2 * margin
 
+    fitted = visual_style == "fitted"
+    poster = visual_style == "poster"
+    panel_top = _fit_box(size)[3] if fitted else None
+    fill = _contrast_on(t.bg) if fitted else _WHITE
+    muted = t.muted if fitted else (214, 222, 233)
+    off = 0 if fitted else 3                    # flat type on solid colour
+
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    draw.rectangle([0, 0, w, px(10)], fill=t.accent)     # top accent bar
-    _paste_logo(img, logo, canvas_w=w, margin=margin)
+    if not poster:                              # poster is chrome-light
+        draw.rectangle([0, 0, w, px(10)], fill=t.accent)   # top accent bar
+    _paste_logo(img, logo, canvas_w=w, margin=margin, left=poster)
 
-    if kind == "title":
+    if kind == "title" and poster:
+        _poster_block(draw, heading, t, w=w, h=h, px=px, margin=margin,
+                      inner=inner)
+    elif kind == "title":
         # HOOK: huge, all-caps, centred, with an accent rule above it. Shrink
         # the font for long hooks so nothing wraps past ~4 lines or truncates.
+        # Fitted: centred within the solid panel (under the media box).
         text = heading.strip().upper()
-        head_px = px(118)
+        head_px = px(96) if fitted else px(118)
         for _try in range(6):
             head_font = _font(_BOLD, head_px)
             lines = _wrap(draw, text, head_font, inner)
-            if len(lines) <= 4 or head_px <= px(72):
+            if len(lines) <= 4 or head_px <= px(64 if fitted else 72):
                 break
             head_px = int(head_px * 0.9)
         lines = lines[:5]
         line_h = int(head_px * 1.12)
-        y0 = int(h * 0.42) - (len(lines) * line_h) // 2
+        if fitted:
+            y0 = (panel_top + h - int(margin * 1.5)) // 2 \
+                - (len(lines) * line_h) // 2
+            y0 = max(y0, panel_top + px(64))
+        else:
+            y0 = int(h * 0.42) - (len(lines) * line_h) // 2
         draw.rectangle([(w - px(110)) // 2, y0 - px(46),
                         (w + px(110)) // 2, y0 - px(34)], fill=t.accent)
-        _shadow_block(draw, lines, head_font, y=y0, line_h=line_h, w=w)
+        _shadow_block(draw, lines, head_font, y=y0, line_h=line_h, w=w,
+                      fill=fill, off=off)
     elif kind == "closing":
         cf = _font(_BOLD, px(64))
         lines = _wrap(draw, (source_label or "connect").strip(), cf, inner)[:3]
-        _shadow_block(draw, lines, cf, y=int(h * 0.44), line_h=int(px(64) * 1.15),
-                      w=w, fill=t.accent)
+        cy = (panel_top + h - int(margin * 1.5)) // 2 \
+            - (len(lines) * int(px(64) * 1.15)) // 2 if fitted else int(h * 0.44)
+        _shadow_block(draw, lines, cf, y=cy, line_h=int(px(64) * 1.15),
+                      w=w, fill=t.accent, off=off)
     elif not show_caption:
         pass   # karaoke captions (burned subtitles) carry this scene's words
+    elif poster:
+        _poster_block(draw, heading, t, w=w, h=h, px=px, margin=margin,
+                      inner=inner)
     else:
         _draw_scene_caption(draw, style=caption_style, heading=heading,
                             bullets=bullets, t=t, w=w, h=h, px=px,
-                            margin=margin, inner=inner)
+                            margin=margin, inner=inner, panel_top=panel_top,
+                            fill=fill, muted=muted, off=off)
 
     # footer: sign-off + index/total (shadowed for legibility on any photo)
     foot = _font(_BOLD, px(26))
-    draw.text((margin + 2, h - margin + 2), sign_off, font=foot, fill=_SHADOW)
-    draw.text((margin, h - margin), sign_off, font=foot, fill=_WHITE)
+    if off:
+        draw.text((margin + 2, h - margin + 2), sign_off, font=foot,
+                  fill=_SHADOW)
+    draw.text((margin, h - margin), sign_off, font=foot, fill=fill)
     tag = f"{index}/{total}"
     tw = draw.textlength(tag, font=foot)
-    draw.text((w - margin - tw + 2, h - margin + 2), tag, font=foot, fill=_SHADOW)
+    if off:
+        draw.text((w - margin - tw + 2, h - margin + 2), tag, font=foot,
+                  fill=_SHADOW)
     draw.text((w - margin - tw, h - margin), tag, font=foot, fill=t.accent)
     return img
 
@@ -346,8 +489,10 @@ def _ass_escape(s: str) -> str:
                     .replace("\n", " ")
 
 
-def _chunk_words(words, max_words=3, max_chars=22):
-    """Group words into short on-screen chunks (a few words at a time)."""
+def _chunk_words(words, max_words=3, max_chars=15):
+    """Group words into short on-screen chunks (a few words at a time).
+    max_chars is sized so a chunk at the karaoke font always fits 9:16 width
+    (22 clipped: 'PAKISTAN'S GOVERNMENT' overflowed a 1080px frame)."""
     chunks, cur, n = [], [], 0
     for w in words:
         wl = len(w[0])
@@ -361,11 +506,17 @@ def _chunk_words(words, max_words=3, max_chars=22):
     return chunks
 
 
-def _build_ass(scenes, voice_durs, scene_words, size) -> str | None:
+def _build_ass(scenes, voice_durs, scene_words, size, *,
+               t: _Theme | None = None,
+               visual_style: str = "cover") -> str | None:
     """An ASS subtitle: each scene's narration words, chunked and timed on the
     continuous narration timeline (scene i offset by the cumulative durations),
-    big/bold/outlined in the lower third — the karaoke captions."""
+    big/bold/outlined — the karaoke captions. Default look: white UPPERCASE in
+    the lower third. 'poster' restyles them to match the poster cards: accent
+    colour, rounded font, sentence case, pinned low like the static poster
+    caption."""
     w, h = size
+    poster = visual_style == "poster" and t is not None
     events = []
     offset = 0.0
     for s, dur, words in zip(scenes, voice_durs, scene_words):
@@ -373,22 +524,34 @@ def _build_ass(scenes, voice_durs, scene_words, size) -> str | None:
             for chunk in _chunk_words(words):
                 cs = offset + chunk[0][1]
                 ce = offset + chunk[-1][2]
-                txt = _ass_escape(" ".join(wd[0] for wd in chunk)).upper()
+                txt = _ass_escape(" ".join(wd[0] for wd in chunk))
+                if not poster:
+                    txt = txt.upper()
                 events.append((cs, max(ce, cs + 0.2), txt))
         offset += dur
     if not events:
         return None
-    fs = max(28, int(96 * w / 1080))
+    fs = max(28, int(84 * w / 1080))
     outline = max(2, int(7 * w / 1080))
-    marginv = int(560 * h / 1920)
+    if poster:
+        r, g, b = t.accent
+        colour = f"&H00{b:02X}{g:02X}{r:02X}"    # ASS colours are &HAABBGGRR
+        fontname = "Ubuntu"                       # rounded; libass falls back
+        marginv = int(220 * h / 1920)             # low, like the poster caption
+    else:
+        colour = "&H00FFFFFF"
+        fontname = "DejaVu Sans"
+        marginv = int(560 * h / 1920)
+    # WrapStyle 0: a chunk that still exceeds the margins wraps (smart,
+    # centred) instead of clipping off both edges of the frame.
     head = (
         "[Script Info]\nScriptType: v4.00+\n"
-        f"PlayResX: {w}\nPlayResY: {h}\nWrapStyle: 2\n\n"
+        f"PlayResX: {w}\nPlayResY: {h}\nWrapStyle: 0\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour,"
         " BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment,"
         " MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Cap,DejaVu Sans,{fs},&H00FFFFFF,&H00000000,&H64000000,"
+        f"Style: Cap,{fontname},{fs},{colour},&H00000000,&H64000000,"
         f"-1,0,1,{outline},2,2,70,70,{marginv},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV,"
@@ -420,11 +583,12 @@ def _render_segment(ffmpeg: str, bg: Path, text: Path, dur: float, index: int,
     fps = profile.fps
     if profile.kenburns:
         n = max(1, int(round(dur * fps)))
-        step = 0.08 / n                          # gentle ~8% zoom over the scene
+        amt = _kb_amount(index)
+        step = amt / n
         if index % 2 == 0:
-            z = f"min(1.0+{step:.6f}*on,1.08)"   # zoom in
+            z = f"min(1.0+{step:.6f}*on,{1 + amt:.2f})"   # zoom in
         else:
-            z = f"max(1.08-{step:.6f}*on,1.0)"   # zoom out
+            z = f"max({1 + amt:.2f}-{step:.6f}*on,1.0)"   # zoom out
         bgf = (f"[0:v]zoompan=z='{z}':d={n}"
                f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={fps},"
                f"setsar=1[bg]")
@@ -439,17 +603,32 @@ def _render_segment(ffmpeg: str, bg: Path, text: Path, dur: float, index: int,
 
 
 def _render_video_segment(ffmpeg: str, clip: Path, overlay: Path, dur: float,
-                          profile: ReelProfile, out: Path) -> None:
+                          profile: ReelProfile, out: Path, *,
+                          style: str = "cover",
+                          bg_rgb: tuple[int, int, int] | None = None) -> None:
     """One scene from a STOCK CLIP -> a `dur`-second segment: the clip is
-    cover-cropped to 9:16, looped if shorter than the scene, then the combined
-    scrim+text ``overlay`` (a pinned RGBA still) is composited on top. The clip's
-    own audio is dropped (-an); narration is muxed later. ``-stream_loop -1``
-    repeats short clips; ``-t`` bounds the output so long clips are trimmed."""
+    cover-cropped to 9:16 ('cover') or contained whole in the fitted media box
+    on the solid theme colour ('fitted' — the pad does the solid background),
+    looped if shorter than the scene, then the pinned RGBA ``overlay`` (text;
+    scrim+text in cover mode) is composited on top. The clip's own audio is
+    dropped (-an); narration is muxed later. ``-stream_loop -1`` repeats short
+    clips; ``-t`` bounds the output so long clips are trimmed."""
     w, h = profile.size
     fps = profile.fps
-    fc = (f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,"
-          f"crop={w}:{h},fps={fps},setsar=1[bg];"
-          f"[bg][1:v]overlay=0:0,format=yuv420p[v]")
+    if style == "fitted" and bg_rgb is not None:
+        x0, y0, x1, y1 = _fit_box(profile.size)
+        bw, bh = x1 - x0, y1 - y0
+        color = "0x{:02X}{:02X}{:02X}".format(*bg_rgb)
+        fc = (f"[0:v]scale={bw}:{bh}:force_original_aspect_ratio=decrease"
+              f":flags=lanczos,"
+              f"pad={w}:{h}:{x0}+({bw}-iw)/2:{y0}+({bh}-ih)/2:color={color},"
+              f"fps={fps},setsar=1[bg];"
+              f"[bg][1:v]overlay=0:0,format=yuv420p[v]")
+    else:
+        fc = (f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase"
+              f":flags=lanczos,"
+              f"crop={w}:{h},fps={fps},setsar=1[bg];"
+              f"[bg][1:v]overlay=0:0,format=yuv420p[v]")
     _run(ffmpeg, ["-stream_loop", "-1", "-i", str(clip),
                   "-loop", "1", "-i", str(overlay),
                   "-filter_complex", fc, "-map", "[v]", "-an",
@@ -547,6 +726,15 @@ def _mux(ffmpeg: str, video: Path, narration: Path | None,
 # branding, build the b-roll, and reuse `_mux` for the music bed.
 
 
+def _visual_style(settings) -> str:
+    """The effective scene-media treatment: 'poster' (full-bleed + bottom
+    accent caption, the viral news-page look — the default, matching the
+    poster cards), 'fitted' (contained on the solid theme colour) or 'cover'
+    (legacy full-bleed crop)."""
+    v = (getattr(settings, "reel_visual_style", "poster") or "poster").lower()
+    return v if v in ("fitted", "cover", "poster") else "poster"
+
+
 def _presenter_mode(profile: ReelProfile, settings) -> str:
     """The effective presenter mode: 'off', 'pip' or 'full'. Off unless the
     profile allows it, the settings ask for it, AND HeyGen is configured (so
@@ -576,10 +764,12 @@ def _probe_duration(ffmpeg: str, path: Path) -> float:
 
 
 def _presenter_overlay(*, t: _Theme, logo: bytes | None,
-                       size: tuple[int, int], caption: str = "") -> "object":
+                       size: tuple[int, int], caption: str = "",
+                       visual_style: str = "cover") -> "object":
     """Branding chrome for presenter reels: top accent bar, logo, a footer
     sign-off, and an optional lower-left caption (kept clear of a bottom-right
-    avatar in pip mode). Returns a transparent RGBA frame."""
+    avatar in pip mode). Returns a transparent RGBA frame. 'fitted' keeps the
+    caption on the solid panel below the media box, in flat contrast type."""
     from PIL import Image, ImageDraw
 
     w, h = size
@@ -587,6 +777,10 @@ def _presenter_overlay(*, t: _Theme, logo: bytes | None,
     px = lambda n: max(1, int(n * k))           # noqa: E731 — scale helper
     margin = px(VMARGIN)
     inner = w - 2 * margin
+    fitted = visual_style == "fitted"
+    panel_top = _fit_box(size)[3] if fitted else None
+    fill = _contrast_on(t.bg) if fitted else _WHITE
+    off = 0 if fitted else 3
 
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -600,14 +794,19 @@ def _presenter_overlay(*, t: _Theme, logo: bytes | None,
         lines = _wrap(draw, cap, cap_font, int(inner * 0.62))[:3]
         line_h = int(cap_px * 1.14)
         y = int(h * 0.70) - len(lines) * line_h
+        if panel_top is not None:
+            y = max(y, panel_top + px(24))
         bottom = _shadow_block(draw, lines, cap_font, y=y, line_h=line_h, w=w,
-                               align="left", left=margin, inner=inner)
+                               align="left", left=margin, inner=inner,
+                               fill=fill, off=off)
         draw.rectangle([margin, bottom + px(14), margin + px(120),
                         bottom + px(24)], fill=t.accent)
 
     foot = _font(_BOLD, px(26))
-    draw.text((margin + 2, h - margin + 2), t.sign_off, font=foot, fill=_SHADOW)
-    draw.text((margin, h - margin), t.sign_off, font=foot, fill=_WHITE)
+    if off:
+        draw.text((margin + 2, h - margin + 2), t.sign_off, font=foot,
+                  fill=_SHADOW)
+    draw.text((margin, h - margin), t.sign_off, font=foot, fill=fill)
     return img
 
 
@@ -616,7 +815,8 @@ def _presenter_full(ffmpeg: str, avatar: Path, branding: Path, dur: float,
     """Avatar fills the 9:16 frame (cover-fit) with branding composited on top.
     Output is SILENT (audio is muxed separately)."""
     w, h = profile.size
-    fc = (f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,"
+    fc = (f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase"
+          f":flags=lanczos,"
           f"crop={w}:{h},fps={profile.fps},setsar=1[bg];"
           f"[bg][1:v]overlay=0:0,format=yuv420p[v]")
     _run(ffmpeg, ["-i", str(avatar), "-loop", "1", "-i", str(branding),
@@ -651,12 +851,15 @@ def _presenter_broll(scenes: list[dict], dur: float, *, settings, t: _Theme,
         first = next((b for b in imgs if b), None)
         imgs = [b or first for b in imgs]
 
-    branding = _presenter_overlay(t=t, logo=logo, size=profile.size)
+    visual_style = _visual_style(settings)
+    branding = _presenter_overlay(t=t, logo=logo, size=profile.size,
+                                  visual_style=visual_style)
     txp = work / "broll_brand.png"
     branding.save(txp, format="PNG")
     segs: list[Path] = []
     for i, s in enumerate(scenes):
-        bg_img = _scene_bg(imgs[i], t, bg_size)
+        zoom = 1 + _kb_amount(i) if profile.kenburns else 1.0
+        bg_img = _scene_bg(imgs[i], t, bg_size, style=visual_style, zoom=zoom)
         bgp = work / f"broll_bg_{i:02d}.png"
         bg_img.save(bgp, format="PNG")
         seg = work / f"broll_{i:02d}.mp4"
@@ -855,6 +1058,8 @@ def render_reel(content: ReelContent, *, settings: PostSettings,
         voice_durs = [x[2] for x in kept]
         scene_words = [x[3] for x in kept]
 
+        visual_style = _visual_style(tts_settings)
+
         # caption style: 'karaoke' burns word-timed subtitles (only when the TTS
         # gave word timing), else a static style (lower_third / centered / boxed).
         caption_style = (getattr(tts_settings, "reel_caption_style", "karaoke")
@@ -877,11 +1082,14 @@ def render_reel(content: ReelContent, *, settings: PostSettings,
         total_n = len(scenes)
 
         # per-scene STOCK VIDEO clip (real footage). Scenes without a clip fall
-        # back to a photo Ken-Burns still, then to a themed colour.
+        # back to a photo Ken-Burns still, then to a themed colour. The scene
+        # duration rides along so clips long enough to play through rank first
+        # (a looped clip restarts with a visible jump cut mid-scene).
         vids: list[bytes | None] = [None] * len(scenes)
         if use_video:
             vids = [video.fetch_scene_video(s["image_query"],
-                                            settings=tts_settings, variant=i)
+                                            settings=tts_settings, variant=i,
+                                            min_seconds=durations[i])
                     for i, s in enumerate(scenes)]
 
         # photos only for the scenes that didn't get a clip; reuse the first hit
@@ -906,19 +1114,26 @@ def render_reel(content: ReelContent, *, settings: PostSettings,
                 kind=s["kind"], heading=s["heading"], bullets=s["bullets"],
                 source_label=content.source_label, sign_off=t.sign_off,
                 index=i, total=total_n, t=t, logo=logo, size=profile.size,
-                show_caption=not karaoke, caption_style=static_style)
+                show_caption=not karaoke, caption_style=static_style,
+                visual_style=visual_style)
             seg = work / f"seg_{i:02d}.mp4"
             if vids[i - 1]:                       # stock video b-roll scene
                 clip = work / f"clip_{i:02d}.mp4"
                 clip.write_bytes(vids[i - 1])
-                overlay = Image.alpha_composite(_scrim_overlay(profile.size),
-                                                txt_img)
+                if visual_style == "fitted":      # text on solid — no scrim
+                    overlay = txt_img
+                else:
+                    overlay = Image.alpha_composite(
+                        _scrim_overlay(profile.size), txt_img)
                 ovp = work / f"ov_{i:02d}.png"
                 overlay.save(ovp, format="PNG")
                 _render_video_segment(ffmpeg, clip, ovp, durations[i - 1],
-                                      profile, seg)
+                                      profile, seg, style=visual_style,
+                                      bg_rgb=t.bg)
             else:                                 # photo / themed-colour scene
-                bg_img = _scene_bg(imgs[i - 1], t, bg_size)
+                zoom = 1 + _kb_amount(i - 1) if profile.kenburns else 1.0
+                bg_img = _scene_bg(imgs[i - 1], t, bg_size,
+                                   style=visual_style, zoom=zoom)
                 bgp = work / f"bg_{i:02d}.png"
                 txp = work / f"tx_{i:02d}.png"
                 bg_img.save(bgp, format="PNG")
@@ -934,7 +1149,9 @@ def render_reel(content: ReelContent, *, settings: PostSettings,
         # 2b. burn word-timed karaoke captions (synced to the narration)
         rendered = silent
         if karaoke:
-            ass_text = _build_ass(scenes, voice_durs, scene_words, profile.size)
+            ass_text = _build_ass(scenes, voice_durs, scene_words,
+                                  profile.size, t=t,
+                                  visual_style=visual_style)
             if ass_text:
                 ass = work / "cap.ass"
                 ass.write_text(ass_text, encoding="utf-8")

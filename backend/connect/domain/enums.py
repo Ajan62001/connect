@@ -114,7 +114,8 @@ JOB_KINDS = (
     "content_verify",  # v20: editorial verification gate (S2)
     "content_correction", "source_recheck",  # v21: corrections (S3)
     "credibility_recompute",  # v22: dynamic source credibility (S4)
-    "integrity_eval")  # v23: production integrity live-eval (S5)
+    "integrity_eval",  # v23: production integrity live-eval (S5)
+    "reel_factory")  # v26: autonomous reel production from the feed
 JOB_STATUSES = ("queued", "running", "done", "failed", "cancelled")
 
 # --- social post card theme ------------------------------------------------
@@ -130,6 +131,15 @@ HeadlineSize = Literal["s", "m", "l"]
 HEADLINE_ALIGNS = ("left", "center")
 HeadlineAlign = Literal["left", "center"]
 
+# How a fetched photo sits on the card/reel frame: 'fitted' keeps the whole
+# image (contained on the solid theme colour, text on the solid areas);
+# 'cover' fills the frame edge-to-edge (centre-crops the sides, scrim + text
+# over the photo); 'poster' is the viral news-page look — full-bleed photo,
+# strong bottom gradient, a bold centred accent-colour caption pinned to the
+# bottom, small logo up top.
+PHOTO_STYLES = ("poster", "fitted", "cover")
+PhotoStyle = Literal["poster", "fitted", "cover"]
+
 
 # --- social content pipeline (v16) -----------------------------------------
 # A campaign turns one corpus subject into a batch of grounded social-content
@@ -138,6 +148,13 @@ HeadlineAlign = Literal["left", "center"]
 
 CONTENT_PLATFORMS = ("instagram", "x", "linkedin")
 ContentPlatform = Literal["instagram", "x", "linkedin"]
+
+# A workspace's publishing CHANNEL identity (v27). Broader than CONTENT_PLATFORMS
+# (which gates the content_item platform CHECK) because a channel can be a
+# YouTube account we publish to via Zapier today and the Data API later — the
+# channel platform is a label + routing hint, not a content_item constraint.
+CHANNEL_PLATFORMS = ("youtube", "instagram", "x", "linkedin", "other")
+ChannelPlatform = Literal["youtube", "instagram", "x", "linkedin", "other"]
 
 CONTENT_FORMATS = ("ig_card", "ig_carousel", "x_thread", "linkedin_post",
                    "ig_reel", "meme")

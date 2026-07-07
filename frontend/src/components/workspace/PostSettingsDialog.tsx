@@ -26,6 +26,7 @@ import {
   type HeadlineAlign,
   type HeadlineSize,
   type PaletteCatalog,
+  type PhotoStyle,
   type PostSettings,
   type Visibility,
 } from "@/lib/api";
@@ -325,6 +326,24 @@ export function PostSettingsDialog({
                     { value: "classic", label: "Classic" },
                     { value: "bold", label: "Bold" },
                     { value: "minimal", label: "Minimal" },
+                  ]}
+                />
+              </div>
+
+              <div className="space-y-1">
+                <Label>Photo style</Label>
+                <p className="text-xs text-muted-foreground">
+                  Poster: full-bleed photo with a bold accent caption at the
+                  bottom. Fitted keeps the whole photo on the card colour;
+                  full-bleed crops it edge-to-edge behind the text.
+                </p>
+                <Segmented<PhotoStyle>
+                  value={merged.card_photo_style ?? "poster"}
+                  onChange={(v) => set("card_photo_style", v)}
+                  options={[
+                    { value: "poster", label: "Poster" },
+                    { value: "fitted", label: "Fitted" },
+                    { value: "cover", label: "Full-bleed" },
                   ]}
                 />
               </div>

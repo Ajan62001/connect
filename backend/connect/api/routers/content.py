@@ -31,6 +31,9 @@ from connect.content.schema import (
     ContentItemPage,
     ContentSeed,
     FORMAT_SCHEMA,
+    FactoryRunPage,
+    FactoryRunRequest,
+    FactoryRunSummary,
     RerenderRequest,
     ScheduleRequest,
     VoiceOption,
@@ -46,6 +49,7 @@ from connect.storage import content_items as item_dao
 
 campaigns_router = APIRouter(prefix="/campaigns", tags=["content"])
 content_router = APIRouter(prefix="/content", tags=["content"])
+factory_router = APIRouter(prefix="/factory", tags=["content"])
 
 MAX_PAGE_SIZE = 100
 
@@ -87,7 +91,8 @@ async def create_campaign(body: CampaignCreate,
     try:
         campaign_id, job_id = await service.start(
             seed, list(body.formats), body.options, owner_id=user.id,
-            visibility=body.visibility)
+            visibility=body.visibility,
+            channel_workspace_id=body.channel_workspace_id)
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     return CampaignAccepted(campaign_id=campaign_id, job_id=job_id)
@@ -199,8 +204,10 @@ async def platform_status(container: Container = Depends(get_container),
 @content_router.get("/voices", response_model=list[VoiceOption])
 async def list_voices(container: Container = Depends(get_container),
                       user: CurrentUser = Depends(get_current_user)):
-    """ElevenLabs voices available for reel narration (empty if no key)."""
-    return tts.list_elevenlabs_voices(container.settings)
+    """Voices available for reel narration: the ElevenLabs account voices
+    (empty if no key) plus local voicebox profiles ('vb:' ids — picking one
+    switches that render to the voicebox engine)."""
+    return tts.list_voices(container.settings)
 
 
 @content_router.get("/capabilities")
@@ -460,3 +467,109 @@ def _parse_ts(value: str) -> str:
             status_code=422,
             detail="scheduled_at must be an ISO 8601 timestamp") from e
     return value
+
+
+# === the reel factory =========================================================
+
+
+@factory_router.post("/reels", response_model=JobAccepted, status_code=202)
+async def start_factory_run(body: FactoryRunRequest,
+                            container: Container = Depends(get_container),
+                            user: CurrentUser = Depends(get_current_user)):
+    """Start one factory run now: scout the feed's hottest subjects and
+    commission one reel-led campaign per pick. Returns the run's job id;
+    progress streams at /factory/runs/{job_id}/events."""
+    if body.visibility not in (None, "private", "shared"):
+        raise HTTPException(status_code=422,
+                            detail="visibility must be private or shared")
+    service = container.reel_factory
+    assert service is not None
+    if service.provider is None:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not set")
+    if container.jobs is None:
+        raise HTTPException(status_code=503,
+                            detail="background jobs are unavailable")
+    count = body.count or container.settings.reel_factory_count
+    try:
+        # the scout picker plus one reel campaign per commissioned subject
+        await container.content.governor.check(0.02 + 0.10 * count,
+                                               user_id=user.id)
+    except BudgetExceeded as e:
+        raise HTTPException(status_code=429, detail=str(e)) from e
+    job_id = await service.start(
+        owner_id=user.id, count=body.count, window_hours=body.window_hours,
+        options=body.options, visibility=body.visibility,
+        workspace_id=body.workspace_id)
+    return JobAccepted(job_id=job_id)
+
+
+@factory_router.get("/runs", response_model=FactoryRunPage)
+async def list_factory_runs(limit: int = Query(default=20, ge=1, le=50),
+                            container: Container = Depends(get_container),
+                            db: psycopg.AsyncConnection = Depends(get_db),
+                            user: CurrentUser = Depends(get_current_user)):
+    service = container.reel_factory
+    assert service is not None
+    runs = await service.list_runs(db, viewer=user.id, limit=limit)
+    return FactoryRunPage(items=[FactoryRunSummary(**r) for r in runs])
+
+
+def _factory_translate(type_: str, data: dict) -> tuple[str, dict] | None:
+    if type_ == "started":
+        return None
+    if type_ == "cancelled":
+        return "error", {"message": "factory run cancelled"}
+    if type_ == "error":
+        return "error", {"message": (data.get("message") or data.get("error")
+                                     or "factory run failed")}
+    return type_, data
+
+
+async def _visible_factory_run(db: psycopg.AsyncConnection, job_id: int,
+                               user: CurrentUser) -> dict:
+    """The run's job row, 404 when absent or when it is a PRIVATE run owned
+    by someone else (its events name subjects/campaigns the campaign API
+    would hide from this viewer)."""
+    cur = await db.execute(
+        "SELECT id, owner_id, status FROM job WHERE id = %s"
+        " AND kind = 'reel_factory'"
+        " AND (owner_id = %s OR COALESCE(payload->>'visibility', 'shared')"
+        " <> 'private')", (job_id, user.id))
+    row = await cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="factory run not found")
+    return row
+
+
+@factory_router.get("/runs/{job_id}/events")
+async def factory_run_events(job_id: int, request: Request,
+                             after: int = Query(default=0, ge=0),
+                             container: Container = Depends(get_container),
+                             db: psycopg.AsyncConnection = Depends(get_db),
+                             user: CurrentUser = Depends(get_current_user)):
+    await _visible_factory_run(db, job_id, user)
+    last_event_id = request.headers.get("last-event-id")
+    if last_event_id and last_event_id.isdigit():
+        after = max(after, int(last_event_id))
+    return EventSourceResponse(
+        job_event_stream(request, container, job_id, after,
+                         _factory_translate))
+
+
+@factory_router.post("/runs/{job_id}/cancel", response_model=JobAccepted,
+                     status_code=202)
+async def cancel_factory_run(job_id: int,
+                             container: Container = Depends(get_container),
+                             db: psycopg.AsyncConnection = Depends(get_db),
+                             user: CurrentUser = Depends(get_current_user)):
+    """Cancel a live run (owner or admin). Campaigns it already commissioned
+    keep generating — cancel those individually."""
+    row = await _visible_factory_run(db, job_id, user)
+    if row["owner_id"] != user.id and user.role != "admin":
+        raise HTTPException(status_code=403,
+                            detail="only the owner (or an admin) may cancel")
+    if container.jobs is None:
+        raise HTTPException(status_code=503,
+                            detail="background jobs are unavailable")
+    await container.jobs.request_cancel(job_id)
+    return JobAccepted(job_id=job_id)

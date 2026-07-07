@@ -19,6 +19,10 @@ import type {
   AdminSettingsUpdate,
   AdminUserUpdate,
   AnalysisCreate,
+  CharacterInput,
+  ChannelSettings,
+  ScriptPresetInput,
+  WorkspaceChannelUpdate,
   AnalysisDetail,
   AnalysisEvent,
   AnalysisListParams,
@@ -118,6 +122,14 @@ export const queryKeys = {
   adminInvites: ["admin", "invites"] as const,
   adminSettings: ["admin", "settings"] as const,
   adminSpend: (days: number) => ["admin", "spend", days] as const,
+  // channel console (v27)
+  voices: ["voices"] as const,
+  voiceboxProfiles: ["voicebox", "profiles"] as const,
+  voiceboxCatalog: (engine: string) => ["voicebox", "catalog", engine] as const,
+  characters: ["characters"] as const,
+  scriptPresets: ["script-presets"] as const,
+  channelSettings: ["channel-settings"] as const,
+  workspaceChannel: (id: number) => ["workspaces", "channel", id] as const,
 };
 
 // --------------------------------------------------------------------------
@@ -1993,5 +2005,131 @@ export function useAdminSpend(days = 7) {
     queryFn: () => api.getAdminSpend(days),
     refetchInterval: 60_000,
     retry: false,
+  });
+}
+
+// --- channel console (v27) ---------------------------------------------------
+
+export function useVoices() {
+  return useQuery({ queryKey: queryKeys.voices, queryFn: api.getVoices, staleTime: Infinity });
+}
+
+export function useVoiceboxProfiles() {
+  return useQuery({ queryKey: queryKeys.voiceboxProfiles, queryFn: api.getVoiceboxProfiles });
+}
+
+export function useVoiceboxCatalog(engine = "kokoro") {
+  return useQuery({
+    queryKey: queryKeys.voiceboxCatalog(engine),
+    queryFn: () => api.getVoiceboxCatalog(engine),
+    staleTime: Infinity,
+  });
+}
+
+export function useAddVoiceboxProfile() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: Record<string, unknown>) => api.addVoiceboxProfile(body),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.voiceboxProfiles });
+      void qc.invalidateQueries({ queryKey: queryKeys.voices });
+    },
+  });
+}
+
+export function useDeleteVoiceboxProfile() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.deleteVoiceboxProfile(id),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.voiceboxProfiles });
+      void qc.invalidateQueries({ queryKey: queryKeys.voices });
+    },
+  });
+}
+
+export function useCharacters() {
+  return useQuery({ queryKey: queryKeys.characters, queryFn: api.listCharacters });
+}
+
+export function useCreateCharacter() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: CharacterInput) => api.createCharacter(body),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: queryKeys.characters }),
+  });
+}
+
+export function useUpdateCharacter() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, body }: { id: number; body: Partial<CharacterInput> }) =>
+      api.updateCharacter(id, body),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: queryKeys.characters }),
+  });
+}
+
+export function useDeleteCharacter() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.deleteCharacter(id),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: queryKeys.characters }),
+  });
+}
+
+export function useScriptPresets() {
+  return useQuery({ queryKey: queryKeys.scriptPresets, queryFn: api.listScriptPresets });
+}
+
+export function useCreateScriptPreset() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ScriptPresetInput) => api.createScriptPreset(body),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: queryKeys.scriptPresets }),
+  });
+}
+
+export function useUpdateScriptPreset() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, body }: { id: string; body: Partial<ScriptPresetInput> }) =>
+      api.updateScriptPreset(id, body),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: queryKeys.scriptPresets }),
+  });
+}
+
+export function useDeleteScriptPreset() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.deleteScriptPreset(id),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: queryKeys.scriptPresets }),
+  });
+}
+
+export function useChannelSettings() {
+  return useQuery({ queryKey: queryKeys.channelSettings, queryFn: api.getChannelSettings });
+}
+
+export function useUpdateChannelSettings() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: Partial<ChannelSettings>) => api.updateChannelSettings(body),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: queryKeys.channelSettings }),
+  });
+}
+
+export function useWorkspaceChannel(id: number) {
+  return useQuery({
+    queryKey: queryKeys.workspaceChannel(id),
+    queryFn: () => api.getWorkspaceChannel(id),
+    enabled: Number.isFinite(id),
+  });
+}
+
+export function useUpdateWorkspaceChannel(id: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: WorkspaceChannelUpdate) => api.updateWorkspaceChannel(id, body),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: queryKeys.workspaceChannel(id) }),
   });
 }

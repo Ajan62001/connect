@@ -21,14 +21,17 @@ def is_configured(settings) -> bool:
     return bool(getattr(settings, "zapier_webhook_url", None))
 
 
-async def publish(settings, *, payload: dict[str, Any]) -> dict:
-    """POST ``payload`` to the configured Zapier Catch Hook. Returns a publish
-    ref ({media_id, permalink, via}); raises NotConnected when unset."""
-    url = getattr(settings, "zapier_webhook_url", None)
+async def publish(settings, *, payload: dict[str, Any],
+                  url_override: str | None = None) -> dict:
+    """POST ``payload`` to a Zapier Catch Hook. ``url_override`` (a workspace
+    channel's own webhook) wins over the global ``CONNECT_ZAPIER_WEBHOOK_URL``,
+    so each channel can fan out to its own Zap. Returns a publish ref
+    ({media_id, permalink, via}); raises NotConnected when neither is set."""
+    url = url_override or getattr(settings, "zapier_webhook_url", None)
     if not url:
         raise NotConnected(
             "Zapier is not connected (set CONNECT_ZAPIER_WEBHOOK_URL to a"
-            " Zapier 'Catch Hook' URL)")
+            " Zapier 'Catch Hook' URL, or a per-workspace channel webhook)")
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(url, json=payload)
         resp.raise_for_status()

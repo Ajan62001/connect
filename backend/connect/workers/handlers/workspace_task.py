@@ -16,6 +16,8 @@ from typing import Any
 from connect.agents.workspace_agent import run_workspace_agent
 from connect.orchestration import events
 from connect.social import settings as post_settings
+from connect.storage import characters as character_dao
+from connect.storage import workspace_channels as channel_dao
 from connect.storage import workspace_chats as chat_dao
 from connect.storage import workspaces as workspace_dao
 from connect.workers.registry import WorkerContext, register
@@ -42,6 +44,10 @@ async def run_workspace_task(ctx: WorkerContext,
     wire = list(chat["messages"] or [])
     transcript = list(chat["transcript"] or [])
     settings = await post_settings.effective(ctx.conn, ws)
+    channel = await channel_dao.get_raw(ctx.conn, workspace_id)
+    char_id = channel.get("default_character_id") if channel else None
+    character = (await character_dao.get(ctx.conn, char_id)
+                 if char_id else None)
 
     n = 0
 
@@ -61,7 +67,7 @@ async def run_workspace_task(ctx: WorkerContext,
         embedder=services.embedder, vectors=services.vectors,
         workspace=ws, viewer=owner_id, messages=wire,
         card_store=services.card_store, logo_store=services.logo_store,
-        post_settings=settings,
+        post_settings=settings, character=character,
         on_turn=on_turn, should_cancel=ctx.cancel.cancelled, mode="deep")
 
     transcript.append(chat_dao.turn_dict(

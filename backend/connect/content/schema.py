@@ -69,8 +69,22 @@ class ContentOptions(_Frozen):
     caption_style: str | None = None     # on-screen captions: 'karaoke' |
                                          # 'lower_third' | 'centered' | 'boxed'
                                          # (None => server default)
+    visual_style: str | None = None      # scene media treatment: 'fitted'
+                                         # (whole image on the solid theme
+                                         # colour) | 'poster' (full-bleed +
+                                         # bottom accent caption) | 'cover'
+                                         # (full-bleed crop)
+                                         # (None => server default)
     video: bool | None = None            # stock VIDEO b-roll on/off (None =>
                                          # server default; needs a Pexels key)
+    character_id: int | None = None      # persona to write/narrate as (None =>
+                                         # channel/global default)
+    script_type: str | None = None       # builtin slug or 'custom:<id>' (None
+                                         # => channel/global default)
+    editor: bool = True                  # run the reel script editor (a
+                                         # bounded critique->revise loop)
+                                         # before render; also gated by the
+                                         # server's reel_editor_enabled
 
 
 # -- per-format LLM output schemas ---------------------------------------------
@@ -278,6 +292,10 @@ class CampaignCreate(BaseModel):
     topic: str | None = Field(default=None, max_length=400)
     since: str | None = None
     until: str | None = None
+    # the channel-of-record when the SUBJECT isn't a workspace (a topic/story
+    # campaign that should still publish as, and inherit the defaults of, a
+    # given workspace channel). Orthogonal to the seed's workspace_id.
+    channel_workspace_id: int | None = None
     formats: list[ContentFormat] = Field(default_factory=list)
     options: ContentOptions = ContentOptions()
     visibility: str | None = None
@@ -287,6 +305,12 @@ class CampaignCreate(BaseModel):
         bad = [f for f in self.formats if f not in CONTENT_FORMATS]
         if bad:
             raise ValueError(f"unknown format(s): {bad}")
+        if (self.workspace_id is not None
+                and self.channel_workspace_id is not None
+                and self.workspace_id != self.channel_workspace_id):
+            raise ValueError(
+                "channel_workspace_id must match the seed workspace_id"
+                " when both are set")
         return self
 
 
@@ -377,3 +401,35 @@ class RerenderRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     content: dict[str, Any] | None = None
     options: ContentOptions = ContentOptions()
+
+
+# -- the reel factory ------------------------------------------------------
+
+
+class FactoryRunRequest(BaseModel):
+    """POST /api/factory/reels — start one production run now. Omitted
+    fields fall back to the server's reel_factory_* settings."""
+    model_config = ConfigDict(extra="forbid")
+    count: int | None = Field(default=None, ge=1, le=8)
+    window_hours: int | None = Field(default=None, ge=1, le=168)
+    options: ContentOptions = ContentOptions()
+    visibility: str | None = None
+    workspace_id: int | None = None   # scope the scout + bind the channel
+
+
+class FactoryRunSummary(_Frozen):
+    """One past/running factory run, reconstructed from its job row + the
+    events it emitted (scouted / assignment / campaign_created)."""
+    job_id: int
+    status: str
+    created_at: str
+    finished_at: str | None = None
+    error: str | None = None
+    result: str | None = None
+    candidates: int = 0
+    assignments: list[dict[str, Any]] = Field(default_factory=list)
+    campaigns: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class FactoryRunPage(_Frozen):
+    items: list[FactoryRunSummary] = Field(default_factory=list)

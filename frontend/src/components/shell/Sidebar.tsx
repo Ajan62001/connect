@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import {
   BookOpenIcon,
   DatabaseIcon,
+  DramaIcon,
   EyeIcon,
   FilmIcon,
   FlaskConicalIcon,
@@ -33,6 +34,7 @@ const NAV_ITEMS = [
   { href: "/investigations", label: "Investigations", icon: TelescopeIcon },
   { href: "/stories", label: "Stories", icon: BookOpenIcon },
   { href: "/content", label: "Content", icon: FilmIcon },
+  { href: "/characters", label: "Characters", icon: DramaIcon },
   { href: "/findings", label: "Findings", icon: NotebookPenIcon },
   { href: "/community", label: "Community", icon: UsersIcon },
   { href: "/contradictions", label: "Contradictions", icon: ScaleIcon },

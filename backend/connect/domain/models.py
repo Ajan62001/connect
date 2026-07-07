@@ -16,12 +16,14 @@ from connect.domain.enums import (
     BriefObjectType,
     BriefSection,
     CardTemplate,
+    ChannelPlatform,
     DocumentOrigin,
     EnrichmentStatus,
     HeadlineAlign,
     HeadlineSize,
     LinkStatus,
     MediaType,
+    PhotoStyle,
     PositionShiftStatus,
     Role,
     SourceType,
@@ -582,6 +584,11 @@ class PostSettings(_Frozen):
     card_accent: str = Field(default="#38bdf8", pattern=_HEX)
     # card look — layout
     card_template: CardTemplate = "classic"
+    # how a fetched photo sits on the card: 'poster' (default) is the viral
+    # news-page look — full-bleed photo, bottom gradient, bold centred
+    # accent-colour caption; 'fitted' keeps the whole image on the solid theme
+    # colour (never crops the sides); 'cover' is the legacy scrimmed crop.
+    card_photo_style: PhotoStyle = "poster"
     headline_size: HeadlineSize = "m"
     headline_align: HeadlineAlign = "left"
     sign_off: str = "via connect"
@@ -607,6 +614,7 @@ class PostSettingsUpdate(_Frozen):
     card_muted: str | None = Field(default=None, pattern=_HEX)
     card_accent: str | None = Field(default=None, pattern=_HEX)
     card_template: CardTemplate | None = None
+    card_photo_style: PhotoStyle | None = None
     headline_size: HeadlineSize | None = None
     headline_align: HeadlineAlign | None = None
     sign_off: str | None = None
@@ -959,6 +967,96 @@ class WorkspaceUpdate(_Frozen):
     query_fts: str | None = None
     visibility: Visibility | None = None
     post_settings: dict[str, Any] | None = None
+
+
+# --- characters + channel bindings (v27) --------------------------------------
+# A CHARACTER is the persona a reel/post is written and narrated as. The text
+# fields ride into generation prompts verbatim (framing-only, like
+# ContentOptions.style), so the length caps double as prompt-injection bounds.
+
+class Character(_Frozen):
+    id: int
+    name: str
+    description: str = ""            # personality
+    speaking_style: str = ""         # how they talk — shapes the script voice
+    sample_line: str = ""            # an audition line (voice + character preview)
+    voice_id: str | None = None      # 'vb:<profile>' or an ElevenLabs voice id
+    heygen_avatar_id: str | None = None
+    catchphrases: list[str] = Field(default_factory=list)
+    sign_off: str = ""
+    avatar_sha: str | None = None
+    owner_id: int | None = None
+    created_at: str
+    updated_at: str | None = None
+
+
+class CharacterCreate(_Frozen):
+    name: str = Field(min_length=1, max_length=80)
+    description: str = Field(default="", max_length=500)
+    speaking_style: str = Field(default="", max_length=500)
+    sample_line: str = Field(default="", max_length=200)
+    voice_id: str | None = None
+    heygen_avatar_id: str | None = None
+    catchphrases: list[str] = Field(default_factory=list, max_length=8)
+    sign_off: str = Field(default="", max_length=120)
+    avatar_sha: str | None = None
+
+
+class CharacterUpdate(_Frozen):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    description: str | None = Field(default=None, max_length=500)
+    speaking_style: str | None = Field(default=None, max_length=500)
+    sample_line: str | None = Field(default=None, max_length=200)
+    voice_id: str | None = None
+    heygen_avatar_id: str | None = None
+    catchphrases: list[str] | None = Field(default=None, max_length=8)
+    sign_off: str | None = Field(default=None, max_length=120)
+    avatar_sha: str | None = None
+
+
+class WorkspaceChannel(_Frozen):
+    """A workspace's publishing channel: the account it acts as plus its default
+    voice / character / script-type. ``zapier_webhook_url`` and future creds are
+    owner-only (masked/omitted for other viewers by the router)."""
+    workspace_id: int
+    platform: ChannelPlatform = "youtube"
+    channel_name: str = ""
+    channel_handle: str = ""
+    external_id: str | None = None
+    zapier_webhook_url: str | None = None
+    webhook_set: bool = False        # set even when the URL is masked out
+    default_voice_id: str | None = None
+    default_character_id: int | None = None
+    default_script_type: str | None = None
+    has_credentials: bool = False    # reserved: future YouTube OAuth
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class WorkspaceChannelUpdate(_Frozen):
+    platform: ChannelPlatform | None = None
+    channel_name: str | None = Field(default=None, max_length=200)
+    channel_handle: str | None = Field(default=None, max_length=120)
+    external_id: str | None = Field(default=None, max_length=200)
+    zapier_webhook_url: str | None = Field(default=None, max_length=600)
+    default_voice_id: str | None = Field(default=None, max_length=200)
+    default_character_id: int | None = None
+    default_script_type: str | None = Field(default=None, max_length=120)
+
+
+class ChannelSettings(_Frozen):
+    """Global channel defaults (app_setting 'channel_settings'), the floor under
+    per-workspace channel bindings — mirrors PostSettings' global/workspace
+    layering but for voice/character/script rather than card look."""
+    default_voice_id: str | None = None
+    default_character_id: int | None = None
+    default_script_type: str | None = None
+
+
+class ChannelSettingsUpdate(_Frozen):
+    default_voice_id: str | None = Field(default=None, max_length=200)
+    default_character_id: int | None = None
+    default_script_type: str | None = Field(default=None, max_length=120)
 
 
 # --- workspace agent (chat) ----------------------------------------------------

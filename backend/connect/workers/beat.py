@@ -17,6 +17,9 @@ over within ``retry_s``). Beat only ENQUEUES, never works:
 | due content   | 'content_publish' per scheduled content_item whose      |
 |               | scheduled_at has passed (the partial unique index       |
 |               | dedups a re-enqueue while the publish job runs).        |
+| reel factory  | one 'reel_factory' run per UTC day at                   |
+|               | reel_factory_utc_hour when reel_factory_enabled          |
+|               | (guarded by a beat_run row, owned by the first admin).  |
 """
 
 from __future__ import annotations
@@ -103,7 +106,7 @@ async def tick(services: Any) -> dict[str, int]:
     counts = {"requeued": 0, "orphan_failed": 0, "polls": 0,
               "nightly": 0, "briefs": 0, "publishes": 0,
               "corrections": 0, "rechecks": 0, "credibility": 0,
-              "integrity_eval": 0}
+              "integrity_eval": 0, "reel_factory": 0}
     async with services.pool.connection() as conn:
         # 1. orphan sweep — replaces v0.1's startup reconcile_orphans
         requeued, failed = await job_dao.reclaim_stale(
@@ -180,6 +183,25 @@ async def tick(services: Any) -> dict[str, int]:
                               settings.nightly_sweep_utc_hour):
             await services.jobs.enqueue("integrity_eval", {})
             counts["integrity_eval"] = 1
+
+        # 10. the reel factory (v26): one production run per UTC day at its
+        # own hour (default 01 UTC — early-morning IST, so reels are in the
+        # review queue by breakfast). Owned by the first enabled admin; a
+        # deployment with no admin logs and skips rather than half-runs.
+        if (settings.reel_factory_enabled
+                and getattr(services, "reel_factory", None) is not None
+                and await _nightly_due(conn, "reel_factory",
+                                       settings.reel_factory_utc_hour)):
+            cur = await conn.execute(
+                "SELECT id FROM app_user WHERE NOT disabled"
+                " AND role = 'admin' ORDER BY id LIMIT 1")
+            row = await cur.fetchone()
+            if row is None:
+                log.warning("beat: reel factory enabled but no admin user"
+                            " to own the run; skipping")
+            else:
+                await services.reel_factory.start(owner_id=int(row["id"]))
+                counts["reel_factory"] = 1
     return counts
 
 

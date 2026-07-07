@@ -21,6 +21,7 @@ from connect.analysis.budget import AnalysisBudget
 from connect.content import gate as gate_mod
 from connect.content import publish as publish_mod
 from connect.integrity import observe as integrity_observe
+from connect.content import channel as channel_mod
 from connect.content.factset import resolve_content_factset
 from connect.content.generate import FormatResult, generate_format
 from connect.content.render import render_carousel, render_meme
@@ -29,7 +30,7 @@ from connect.content import plan as plan_mod
 from connect.content import reel as reel_render
 from connect.content import video as video_mod
 from connect.content.schema import ContentOptions, ContentSeed, FORMAT_SCHEMA
-from connect.social import palettes
+from connect.social import palettes, tts
 from connect.llm.provider import LLMError, LLMProvider
 from connect.llm.spend import Governor
 from connect.orchestration import events
@@ -38,6 +39,8 @@ from connect.social.card import render_card
 from connect.storage import campaigns as campaign_dao
 from connect.storage import content_items as item_dao
 from connect.storage import content_sources
+from connect.storage import workspace_channels
+from connect.storage import workspaces as workspace_dao
 from connect.storage.pg import utc_now
 from connect.workers.queue import JobQueue
 from connect.workers.registry import CancelToken
@@ -68,10 +71,18 @@ class ContentService:
 
     async def start(self, seed: ContentSeed, formats: list[str],
                     options: ContentOptions | None = None, *, owner_id: int,
-                    visibility: str | None = None) -> tuple[int, int]:
+                    visibility: str | None = None,
+                    channel_workspace_id: int | None = None) -> tuple[int, int]:
         """Create the campaign + enqueue its generation job. Raises LookupError
-        when the source row is missing or not visible to the owner."""
+        when the source row is missing or not visible to the owner.
+
+        ``channel_workspace_id`` binds a channel-of-record to a campaign whose
+        SUBJECT isn't a workspace (a topic/story campaign that should still
+        publish as, and inherit the voice/character/preset of, that workspace)."""
         opts = options or ContentOptions()
+        # the channel-of-record: the seed's workspace subject, else the explicit
+        # channel binding (a topic/factory campaign publishing to a channel)
+        workspace_id = seed.workspace_id or channel_workspace_id
         async with self.pool.connection() as conn:
             subject, input_type = await self._resolve_subject(
                 conn, seed, viewer=owner_id)
@@ -79,7 +90,7 @@ class ContentService:
                 conn, owner_id=owner_id, subject=subject,
                 input_type=input_type, seed=seed.model_dump(),
                 formats=list(formats), options=opts.model_dump(),
-                visibility=visibility or "shared")
+                visibility=visibility or "shared", workspace_id=workspace_id)
         job_id = await self.jobs.enqueue(
             "content_generate",
             {"campaign_id": campaign_id, "seed": seed.model_dump(),
@@ -163,8 +174,8 @@ class ContentService:
             return await events.emit(conn, job_id, type_, data)
 
         cur = await conn.execute(
-            "SELECT owner_id, visibility FROM campaign WHERE id = %s",
-            (campaign_id,))
+            "SELECT owner_id, visibility, workspace_id FROM campaign"
+            " WHERE id = %s", (campaign_id,))
         crow = await cur.fetchone()
         if crow is None:
             # the campaign was deleted (e.g. cancelled+removed) before the job
@@ -174,7 +185,17 @@ class ContentService:
         await campaign_dao.set_status(conn, campaign_id, "running",
                                       started=True)
         budget = AnalysisBudget(self.budget_usd)
-        eff = await post_settings.get_global(conn)
+        # resolve the channel context (effective card settings + persona +
+        # script preset + voice) from the campaign's channel-of-record
+        # workspace — this is where a workspace's identity finally shapes
+        # generation (previously the pipeline used only the GLOBAL settings).
+        ws = (await workspace_dao.get(conn, crow["workspace_id"],
+                                      viewer=owner_id)
+              if crow["workspace_id"] else None)
+        ctx = await channel_mod.resolve_channel_context(
+            conn, workspace=ws, options=opts)
+        eff, opts = ctx.post, ctx.options
+        style_ctx = channel_mod.style_context(ctx)
         made: list[int] = []
         try:
             if cancel is not None:
@@ -216,6 +237,10 @@ class ContentService:
                 if pick is not None and fmt == "ig_reel" and opts.video is None:
                     fmt_opts = opts.model_copy(
                         update={"video": pick.media == "stock_video"})
+                editor_passes = 2 if (
+                    fmt == "ig_reel" and fmt_opts.editor
+                    and getattr(self.settings, "reel_editor_enabled", True)
+                ) else 0
                 result = await generate_format(
                     conn, self.provider, fmt=fmt, factset=factset,
                     options=fmt_opts, settings=eff, budget=budget,
@@ -223,11 +248,14 @@ class ContentService:
                     media_hint=(pick.media_query or None)
                     if pick and pick.media != "none" else None,
                     angle=(plan.angle or None) if plan else None,
-                    pick_reason=(pick.reason or None) if pick else None)
+                    pick_reason=(pick.reason or None) if pick else None,
+                    editor_passes=editor_passes,
+                    style_context=style_ctx)
                 if pick is not None and pick.media == "none":
                     result.content = _strip_image_queries(result.content)
                 card_shas = await self._render(result, eff, topic=seed.topic,
-                                               options=fmt_opts)
+                                               options=fmt_opts,
+                                               character=ctx.character)
                 item_id = await item_dao.insert(
                     conn, campaign_id=campaign_id, owner_id=owner_id,
                     platform=result.platform, format=fmt,
@@ -250,15 +278,26 @@ class ContentService:
                                       finished=True)
         return f"{len(made)} items"
 
-    def _render_settings(self, options: Any) -> Any:
+    def _render_settings(self, options: Any, *, character: Any = None) -> Any:
         """Per-reel render settings: the global settings with the campaign's
         reel controls (voice / engine / music) overlaid. Returns the global
-        settings unchanged when there are no overrides."""
-        if options is None:
+        settings unchanged when there are no overrides. ``character`` supplies a
+        HeyGen avatar override for presenter reels when one is bound."""
+        if options is None and character is None:
             return self.settings
+        options = options if options is not None else ContentOptions()
         upd: dict[str, Any] = {}
-        if getattr(options, "voice_id", None):
-            upd["elevenlabs_voice_id"] = options.voice_id
+        voice_id = getattr(options, "voice_id", None)
+        if voice_id:
+            # a voice pick implies its engine: 'vb:<profile>' is a local
+            # voicebox profile, anything else an ElevenLabs voice
+            if voice_id.startswith(tts.VOICEBOX_PREFIX):
+                upd["voicebox_profile_id"] = \
+                    voice_id[len(tts.VOICEBOX_PREFIX):]
+                upd["reel_tts_engine"] = "voicebox"
+            else:
+                upd["elevenlabs_voice_id"] = voice_id
+                upd["reel_tts_engine"] = "elevenlabs"
         if getattr(options, "tts_engine", None):
             upd["reel_tts_engine"] = options.tts_engine
         if getattr(options, "music_volume", None) is not None:
@@ -268,8 +307,14 @@ class ContentService:
         if getattr(options, "presenter", False):
             cur = getattr(self.settings, "reel_presenter", "off") or "off"
             upd["reel_presenter"] = cur if cur != "off" else "pip"
+            # the bound character's own avatar fronts the presenter reel
+            if character is not None and getattr(
+                    character, "heygen_avatar_id", None):
+                upd["heygen_avatar_id"] = character.heygen_avatar_id
         if getattr(options, "caption_style", None):
             upd["reel_caption_style"] = options.caption_style
+        if getattr(options, "visual_style", None):
+            upd["reel_visual_style"] = options.visual_style
         if getattr(options, "video", None) is not None:
             upd["reel_use_video"] = options.video
         if not upd:
@@ -292,7 +337,8 @@ class ContentService:
             return None
 
     async def _render(self, result: FormatResult, eff: Any, *,
-                      topic: str | None = None, options: Any = None) -> list[str]:
+                      topic: str | None = None, options: Any = None,
+                      character: Any = None) -> list[str]:
         """Render image cards (ig_card / ig_carousel / meme) and store them;
         text formats have no cards. Rendering is CPU-bound -> a worker thread.
         When auto-theming is on, the card palette is resolved per item from the
@@ -331,7 +377,8 @@ class ContentService:
             # controls are applied via the effective render settings.
             mp4 = await asyncio.to_thread(
                 reel_render.render_reel, result.content, settings=themed,
-                logo=logo, tts_settings=self._render_settings(options))
+                logo=logo, tts_settings=self._render_settings(
+                    options, character=character))
             rel = self.reel_store.put(mp4)
             return [rel.rsplit("/", 1)[-1]]
         else:
@@ -428,9 +475,15 @@ class ContentService:
 
         try:
             if target == "zapier":
+                # route through the campaign's workspace-channel webhook (with
+                # its channel identity block) when bound; else the global hook
+                channel = await workspace_channels.for_campaign(
+                    conn, row["campaign_id"])
                 ref = await publish_mod.publish_via_zapier(
                     s, fmt=fmt, content=content, card_urls=card_urls,
-                    item_id=item_id)
+                    item_id=item_id, channel=channel,
+                    url_override=channel.get("zapier_webhook_url")
+                    if channel else None)
             else:
                 ref = await publish_mod.publish_item(
                     s, fmt=fmt, content=content, card_urls=card_urls)
@@ -455,12 +508,32 @@ class ContentService:
             return "gone"
         if item.format not in ("ig_card", "ig_carousel", "ig_reel", "meme"):
             return "no media"
+        # inherit the campaign's stored render choices for any knob the
+        # request leaves unset — a script-edit re-render must not silently
+        # restyle the reel (visuals/captions/voice falling back to server
+        # defaults would redesign an already-reviewed item)
+        stored = await campaign_dao.options_for(conn, item.campaign_id)
+        inherit = {k: v for k, v in stored.items()
+                   if k in ("visual_style", "caption_style", "voice_id",
+                            "tts_engine", "music_volume", "video",
+                            "character_id", "script_type")
+                   and v is not None and getattr(options, k, None) is None}
+        if inherit:
+            options = options.model_copy(update=inherit)
         content_obj = FORMAT_SCHEMA[item.format](**item.content)
         result = FormatResult(fmt=item.format, platform=item.platform,
                               content=content_obj, sources=[],
                               grounding=item.grounding or {})
-        eff = await post_settings.get_global(conn)
-        card_shas = await self._render(result, eff, topic=None, options=options)
+        # resolve the same channel context the original generation used, so a
+        # re-render keeps the workspace's voice/character/card settings
+        ws_id = await campaign_dao.workspace_for(conn, item.campaign_id)
+        ws = (await workspace_dao.get(conn, ws_id, viewer=owner_id)
+              if ws_id else None)
+        ctx = await channel_mod.resolve_channel_context(
+            conn, workspace=ws, options=options)
+        card_shas = await self._render(result, ctx.post, topic=None,
+                                       options=ctx.options,
+                                       character=ctx.character)
         await item_dao.set_card_shas(conn, item_id, owner_id=owner_id,
                                      card_shas=card_shas)
         return f"rendered {len(card_shas)}"

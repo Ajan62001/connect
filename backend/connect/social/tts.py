@@ -1,12 +1,17 @@
-"""Optional text-to-speech for reel narration — two engines, both optional.
+"""Optional text-to-speech for reel narration — three engines, all optional.
 
 ``synthesize_scenes`` picks an engine (``_resolve_engine``): ElevenLabs cloud
-(most natural, needs ``elevenlabs_api_key``) or local Piper (free, offline,
-needs a baked voice). 'auto' prefers ElevenLabs then Piper; ElevenLabs failures
-fall back to Piper, then to silent. TTS NEVER hard-fails reel generation — a
-silent slideshow is always a valid result.
+(most natural, needs ``elevenlabs_api_key``), a local voicebox server
+(free/offline, profile-based — its Kokoro presets include Hindi/Indian-accented
+voices; needs ``voicebox_url``), or local Piper (free, offline, needs a baked
+voice). 'auto' prefers ElevenLabs, then voicebox, then Piper; failures fall
+through the same order, then to silent. TTS NEVER hard-fails reel generation —
+a silent slideshow is always a valid result.
 
 - ElevenLabs: REST API, `xi-api-key`; per-scene mp3 normalised to wav via ffmpeg.
+- voicebox: local HTTP API — POST /generate (async) -> poll /history/{id} ->
+  GET /audio/{id}; per-scene wav normalised via ffmpeg. No word timing, so
+  karaoke captions fall back to static ones.
 - Piper: a ``<voice>.onnx`` + ``.onnx.json`` pair under
   ``settings.piper_voice_dir`` (env ``CONNECT_PIPER_VOICE_DIR``); the `piper`
   package is the optional ``[tts]`` extra, imported lazily.
@@ -120,14 +125,162 @@ def list_elevenlabs_voices(settings) -> list[dict]:
         return []
 
 
+# -- voicebox (local TTS server) ------------------------------------------------
+
+VOICEBOX_PREFIX = "vb:"                    # voice-picker ids: 'vb:<profile_id>'
+
+
+def voicebox_available(settings) -> bool:
+    return bool(getattr(settings, "voicebox_url", None))
+
+
+def _voicebox_base(settings) -> str:
+    return str(getattr(settings, "voicebox_url", "") or "").rstrip("/")
+
+
+def voicebox_profiles(settings) -> list[dict]:
+    """The server's voice profiles (uncached — the call is local and instant).
+    Empty list when unconfigured / unreachable."""
+    if not voicebox_available(settings):
+        return []
+    try:
+        import httpx
+        r = httpx.get(f"{_voicebox_base(settings)}/profiles", timeout=10.0)
+        r.raise_for_status()
+        return r.json() or []
+    except Exception as e:  # noqa: BLE001 — voices list is best-effort
+        log.info("could not list voicebox profiles: %s", e)
+        return []
+
+
+def voicebox_presets(settings, engine: str) -> list[dict]:
+    """The voicebox server's PRESET catalog for an engine (e.g. kokoro's built-in
+    voices, including Hindi ones). Empty list when unconfigured / unreachable."""
+    if not voicebox_available(settings):
+        return []
+    try:
+        import httpx
+        r = httpx.get(f"{_voicebox_base(settings)}/profiles/presets/{engine}",
+                      timeout=10.0)
+        r.raise_for_status()
+        return r.json() or []
+    except Exception as e:  # noqa: BLE001 — catalog is best-effort
+        log.info("could not list voicebox presets (%s): %s", engine, e)
+        return []
+
+
+def create_voicebox_profile(settings, body: dict) -> dict:
+    """Create a voicebox profile (e.g. from a preset). Raises on failure."""
+    import httpx
+    r = httpx.post(f"{_voicebox_base(settings)}/profiles", json=body,
+                   timeout=30.0)
+    r.raise_for_status()
+    return r.json()
+
+
+def delete_voicebox_profile(settings, profile_id: str) -> None:
+    """Delete a voicebox profile. Raises on failure."""
+    import httpx
+    r = httpx.delete(f"{_voicebox_base(settings)}/profiles/{profile_id}",
+                     timeout=15.0)
+    r.raise_for_status()
+
+
+def list_voices(settings) -> list[dict]:
+    """Everything the studio's voice picker can offer: the ElevenLabs account
+    voices plus the local voicebox profiles (ids prefixed ``vb:`` — picking one
+    switches that render to the voicebox engine)."""
+    # copy: list_elevenlabs_voices returns the cached list BY REFERENCE, so we
+    # must not append to it (that permanently grows the process cache and yields
+    # duplicate voicebox entries on every subsequent call).
+    out = list(list_elevenlabs_voices(settings))
+    for p in voicebox_profiles(settings):
+        bits = [x for x in ((p.get("language") or "").upper() or None,
+                            p.get("description")) if x]
+        out.append({"id": f"{VOICEBOX_PREFIX}{p['id']}",
+                    "name": f"{p.get('name', 'voice')} (voicebox)",
+                    "description": " · ".join(bits) or "local voicebox voice"})
+    return out
+
+
+def synthesize_sample(settings, voice_id: str,
+                      text: str) -> tuple[bytes, str] | None:
+    """Synthesize a short AUDITION clip of ``text`` in ``voice_id`` and return
+    (audio_bytes, mime), or None on failure. A 'vb:<profile>' id uses voicebox
+    (wav); anything else an ElevenLabs voice (mp3). Blocking — the router runs
+    it in a thread. Never raises."""
+    text = (text or "").strip() or "This is a sample of my voice."
+    try:
+        if voice_id.startswith(VOICEBOX_PREFIX):
+            return _voicebox_sample(settings, voice_id[len(VOICEBOX_PREFIX):],
+                                    text)
+        return _elevenlabs_sample(settings, voice_id, text)
+    except Exception as e:  # noqa: BLE001 — audition is best-effort
+        log.info("voice audition failed (%s): %s", voice_id, e)
+        return None
+
+
+def _voicebox_sample(settings, profile_id: str,
+                     text: str) -> tuple[bytes, str] | None:
+    import time
+
+    import httpx
+    if not voicebox_available(settings):
+        return None
+    base = _voicebox_base(settings)
+    budget = float(getattr(settings, "voicebox_timeout_s", 300.0) or 300.0)
+    language = getattr(settings, "voicebox_language", "en") or "en"
+    with httpx.Client(timeout=30.0) as c:
+        prof = c.get(f"{base}/profiles/{profile_id}")
+        prof.raise_for_status()
+        body = {"profile_id": profile_id, "language": language, "text": text}
+        engine = (prof.json() or {}).get("default_engine")
+        if engine:
+            body["engine"] = engine
+        r = c.post(f"{base}/generate", json=body)
+        r.raise_for_status()
+        gid = r.json()["id"]
+        status = r.json().get("status") or "generating"
+        deadline = time.monotonic() + budget
+        while status not in ("completed", "failed"):
+            if time.monotonic() > deadline:
+                return None
+            time.sleep(1.0)
+            status = (c.get(f"{base}/history/{gid}").json()
+                      .get("status") or "generating")
+        if status == "failed":
+            return None
+        audio = c.get(f"{base}/audio/{gid}")
+        audio.raise_for_status()
+        return audio.content, "audio/wav"
+
+
+def _elevenlabs_sample(settings, voice_id: str,
+                       text: str) -> tuple[bytes, str] | None:
+    import httpx
+    key = getattr(settings, "elevenlabs_api_key", None)
+    if not key:
+        return None
+    model = getattr(settings, "elevenlabs_model", "eleven_multilingual_v2")
+    r = httpx.post(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+        headers={"xi-api-key": key, "Content-Type": "application/json"},
+        json={"text": text, "model_id": model}, timeout=60.0)
+    r.raise_for_status()
+    return r.content, "audio/mpeg"
+
+
 def _resolve_engine(settings) -> str:
     """Which TTS engine to use: explicit ``reel_tts_engine`` setting, or 'auto'
-    (ElevenLabs if a key is set, else Piper if a voice is present, else none)."""
+    (ElevenLabs if a key is set, else voicebox if a URL is set, else Piper if
+    a voice is present, else none)."""
     eng = (getattr(settings, "reel_tts_engine", "auto") or "auto").lower()
     if eng != "auto":
         return eng
     if getattr(settings, "elevenlabs_api_key", None):
         return "elevenlabs"
+    if voicebox_available(settings):
+        return "voicebox"
     if piper_available(settings):
         return "piper"
     return "none"
@@ -151,6 +304,87 @@ def _piper_parts(scene_texts, settings, work_dir) -> list[Path] | None:
         return parts or None
     except Exception as e:  # noqa: BLE001 — best-effort
         log.info("piper TTS failed: %s", e)
+        return None
+
+
+def _voicebox_profile(settings, client) -> dict | None:
+    """The profile to speak with: ``voicebox_profile_id`` when set (and still
+    present on the server), else the server's first profile."""
+    profiles = []
+    try:
+        r = client.get(f"{_voicebox_base(settings)}/profiles", timeout=10.0)
+        r.raise_for_status()
+        profiles = r.json() or []
+    except Exception as e:  # noqa: BLE001 — treated as no-profile below
+        log.info("voicebox profiles unavailable: %s", e)
+    if not profiles:
+        return None
+    want = getattr(settings, "voicebox_profile_id", None)
+    if want:
+        for p in profiles:
+            if p.get("id") == want:
+                return p
+        log.info("voicebox profile %s not found; using %r", want,
+                 profiles[0].get("name"))
+    return profiles[0]
+
+
+def _voicebox_parts(scene_texts, settings, work_dir) -> list[Path] | None:
+    """One WAV per scene via the local voicebox server, or None on any failure
+    (unconfigured, unreachable, generation error) so the caller can fall back.
+    POST /generate is async: poll /history/{id} until completed, then download
+    /audio/{id} and normalise to the shared wav format for _concat_wavs."""
+    if not voicebox_available(settings):
+        return None
+    import subprocess
+    import time
+
+    import httpx
+    base = _voicebox_base(settings)
+    budget = float(getattr(settings, "voicebox_timeout_s", 300.0) or 300.0)
+    language = getattr(settings, "voicebox_language", "en") or "en"
+    ffmpeg = getattr(settings, "ffmpeg_path", None) or "ffmpeg"
+    try:
+        parts: list[Path] = []
+        with httpx.Client(timeout=30.0) as c:
+            profile = _voicebox_profile(settings, c)
+            if profile is None:
+                return None
+            body_base = {"profile_id": profile["id"], "language": language}
+            # preset profiles only accept their own engine (e.g. kokoro)
+            if profile.get("default_engine"):
+                body_base["engine"] = profile["default_engine"]
+            for i, text in enumerate(scene_texts):
+                spoken = (text or "").strip() or " "
+                r = c.post(f"{base}/generate",
+                           json={**body_base, "text": spoken})
+                r.raise_for_status()
+                gid = r.json()["id"]
+                deadline = time.monotonic() + budget
+                status = r.json().get("status") or "generating"
+                while status not in ("completed", "failed"):
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(f"voicebox scene {i} timed out")
+                    time.sleep(1.0)
+                    status = (c.get(f"{base}/history/{gid}").json()
+                              .get("status") or "generating")
+                if status == "failed":
+                    raise RuntimeError(f"voicebox scene {i} failed")
+                audio = c.get(f"{base}/audio/{gid}")
+                audio.raise_for_status()
+                raw = work_dir / f"vb_{i}.src"
+                raw.write_bytes(audio.content)
+                wav = work_dir / f"vb_{i}.wav"
+                # normalise to a common wav format so _concat_wavs lines up
+                p = subprocess.run(
+                    [ffmpeg, "-y", "-i", str(raw), "-ar", "22050", "-ac", "1",
+                     str(wav)], capture_output=True)
+                if p.returncode != 0 or not wav.exists():
+                    raise RuntimeError("ffmpeg voicebox->wav failed")
+                parts.append(wav)
+        return parts or None
+    except Exception as e:  # noqa: BLE001 — fall back to piper/silent
+        log.info("voicebox TTS failed, falling back: %s", e)
         return None
 
 
@@ -235,8 +469,8 @@ def synthesize_scenes(scene_texts: list[str], *, settings, work_dir: Path):
     Returns ``(narration_wav, per_scene_durations, per_scene_words)`` where
     per_scene_words[i] is a list of ``(word, start, end)`` (relative to that
     scene's audio) for karaoke captions, or None when the engine has no word
-    timing (Piper). Returns ``(None, None, None)`` when there's no narration.
-    Never raises.
+    timing (voicebox/Piper). Returns ``(None, None, None)`` when there's no
+    narration. Never raises.
     """
     engine = _resolve_engine(settings)
     parts: list[Path] | None = None
@@ -246,7 +480,11 @@ def synthesize_scenes(scene_texts: list[str], *, settings, work_dir: Path):
         if res is not None:
             parts, words = res
         if parts is None:                       # graceful fallback to local
-            parts = _piper_parts(scene_texts, settings, work_dir)
+            parts = _voicebox_parts(scene_texts, settings, work_dir) \
+                or _piper_parts(scene_texts, settings, work_dir)
+    elif engine == "voicebox":
+        parts = _voicebox_parts(scene_texts, settings, work_dir) \
+            or _piper_parts(scene_texts, settings, work_dir)
     elif engine == "piper":
         parts = _piper_parts(scene_texts, settings, work_dir)
 

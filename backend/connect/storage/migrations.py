@@ -454,6 +454,51 @@ async def pg_migrate_24_to_25(conn: "psycopg.AsyncConnection") -> None:
         "ALTER TABLE campaign ADD COLUMN IF NOT EXISTS plan jsonb")
 
 
+async def pg_migrate_25_to_26(conn: "psycopg.AsyncConnection") -> None:
+    """v26 — the reel factory: the 'reel_factory' job kind (an autonomous
+    production run that scouts hot subjects from the feed and commissions one
+    reel-led campaign per pick) plus its singleton dedup index (at most one
+    live run). Constraint widening + one index; no data migration."""
+    await conn.execute("ALTER TABLE job DROP CONSTRAINT IF EXISTS ck_job_kind")
+    await conn.execute(
+        "ALTER TABLE job ADD CONSTRAINT ck_job_kind"
+        f" CHECK (kind IN {schema.E.sql_in(schema.E.JOB_KINDS)})")
+    await conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_reel_factory"
+        " ON job ((kind)) WHERE kind = 'reel_factory'"
+        " AND status IN ('queued','running')")
+
+
+async def pg_migrate_26_to_27(conn: "psycopg.AsyncConnection") -> None:
+    """v27 — workspaces become channel consoles: a shared ``character`` roster
+    and ``script_preset`` table, a 1:1 ``workspace_channel`` binding (publishing
+    account + default voice/character/script-type), and a ``campaign.workspace_id``
+    column so a campaign's channel-of-record is orthogonal to its subject seed.
+    All additive; backfills workspace_id from the seed JSONB where the referenced
+    workspace still exists."""
+    await conn.execute(schema._PG_DDL_CHARACTER)
+    for ddl in schema._PG_DDL_CHARACTER_INDEXES:
+        await conn.execute(ddl)
+    await conn.execute(schema._PG_DDL_SCRIPT_PRESET)
+    for ddl in schema._PG_DDL_SCRIPT_PRESET_INDEXES:
+        await conn.execute(ddl)
+    await conn.execute(schema._PG_DDL_WORKSPACE_CHANNEL)
+    await conn.execute(
+        "ALTER TABLE campaign ADD COLUMN IF NOT EXISTS workspace_id bigint"
+        " REFERENCES workspace(id) ON DELETE SET NULL")
+    # backfill from the seed, guarded against deleted workspaces (the FK would
+    # otherwise reject) — campaigns of dropped workspaces just stay NULL
+    await conn.execute(
+        "UPDATE campaign SET workspace_id = (seed->>'workspace_id')::bigint"
+        " WHERE workspace_id IS NULL AND seed->>'workspace_id' ~ '^[0-9]+$'"
+        " AND EXISTS (SELECT 1 FROM workspace w"
+        "             WHERE w.id = (seed->>'workspace_id')::bigint)")
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_campaign_workspace"
+        " ON campaign(workspace_id, created_at DESC)"
+        " WHERE workspace_id IS NOT NULL")
+
+
 # Registry: version N -> async function taking N's schema to N+1's.
 # Forward-only.
 PG_MIGRATIONS: dict[
@@ -482,6 +527,8 @@ PG_MIGRATIONS: dict[
     22: pg_migrate_22_to_23,
     23: pg_migrate_23_to_24,
     24: pg_migrate_24_to_25,
+    25: pg_migrate_25_to_26,
+    26: pg_migrate_26_to_27,
 }
 
 

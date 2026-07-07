@@ -55,6 +55,9 @@ KIND_PRIORITIES: dict[str, int] = {
     "enrich_t1_sync": PRIORITY_BACKGROUND,
     "enrich_t1_batch": PRIORITY_BACKGROUND,
     "brief_generate": 60,
+    # a factory run only scouts + enqueues campaigns (the heavy lifting is
+    # its child content_generate jobs, which inherit their own priority).
+    "reel_factory": PRIORITY_BACKGROUND,
     "poll_source": PRIORITY_POLL,
     # bulk historical crawl — lowest priority so it never starves polls or
     # interactive work; runs when the queue is otherwise idle.
